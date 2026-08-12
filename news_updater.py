@@ -2,22 +2,25 @@
 """
 PortfolioNewsUpdater - free stock news monitor.
 
-Runs on a Google Cloud "Always Free" e2-micro VM. Every 4 hours it checks the
-configured tickers for NEW information since the last run.
+Runs on a Google Cloud "Always Free" e2-micro VM. Twice a day (08:00 and
+20:00 UTC) it checks the configured tickers for NEW information since the
+last run.
 
 Pipeline:
   TICKERS -> [SEC/EDGAR, RSS/News, Company IR] -> NORMALIZE
-          -> DEDUPLICATE (SQLite) -> AI FILTER (importance/relevance)
+          -> DEDUPLICATE (SQLite + AI semantic) -> AI FILTER (importance)
           -> important? -> TELEGRAM digest (others -> DB for later browsing)
 
 Sources (v1):
   - SEC EDGAR filings (8-K, 10-Q, 10-K, 6-K, 20-F, DEF 14A, Form 4) via edgartools
+  - Google News RSS (any ticker, no config)
   - Company RSS / press-release feeds (configured per ticker) via feedparser
 
-New items are deduplicated (SQLite), relevance-filtered and translated to
-English by DeepSeek, then a concise Telegram digest is sent.
+New items are deduplicated (exact via SQLite, near-duplicates via AI),
+relevance-filtered and translated to English by DeepSeek, then a concise
+Telegram digest is sent.
 
-Runs via cron (every 4 hours). Reads config_local.json and secrets_local.json.
+Runs via cron (twice daily). Reads config_local.json and secrets_local.json.
 """
 
 import hashlib
@@ -165,9 +168,17 @@ def set_last_fetched(conn, ticker, source, when):
     conn.commit()
 
 
-def item_hash(source, item_id, title):
-    """A stable hash for an item so we can detect what's new vs already seen."""
-    raw = f"{source}|{item_id}|{title}".strip().lower()
+def item_hash(source, item_id, title=None):
+    """
+    A stable hash for an item so we can detect what's new vs already seen.
+
+    Hashes on source + item_id (the URL / accession / link), NOT the title.
+    The title is intentionally excluded because the same article can appear
+    with slightly different titles (or garbled text from Google News), which
+    would otherwise create false "duplicates". The item_id is the canonical
+    unique identifier for an item.
+    """
+    raw = f"{source}|{item_id}".strip().lower()
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -190,6 +201,107 @@ def mark_seen(conn, ticker, source, item_id, title, url):
         (ticker, source, h, title, url, now),
     )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Semantic dedup (AI-assisted)
+# ---------------------------------------------------------------------------
+# How many recently-seen items (per ticker) the AI compares new items against.
+# This is what catches near-duplicates: two headlines about the SAME event
+# (e.g. "BlackRock bought 10,000 shares" vs "BlackRock entered") that have
+# different wording but the same underlying meaning.
+SEMANTIC_DEDUP_HISTORY = 20
+
+
+def get_recent_seen(conn, ticker, limit=SEMANTIC_DEDUP_HISTORY):
+    """Return the most recent seen titles for a ticker, newest first."""
+    cur = conn.execute(
+        "SELECT title FROM seen WHERE ticker=? "
+        "ORDER BY first_seen DESC LIMIT ?",
+        (ticker, limit),
+    )
+    return [row[0] for row in cur.fetchall() if row[0]]
+
+
+def semantic_dedup(items, conn, config, secrets):
+    """
+    Drop items that are semantically the SAME event as something already
+    reported for that ticker (different wording, same meaning). This catches
+    near-duplicates that the exact hash-based dedup misses.
+
+    Cost-efficient: one batched AI call PER TICKER. For each ticker we give the
+    model the new candidate headlines + the recent history headlines, and it
+    returns which candidates are genuinely NEW events. Items that are just
+    re-wordings of already-reported news are dropped.
+
+    Falls back to returning all items unchanged on any error (never drop news
+    just because the AI call failed).
+    """
+    if not items or not conn:
+        return items
+    base = config.get("ai_base_url") or DEFAULT_AI_BASE
+    model = config.get("ai_model") or DEFAULT_AI_MODEL
+    key = secrets.get("ai_api_key", "")
+    if not key:
+        return items  # no AI -> keep everything (stage 1 already ran)
+
+    kept = []
+    # Group candidates by ticker so we make one call per ticker.
+    by_ticker = {}
+    for it in items:
+        by_ticker.setdefault(it.get("ticker", ""), []).append(it)
+
+    for ticker, cands in by_ticker.items():
+        if not ticker:
+            kept.extend(cands)
+            continue
+        history = get_recent_seen(conn, ticker)
+        if not history:
+            kept.extend(cands)
+            continue
+        cand_lines = [f"{i+1}. {c.get('title','')}" for i, c in enumerate(cands)]
+        hist_lines = [f"- {t}" for t in history]
+        prompt = (
+            "You are a news deduplicator. Below are NEW headlines for stock "
+            f"{ticker}, and a list of news ALREADY REPORTED for {ticker}.\n"
+            "For each NEW headline, decide whether it describes the SAME "
+            "underlying event as any ALREADY REPORTED item (just worded "
+            "differently). Examples of the SAME event:\n"
+            "  'BlackRock bought 10,000 shares' vs 'BlackRock entered' -> SAME\n"
+            "  'Company X beats Q1 earnings' vs 'X reports record profit' -> SAME\n"
+            "Return ONLY a JSON array of the numbers (1-based) of the NEW "
+            "headlines that are GENUINELY NEW events (not duplicates). If all "
+            "are duplicates, return [].\n\n"
+            "ALREADY REPORTED:\n" + "\n".join(hist_lines) + "\n\n"
+            "NEW HEADLINES:\n" + "\n".join(cand_lines)
+        )
+        content = _chat(base, model, key,
+                        "You are a precise JSON-returning assistant.",
+                        prompt)
+        if content is None:
+            kept.extend(cands)  # on error, keep everything (don't miss news)
+            continue
+        keep_nums = set()
+        try:
+            match = re.search(r"\[.*\]", content, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group(0))
+                if isinstance(parsed, list):
+                    keep_nums = {int(x) for x in parsed if str(x).strip().isdigit()}
+        except Exception as exc:
+            print(f"  [warn] semantic dedup parse failed for {ticker}: {exc}",
+                  file=sys.stderr)
+            keep_nums = set()
+        # Keep only the candidates the AI said are genuinely new (1-based).
+        kept_count = 0
+        for i, c in enumerate(cands):
+            if (i + 1) in keep_nums:
+                kept.append(c)
+                kept_count += 1
+        print(f"  Semantic dedup {ticker}: {len(cands)} candidate(s) -> "
+              f"{kept_count} genuinely new. "
+              f"(compared against {len(history)} recent item(s))")
+    return kept
 
 
 def prune_db(conn):
@@ -238,10 +350,15 @@ SEC_FORMS = [
 
 
 def fetch_sec_filings(ticker, since_dt):
-    """SEC filings for this ticker filed since since_dt, using edgartools."""
+    """
+    SEC filings for this ticker filed since since_dt, using edgartools.
+
+    Returns a list of items, or None if the fetch FAILED (so the caller knows
+    NOT to advance the delta timestamp and risk missing news).
+    """
     if not SEC_AVAILABLE:
         print("  [warn] edgartools not installed - skipping SEC.")
-        return []
+        return None  # can't fetch -> don't advance the delta
     items = []
     try:
         set_identity(SEC_IDENTITY)
@@ -276,6 +393,7 @@ def fetch_sec_filings(ticker, since_dt):
             })
     except Exception as exc:
         print(f"  [error] SEC {ticker}: {exc}", file=sys.stderr)
+        return None  # fetch failed -> don't advance the delta
     return items
 
 
@@ -313,6 +431,7 @@ def fetch_rss(url, ticker, since_dt=None):
             })
     except Exception as exc:
         print(f"  [error] RSS {url}: {exc}", file=sys.stderr)
+        return None  # fetch failed -> don't advance the delta
     return items
 
 
@@ -344,12 +463,15 @@ def _chat(base, model, key, system, user, timeout=60):
         return None
 
 
-def ai_filter(items, config, secrets):
+def ai_filter(items, config, secrets, conn=None):
     """
-    Two-stage AI filtering to save cost:
+    Multi-stage AI filtering to save cost:
       Stage 1 (cheap): ask for a YES/NO per item title - is it worth an
                        investor's attention?
-      Stage 2 (detailed): only for the YES items, do the full analysis
+      Stage 1.5 (semantic dedup): drop items that are the SAME event as
+                       something already reported for that ticker (catches
+                       near-duplicates with different wording).
+      Stage 2 (detailed): only for the survivors, do the full analysis
                        (dedupe, translate, summarize, categorize, explain).
     Returns a list of dicts (the kept, ranked items).
     """
@@ -391,7 +513,15 @@ def ai_filter(items, config, secrets):
     if not kept:
         return []
 
-    # ---- Stage 2: detailed analysis on the keepers ----
+    # ---- Stage 1.5: semantic dedup against already-reported news ----
+    # This is the AI dedup that catches "same event, different wording" items.
+    if conn is not None:
+        kept = semantic_dedup(kept, conn, config, secrets)
+        if not kept:
+            print("  Semantic dedup removed all candidates - nothing new.")
+            return []
+
+    # ---- Stage 2: detailed analysis on the survivors ----
     prompt = (
         "You are an investor's news assistant. Below is a JSON list of newly "
         "discovered items (SEC filings, press releases, news) for a set of stocks.\n"
@@ -535,8 +665,17 @@ def main():
             else:
                 gnews_url = "https://news.google.com/rss/search?q=" + ticker + "+stock"
                 items = fetch_rss(gnews_url, ticker, since_dt)
-                for it in items:
-                    it["source"] = "GoogleNews"
+                if items is not None:
+                    for it in items:
+                        it["source"] = "GoogleNews"
+
+            # 'items' is None only if the fetch FAILED. In that case we do NOT
+            # advance last_fetched, so nothing published during the failed
+            # window is missed - the next run re-fetches from the old delta.
+            if items is None:
+                print(f"  [warn] {ticker} {source} fetch failed - NOT advancing "
+                      f"delta (will retry from {since_dt.strftime('%Y-%m-%d %H:%M')}).")
+                continue
 
             for item in items:
                 if is_new(conn, ticker, item["source"], item["id"], item["title"]):
@@ -551,27 +690,46 @@ def main():
         last = get_last_fetched(conn, ticker, "RSS")
         since_dt = (datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=EASTERN)
                     if last else datetime.now(EASTERN) - timedelta(hours=initial_hours))
+        rss_ok = True
         for feed_url in feeds:
-            for item in fetch_rss(feed_url, ticker, since_dt):
+            feed_items = fetch_rss(feed_url, ticker, since_dt)
+            if feed_items is None:
+                rss_ok = False
+                print(f"  [warn] {ticker} RSS {feed_url} failed - NOT advancing delta.")
+                continue
+            for item in feed_items:
                 if is_new(conn, ticker, item["source"], item["id"], item["title"]):
                     all_new.append(item)
                     mark_seen(conn, ticker, item["source"], item["id"], item["title"], item.get("url", ""))
-        set_last_fetched(conn, ticker, "RSS", now_utc_str)
+        # Only advance the RSS delta if ALL configured feeds fetched OK.
+        if rss_ok:
+            set_last_fetched(conn, ticker, "RSS", now_utc_str)
 
-    conn.close()
     record["new_items"] = len(all_new)
     print(f"  {len(all_new)} new item(s) found.")
 
-    # Cap how many items go to the AI filter (keep the most recent). This
-    # prevents flooding on the first run after a long gap, when Google News
-    # can return dozens of items per ticker.
+    # Keep only the most recent items for the AI filter, so we never drop the
+    # newest news when there's a flood (e.g. first run after a long gap).
+    # Sort by date (newest first) so the trim keeps the freshest items.
+    def _sort_key(it):
+        # Prefer a parsed date; fall back to the raw string; empty = oldest.
+        d = it.get("date") or ""
+        try:
+            # Handles both 'YYYY-MM-DD' (SEC) and RFC822-ish RSS publish strings.
+            return datetime.strptime(str(d)[:10], "%Y-%m-%d")
+        except Exception:
+            return datetime.min
+    all_new.sort(key=_sort_key, reverse=True)
+
     max_to_filter = int(config.get("max_items_per_run", 40))
     if len(all_new) > max_to_filter:
         print(f"  Trimming to the {max_to_filter} most recent for AI filtering.")
         all_new = all_new[:max_to_filter]
 
-    # AI filter + dedupe + translate
-    filtered = ai_filter(all_new, config, secrets)
+    # AI filter + dedupe + translate. conn stays open so the semantic-dedup
+    # stage can compare new items against the already-seen history.
+    filtered = ai_filter(all_new, config, secrets, conn)
+    conn.close()
 
     # Cap the digest size so Telegram doesn't get a wall of text.
     max_digest = int(config.get("max_digest_items", 10))
