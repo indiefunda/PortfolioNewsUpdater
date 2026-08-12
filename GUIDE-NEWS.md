@@ -1,0 +1,53 @@
+# 📰 PortfolioNewsUpdater — setup
+
+Searches your tickers for **new** SEC filings, news, and RSS items every **12
+hours**, filters/dedupes/ranks them with **DeepSeek AI**, and sends a concise
+Telegram digest. Runs on the same **free** Google Cloud VM as your price
+monitor, so it costs **$0** for the VM/network/storage (only DeepSeek's tiny
+API fee, ~$0.01–0.05/month).
+
+## What it checks (per ticker, per run — only the "delta" since last time)
+- **SEC EDGAR** filings (8-K, 10-Q, 10-K, 6-K, 20-F, SCHEDULE 13D/13G, etc.)
+- **Google News RSS** (works for any ticker, no config)
+- **Company RSS / press-release feeds** (optional, per-ticker in config)
+
+New items → SQLite dedup → **DeepSeek** dedup/filter/rank/translate → Telegram.
+
+## One-time setup
+
+1. **Install the Google Cloud CLI** once (if not already done):
+   `https://cloud.google.com/sdk/docs/install` — then reopen your terminal.
+
+2. **Start the panel** (double-click `start_cloud.bat`, or `python cloud_manager.py`).
+   Open **`http://localhost:8001`**.
+
+3. In the panel:
+   - **Connect to Google** → Authenticate (your Google login opens).
+   - **Your server** → click **Create/update free server** (uses your existing
+     `stock-monitor` VM; just adds the news files + a 2x-daily cron job).
+   - **Your portfolio & sources** → add your tickers, pick the AI provider.
+   - **Telegram & API keys** → paste your Telegram bot token/chat id and your
+     **DeepSeek** (or Gemini) API key.
+   - **Upload config to server**.
+   - **Run now (test)** to confirm, then check **Schedule & run history**.
+
+## Important security note
+
+Your **AI API key** and **Telegram token** live in `secrets_local.json`, which
+is **git-ignored** — never commit or share this file. If you share the app
+with friends, each person uses their **own** keys and their own VM.
+
+## Stopping it (if you ever need to)
+
+```bash
+crontab -l | grep -v news_updater | crontab -
+```
+
+## Troubleshooting
+
+| Problem | What to do |
+|---------|------------|
+| "Schedule not installed" | Click **Upload config to server**, then **Check schedule**. |
+| No digest arrives | Click **Run now (test)** — check the output for errors. Make sure Telegram + AI key are set. |
+| "No AI API key" in output | Add your key in the panel (Step 4) and re-upload. |
+| Too many/too few items | Adjust `max_items_per_run` / `max_digest_items` in config. |

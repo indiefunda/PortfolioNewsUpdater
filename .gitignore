@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Secrets (never commit your API key or Telegram token)
+secrets_local.json
+.env
+*.env
+
+# Runtime data
+news.db
+run_history.json
+news_run_history.json
+seen.json
+
+# Test artifacts
+_test_ai.py
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Generated zip packages
+*.zip

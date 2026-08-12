@@ -1,0 +1,25 @@
+{
+  "tickers": [
+    "HUIZ",
+    "YB",
+    "LX",
+    "CAAS",
+    "QFIN",
+    "LU"
+  ],
+  "enabled": true,
+  "initial_lookback_hours": 24,
+  "max_items_per_run": 40,
+  "max_digest_items": 10,
+  "ai_provider": "deepseek",
+  "ai_model": "deepseek-v4-flash",
+  "ai_base_url": "https://api.deepseek.com",
+  "rss_feeds": {
+    "HUIZ": [],
+    "YB": [],
+    "LX": [],
+    "CAAS": [],
+    "QFIN": [],
+    "LU": []
+  }
+}
