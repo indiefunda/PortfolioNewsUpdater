@@ -29,6 +29,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -213,17 +214,32 @@ def mark_seen(conn, ticker, source, item_id, title, url):
 SEMANTIC_DEDUP_HISTORY = 20
 
 
-def get_recent_seen(conn, ticker, limit=SEMANTIC_DEDUP_HISTORY):
-    """Return the most recent seen titles for a ticker, newest first."""
-    cur = conn.execute(
-        "SELECT title FROM seen WHERE ticker=? "
-        "ORDER BY first_seen DESC LIMIT ?",
-        (ticker, limit),
-    )
+def get_recent_seen(conn, ticker, limit=SEMANTIC_DEDUP_HISTORY, before=None):
+    """
+    Return the most recent seen titles for a ticker, newest first.
+
+    If 'before' (an ISO timestamp string) is given, only items first seen
+    BEFORE that time are returned. This lets the semantic-dedup stage exclude
+    items from the CURRENT run (which are marked 'seen' during the fetch loop
+    but may never have been reported yet), so we never drop a genuinely-new
+    event just because it arrived in the same batch as another new event.
+    """
+    if before:
+        cur = conn.execute(
+            "SELECT title FROM seen WHERE ticker=? AND first_seen < ? "
+            "ORDER BY first_seen DESC LIMIT ?",
+            (ticker, before, limit),
+        )
+    else:
+        cur = conn.execute(
+            "SELECT title FROM seen WHERE ticker=? "
+            "ORDER BY first_seen DESC LIMIT ?",
+            (ticker, limit),
+        )
     return [row[0] for row in cur.fetchall() if row[0]]
 
 
-def semantic_dedup(items, conn, config, secrets):
+def semantic_dedup(items, conn, config, secrets, run_start=None):
     """
     Drop items that are semantically the SAME event as something already
     reported for that ticker (different wording, same meaning). This catches
@@ -233,6 +249,11 @@ def semantic_dedup(items, conn, config, secrets):
     model the new candidate headlines + the recent history headlines, and it
     returns which candidates are genuinely NEW events. Items that are just
     re-wordings of already-reported news are dropped.
+
+    'run_start' (an ISO timestamp string) is used to exclude items from the
+    CURRENT run from the comparison history - see get_recent_seen(). Without
+    it, two distinct new events in the same batch could be wrongly deduped
+    against each other before either is ever reported.
 
     Falls back to returning all items unchanged on any error (never drop news
     just because the AI call failed).
@@ -255,7 +276,7 @@ def semantic_dedup(items, conn, config, secrets):
         if not ticker:
             kept.extend(cands)
             continue
-        history = get_recent_seen(conn, ticker)
+        history = get_recent_seen(conn, ticker, before=run_start)
         if not history:
             kept.extend(cands)
             continue
@@ -397,6 +418,45 @@ def fetch_sec_filings(ticker, since_dt):
     return items
 
 
+def validate_sec_tickers(tickers):
+    """
+    Check which tickers resolve in SEC EDGAR via edgartools and log the result,
+    so you know which tickers actually have SEC-filing coverage.
+
+    Non-fatal: it only logs a warning for unresolvable tickers. Returns the set
+    of tickers that resolved. A ticker that fails here still gets news from
+    Google News / RSS, just no SEC filings.
+    """
+    if not SEC_AVAILABLE:
+        print("  [warn] edgartools not installed - skipping SEC coverage check.")
+        return set()
+    resolved = set()
+    unresolved = []
+    try:
+        set_identity(SEC_IDENTITY)
+        for ticker in tickers:
+            try:
+                company = Company(ticker)
+                cik = str(getattr(company, "cik", "") or "").strip()
+                name = str(getattr(company, "name", "") or ticker)
+                if cik:
+                    resolved.add(ticker)
+                    print(f"  [sec] {ticker}: OK (CIK {cik}, {name})")
+                else:
+                    unresolved.append(ticker)
+            except Exception as exc:
+                unresolved.append(ticker)
+                print(f"  [sec] {ticker}: could not resolve in SEC EDGAR ({exc})",
+                      file=sys.stderr)
+    except Exception as exc:
+        print(f"  [warn] SEC coverage check failed: {exc}", file=sys.stderr)
+        return resolved
+    if unresolved:
+        print(f"  [sec] No SEC coverage for: {', '.join(unresolved)} "
+              f"(these tickers will only get Google News / RSS).")
+    return resolved
+
+
 # ---------------------------------------------------------------------------
 # RSS / press-release feeds (via feedparser)
 # ---------------------------------------------------------------------------
@@ -438,8 +498,26 @@ def fetch_rss(url, ticker, since_dt=None):
 # ---------------------------------------------------------------------------
 # AI filter + dedupe + translate (two-stage to save cost)
 # ---------------------------------------------------------------------------
+# How many times to retry a transient AI API failure (network blip, 5xx,
+# rate limit) before giving up. 4xx errors (bad key, bad request) are NOT
+# retried - they will never succeed.
+AI_RETRIES = 2
+AI_RETRY_DELAY_SEC = 3
+
+
+def _is_retryable(resp):
+    """Return True if an HTTP response is a transient failure worth retrying."""
+    if resp is None:
+        return True  # connection error / timeout
+    return resp.status_code in (429,) or resp.status_code >= 500
+
+
 def _chat(base, model, key, system, user, timeout=60):
-    """One chat completion call. Returns the raw content string or None."""
+    """
+    One chat completion call with retry for transient failures.
+
+    Returns the raw content string, or None if all attempts failed.
+    """
     url = base.rstrip("/") + "/chat/completions"
     payload = {
         "model": model,
@@ -449,28 +527,48 @@ def _chat(base, model, key, system, user, timeout=60):
         ],
         "temperature": 0.2,
     }
-    try:
-        resp = requests.post(
-            url,
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-    except Exception as exc:
-        print(f"  [error] AI call failed: {exc}", file=sys.stderr)
-        return None
+    last_exc = None
+    attempts = 0
+    for attempt in range(AI_RETRIES + 1):
+        resp = None
+        attempts = attempt + 1
+        try:
+            resp = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=timeout,
+            )
+            if not _is_retryable(resp):
+                resp.raise_for_status()
+                return resp.json()["choices"][0]["message"]["content"]
+            # Transient status (429 / 5xx) - fall through to retry.
+            last_exc = f"HTTP {resp.status_code}"
+        except Exception as exc:
+            last_exc = exc
+            # Don't retry auth/validation errors (they won't succeed on retry).
+            if isinstance(exc, requests.exceptions.HTTPError) and resp is not None \
+                    and resp.status_code in (400, 401, 403, 404, 422):
+                break
+        if attempt < AI_RETRIES:
+            print(f"  [warn] AI call attempt {attempt + 1} failed ({last_exc}); "
+                  f"retrying in {AI_RETRY_DELAY_SEC}s...", file=sys.stderr)
+            time.sleep(AI_RETRY_DELAY_SEC)
+    print(f"  [error] AI call failed after {attempts} attempt(s): {last_exc}",
+          file=sys.stderr)
+    return None
 
 
-def ai_filter(items, config, secrets, conn=None):
+def ai_filter(items, config, secrets, conn=None, run_start=None):
     """
     Multi-stage AI filtering to save cost:
       Stage 1 (cheap): ask for a YES/NO per item title - is it worth an
                        investor's attention?
       Stage 1.5 (semantic dedup): drop items that are the SAME event as
                        something already reported for that ticker (catches
-                       near-duplicates with different wording).
+                       near-duplicates with different wording). 'run_start' is
+                       used so items from the CURRENT run are excluded from
+                       the comparison history.
       Stage 2 (detailed): only for the survivors, do the full analysis
                        (dedupe, translate, summarize, categorize, explain).
     Returns a list of dicts (the kept, ranked items).
@@ -516,7 +614,7 @@ def ai_filter(items, config, secrets, conn=None):
     # ---- Stage 1.5: semantic dedup against already-reported news ----
     # This is the AI dedup that catches "same event, different wording" items.
     if conn is not None:
-        kept = semantic_dedup(kept, conn, config, secrets)
+        kept = semantic_dedup(kept, conn, config, secrets, run_start=run_start)
         if not kept:
             print("  Semantic dedup removed all candidates - nothing new.")
             return []
@@ -599,6 +697,10 @@ def format_digest(filtered, ticker_count):
 # ---------------------------------------------------------------------------
 def main():
     start_time = datetime.now(EASTERN)
+    # ISO timestamp marking the start of THIS run. Used to exclude items seen
+    # during this run from the semantic-dedup history (so two distinct new
+    # events in the same batch aren't wrongly deduped against each other).
+    run_start = start_time.strftime("%Y-%m-%d %H:%M:%S")
     record = {
         "timestamp": start_time.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "status": "ran",
@@ -626,6 +728,10 @@ def main():
         print("No tickers configured.")
         record["status"] = "error"; record["error"] = "No tickers."
         append_run_record(record); return
+
+    # Report which tickers have SEC EDGAR coverage (non-fatal - just informs
+    # you which tickers get SEC filings vs only Google News / RSS).
+    validate_sec_tickers(tickers)
 
     secrets = load_secrets()
     token = secrets.get("telegram_bot_token", "")
@@ -727,8 +833,9 @@ def main():
         all_new = all_new[:max_to_filter]
 
     # AI filter + dedupe + translate. conn stays open so the semantic-dedup
-    # stage can compare new items against the already-seen history.
-    filtered = ai_filter(all_new, config, secrets, conn)
+    # stage can compare new items against the already-seen history. run_start
+    # excludes this run's own items from that comparison.
+    filtered = ai_filter(all_new, config, secrets, conn, run_start=run_start)
     conn.close()
 
     # Cap the digest size so Telegram doesn't get a wall of text.
