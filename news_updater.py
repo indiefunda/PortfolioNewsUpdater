@@ -30,7 +30,7 @@ import re
 import sqlite3
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
 import feedparser
@@ -693,6 +693,44 @@ def format_digest(filtered, ticker_count):
 
 
 # ---------------------------------------------------------------------------
+# Schedule guard
+# ---------------------------------------------------------------------------
+# The two target run times in US Eastern time. Because EASTERN is a DST-aware
+# zoneinfo tz, these wall-clock times are correct in BOTH summer (EDT) and
+# winter (EST) - that is the whole point: 9:15 ET is always 15 min before the
+# 9:30 ET open, and 16:45 ET is always 7.5h later / just after the 16:00 ET
+# close, regardless of the season.
+SCHEDULE_RUN_TIMES = (dtime(9, 15), dtime(16, 45))
+# Tolerance window (minutes around each target) during which a run is allowed.
+# Cron fires at the top of the exact minute, but allowing a small window makes
+# the guard robust to a VM that is briefly busy or clock-skewed.
+SCHEDULE_TOLERANCE_MIN = 5
+
+
+def _schedule_guard(now_et):
+    """Exit without doing any work unless now is close to a scheduled run time.
+
+    setup_cloud.sh installs two cron jobs (one per DST season). The out-of-
+    season job fires at the wrong local minute; this guard turns that into an
+    instant no-op so exactly two real runs happen per day. It runs before any
+    DB/network work, so a skipped run costs almost nothing.
+    """
+    now_t = now_et.time()
+    for target in SCHEDULE_RUN_TIMES:
+        # Compare wall-clock times on the same day so the delta is correct
+        # across midnight (not that it can happen here, but it is safe).
+        delta = abs(
+            (datetime.combine(now_et.date(), now_t)
+             - datetime.combine(now_et.date(), target)).total_seconds()
+        )
+        if delta <= SCHEDULE_TOLERANCE_MIN * 60:
+            return  # this is a scheduled run -> proceed
+    print(f"[{now_et.strftime('%Y-%m-%d %H:%M %Z')}] "
+          f"Outside scheduled times (9:15 / 16:45 ET) - skipping.")
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -701,6 +739,30 @@ def main():
     # during this run from the semantic-dedup history (so two distinct new
     # events in the same batch aren't wrongly deduped against each other).
     run_start = start_time.strftime("%Y-%m-%d %H:%M:%S")
+
+    # ---------------------------------------------------------------------
+    # DST-aware schedule guard.
+    #
+    # setup_cloud.sh installs TWO cron jobs (one per DST season) so the
+    # digest is pinned to US market time in both summer and winter:
+    #     Run 1: 9:15 ET (15 min before the 9:30 ET open)
+    #     Run 2: 16:45 ET (7.5h later, just after the 16:00 ET close)
+    # Because cron fires at fixed UTC times, the out-of-season job fires at
+    # the wrong local minute. This guard makes that job an instant no-op so
+    # exactly two real runs happen per day. It runs BEFORE any DB or network
+    # work, so an out-of-season invocation costs almost nothing.
+    #
+    # We allow a small tolerance so a run that is a few seconds/minutes late
+    # (e.g. VM was busy) still counts. If the current ET time is not close to
+    # either target, exit immediately - do not fetch, do not send, do not log.
+    #
+    # Manual runs use "--force" (the panel's "Run now" button) to bypass the
+    # guard so you can test at any time of day.
+    # ---------------------------------------------------------------------
+    if "--force" not in sys.argv:
+        _schedule_guard(start_time)
+
+    record = {
     record = {
         "timestamp": start_time.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "status": "ran",

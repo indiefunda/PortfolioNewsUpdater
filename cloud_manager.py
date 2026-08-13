@@ -317,7 +317,7 @@ HTML = """<!DOCTYPE html>
 </head>
 <body>
   <h1>📰 PortfolioNewsUpdater — Cloud</h1>
-  <div class="sub">Searches SEC, news and RSS for your tickers, filters with AI, sends a Telegram digest. Runs twice a day.</div>
+  <div class="sub">Searches SEC, news and RSS for your tickers, filters with AI, sends a Telegram digest. Runs twice a day at 9:15 ET &amp; 16:45 ET (auto-adjusts for DST).</div>
   <div class="msg" id="msg"></div>
 
   <div class="card">
@@ -458,7 +458,7 @@ async function loadCron(){
   if(!c){ el.innerHTML='<span class="dot gray"></span><b>Could not reach server.</b>'; return; }
   const daemon = String(c.cron_daemon_active||'').trim();
   if(c.active === 'active'){
-    el.innerHTML = '<span class="dot green"></span><b>Schedule armed (2x daily).</b> cron: '+
+    el.innerHTML = '<span class="dot green"></span><b>Schedule armed (2x daily, US market time).</b> Runs at 9:15 ET &amp; 16:45 ET, auto-adjusts for DST. cron: '+
       (daemon==='active'?'running':'NOT running')+'<br><span style="color:var(--muted)">'+escapeHtml(c.cron_line||'')+'</span>';
   } else {
     el.innerHTML = '<span class="dot red"></span><b>Schedule not installed.</b> Upload config (Step 3) to install it. cron: '+(daemon==='active'?'running':'NOT running');
@@ -613,7 +613,7 @@ class Handler(BaseHTTPRequestHandler):
         home = get_vm_home(zone)
         ok, out, err = run_gcloud([
             "compute", "ssh", "--zone", zone, VM_NAME,
-            "--command", f"cd {home} && python3 news_updater.py 2>&1",
+            "--command", f"cd {home} && python3 news_updater.py --force 2>&1",
             "--quiet"], timeout=180)
         self._send_json({"ok": ok, "error": (err or "") if not ok else "", "output": out + err})
 
