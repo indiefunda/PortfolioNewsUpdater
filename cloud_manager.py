@@ -124,8 +124,15 @@ def run_gcloud(args, timeout=120):
         return False, "", "gcloud not found. Install the Google Cloud CLI."
     cmd = [gcloud] + args
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return proc.returncode == 0, proc.stdout, proc.stderr
+        # Decode as UTF-8 (gcloud may emit non-ASCII/UTF-8 bytes) and never
+        # crash on a bad byte. Without this, subprocess uses the system locale
+        # (e.g. cp1252 on Windows), which raises a UnicodeDecodeError and can
+        # leave stdout/stderr as None, crashing callers that concatenate them.
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
+        )
+        return proc.returncode == 0, proc.stdout or "", proc.stderr or ""
     except FileNotFoundError:
         return False, "", "gcloud not found. Install the Google Cloud CLI."
     except subprocess.TimeoutExpired:
@@ -336,7 +343,7 @@ HTML = """<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <h2>3. Your portfolio & sources</h2>
+    <h2>3. Configuration</h2>
     <label>Stocks</label>
     <div class="row" id="chips"></div>
     <div class="row" style="margin-top:8px">
@@ -353,28 +360,22 @@ HTML = """<!DOCTYPE html>
     <input id="aiModel" type="text" placeholder="deepseek-v4-flash">
     <label>AI base URL</label>
     <input id="aiBase" type="text" placeholder="https://api.deepseek.com">
-    <div class="toggle" style="margin-top:14px">
-      <span>Run the news updater (2x daily)</span>
-      <label class="switch"><input type="checkbox" id="enabledToggle"><span class="slider"></span></label>
-    </div>
-    <button class="btn-primary" onclick="uploadConfig()">🚀 Upload config to server</button>
-    <div class="hint">Sends your stocks, AI settings, and Telegram to the cloud server.</div>
-  </div>
-
-  <div class="card">
-    <h2>4. Telegram & API keys</h2>
     <label>Telegram bot token</label>
     <input id="token" type="text" placeholder="123456789:AAH...">
     <label>Telegram chat id</label>
     <input id="chatid" type="text" placeholder="e.g. 123456789">
     <label>AI API key (DeepSeek / Gemini)</label>
     <input id="aikey" type="password" placeholder="paste your key">
-    <button class="btn-primary" onclick="uploadConfig()">💾 Save keys & upload</button>
-    <div class="hint">Stored locally and on the server. Never shared.</div>
+    <div class="toggle" style="margin-top:14px">
+      <span>Run the news updater (2x daily)</span>
+      <label class="switch"><input type="checkbox" id="enabledToggle"><span class="slider"></span></label>
+    </div>
+    <button class="btn-primary" onclick="uploadConfig()">🚀 Upload config to server</button>
+    <div class="hint">Sends your stocks, AI settings, and Telegram keys to the cloud server. Keys stay local and on your VM — never shared.</div>
   </div>
 
   <div class="card">
-    <h2>5. Schedule & run history</h2>
+    <h2>4. Schedule & run history</h2>
     <div class="status" id="cronStatus">—</div>
     <button class="btn-ghost" onclick="loadCron()">↻ Check schedule</button>
     <button class="btn-ok" onclick="runNow()">▶ Run now (test)</button>

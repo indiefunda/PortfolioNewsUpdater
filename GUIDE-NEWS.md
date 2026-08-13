@@ -40,9 +40,8 @@ New items → SQLite dedup → **DeepSeek** dedup/filter/rank/translate → Tele
    - **Connect to Google** → Authenticate (your Google login opens).
    - **Your server** → click **Create/update free server** (uses your existing
      `stock-monitor` VM; just adds the news files + a 2x-daily cron job).
-   - **Your portfolio & sources** → add your tickers, pick the AI provider.
-   - **Telegram & API keys** → paste your Telegram bot token/chat id and your
-     **DeepSeek** (or Gemini) API key.
+   - **Configuration** → add your tickers, pick the AI provider, and paste
+     your Telegram bot token/chat id and **DeepSeek** (or Gemini) API key.
    - **Upload config to server**.
    - **Run now (test)** to confirm, then check **Schedule & run history**.
 
@@ -64,7 +63,7 @@ crontab -l | grep -v news_updater | crontab -
 |---------|------------|
 | "Schedule not installed" | Click **Upload config to server**, then **Check schedule**. |
 | No digest arrives | Click **Run now (test)** — check the output for errors. Make sure Telegram + AI key are set. |
-| "No AI API key" in output | Add your key in the panel (Step 4) and re-upload. |
+| "No AI API key" in output | Add your key in the panel (**Configuration**) and re-upload. |
 | Too many/too few items | Adjust `max_items_per_run` / `max_digest_items` in config. |
 | Out-of-season run skipped | Expected — the DST guard makes the wrong-season cron job a fast no-op so you only get 2 real runs/day. |
 | Manual run skipped | The panel's **Run now (test)** always forces a run (`--force`), so you can test any time. |
