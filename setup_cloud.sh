@@ -54,6 +54,11 @@ MONITOR="$PROJECT_DIR/news_updater.py"
 LOG="$PROJECT_DIR/news_updater.log"
 PYTHON="$(command -v python3)"
 
+# Remove any stale /etc/cron.d/ copies from an earlier run (they are not
+# touched by the user-crontab cleanup below and could otherwise linger with
+# an old or broken schedule).
+sudo rm -f /etc/cron.d/news-summer /etc/cron.d/news-winter 2>/dev/null || true
+
 # Compute both seasons' UTC firing times from the SAME source of truth as
 # news_updater.py (America/New_York DST rules). This keeps the schedule
 # correct for every year automatically. 9:15 ET = 15 min before the 9:30 ET
@@ -63,22 +68,35 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 EASTERN = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
-def utc_min(month, day, hour, minute):
+def cron_fields(month, day, hour, minute):
+    """Return the CRON minute and hour fields for a given ET wall-clock time.
+
+    cron needs the minute and hour as SEPARATE fields (e.g. "15 13"). We must
+    NOT emit "13:15" with a colon - that makes cron read a single invalid
+    field, which shifts everything right and causes "bad day-of-week".
+    """
     dt = datetime(2026, month, day, hour, minute, tzinfo=EASTERN)
-    return dt.astimezone(UTC).strftime("%H:%M")
-# July 1 = EDT (summer), Jan 1 = EST (winter).
-print(f"summer_run1={utc_min(7, 1, 9, 15)}")
-print(f"summer_run2={utc_min(7, 1, 16, 45)}")
-print(f"winter_run1={utc_min(1, 1, 9, 15)}")
-print(f"winter_run2={utc_min(1, 1, 16, 45)}")
+    u = dt.astimezone(UTC)
+    return u.strftime("%M"), u.strftime("%H")
+# July 1 = EDT (summer), Jan 1 = EST (winter). Runs: 9:15 ET and 16:45 ET.
+smin, sh1 = cron_fields(7, 1, 9, 15)
+_,    sh2 = cron_fields(7, 1, 16, 45)
+wmin, wh1 = cron_fields(1, 1, 9, 15)
+_,    wh2 = cron_fields(1, 1, 16, 45)
+# Both runs are at the same minute past the hour, so the minute field is a
+# single value and the hour field is a comma list.
+print(f"summer_min={smin}")
+print(f"summer_hours={sh1},{sh2}")
+print(f"winter_min={wmin}")
+print(f"winter_hours={wh1},{wh2}")
 PYEOF
 )"
-SUMMER_R1="$(printf '%s\n' "$SCHEDULE_JSON" | grep '^summer_run1=' | cut -d= -f2)"
-SUMMER_R2="$(printf '%s\n' "$SCHEDULE_JSON" | grep '^summer_run2=' | cut -d= -f2)"
-WINTER_R1="$(printf '%s\n' "$SCHEDULE_JSON" | grep '^winter_run1=' | cut -d= -f2)"
-WINTER_R2="$(printf '%s\n' "$SCHEDULE_JSON" | grep '^winter_run2=' | cut -d= -f2)"
-echo "  Summer (EDT) run times (UTC): $SUMMER_R1, $SUMMER_R2"
-echo "  Winter (EST) run times (UTC): $WINTER_R1, $WINTER_R2"
+SUMMER_MIN="$(printf '%s\n' "$SCHEDULE_JSON" | grep '^summer_min=' | cut -d= -f2)"
+SUMMER_HOURS="$(printf '%s\n' "$SCHEDULE_JSON" | grep '^summer_hours=' | cut -d= -f2)"
+WINTER_MIN="$(printf '%s\n' "$SCHEDULE_JSON" | grep '^winter_min=' | cut -d= -f2)"
+WINTER_HOURS="$(printf '%s\n' "$SCHEDULE_JSON" | grep '^winter_hours=' | cut -d= -f2)"
+echo "  Summer (EDT) cron: $SUMMER_MIN $SUMMER_HOURS * * 1-5"
+echo "  Winter (EST) cron: $WINTER_MIN $WINTER_HOURS * * 1-5"
 
 CRONTAB="$(command -v crontab || echo /usr/bin/crontab)"
 MKTEMP="$(command -v mktemp || echo /usr/bin/mktemp)"
@@ -89,8 +107,8 @@ GREP="$(command -v grep || echo /bin/grep)"
 # marker unique to our jobs). The old code filtered on the whole line's
 # schedule, which let duplicates accumulate - matching the script name is
 # the reliable way to remove all previous copies.
-SUMMER_CRON="$SUMMER_R1,$SUMMER_R2 * * 1-5 cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
-WINTER_CRON="$WINTER_R1,$WINTER_R2 * * 1-5 cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
+SUMMER_CRON="$SUMMER_MIN $SUMMER_HOURS * * 1-5 cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
+WINTER_CRON="$WINTER_MIN $WINTER_HOURS * * 1-5 cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
 
 TMPCRON="$("$MKTEMP")"
 "$CRONTAB" -l 2>/dev/null | "$GREP" -v 'news_updater.py' > "$TMPCRON" || true
@@ -103,8 +121,8 @@ else
   # Fallback: install a system cron file (needs root). Format is the same
   # as a crontab but with the username field inserted after the schedule.
   USERNAME="$(id -un 2>/dev/null || echo root)"
-  echo "$SUMMER_R1,$SUMMER_R2 * * 1-5 $USERNAME cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1" > /tmp/news-summer
-  echo "$WINTER_R1,$WINTER_R2 * * 1-5 $USERNAME cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1" > /tmp/news-winter
+  echo "$SUMMER_MIN $SUMMER_HOURS * * 1-5 $USERNAME cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1" > /tmp/news-summer
+  echo "$WINTER_MIN $WINTER_HOURS * * 1-5 $USERNAME cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1" > /tmp/news-winter
   sudo mv /tmp/news-summer /etc/cron.d/news-summer 2>/dev/null || true
   sudo mv /tmp/news-winter /etc/cron.d/news-winter 2>/dev/null || true
   if sudo test -f /etc/cron.d/news-summer; then
@@ -120,7 +138,10 @@ fi
 rm -f "$TMPCRON"
 
 echo "  Installed job(s):"
-"$CRONTAB" -l 2>/dev/null | "$GREP" 'news_updater.py' || echo "  (not found)"
+"$CRONTAB" -l 2>/dev/null | "$GREP" 'news_updater.py' || echo "  (user crontab: none)"
+for f in /etc/cron.d/news-summer /etc/cron.d/news-winter; do
+  sudo test -f "$f" && { echo "  $f:"; sudo cat "$f"; }
+done
 
 # --- Run once to confirm it works
 echo "  Running news_updater.py once to test..."

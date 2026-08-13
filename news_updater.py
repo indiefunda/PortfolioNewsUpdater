@@ -763,7 +763,6 @@ def main():
         _schedule_guard(start_time)
 
     record = {
-    record = {
         "timestamp": start_time.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "status": "ran",
         "tickers_checked": 0,
