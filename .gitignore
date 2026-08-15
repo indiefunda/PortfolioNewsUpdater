@@ -16,6 +16,8 @@ news.db
 run_history.json
 news_run_history.json
 seen.json
+tavily_usage.json
+company_lookup.json
 
 # Test artifacts
 _test_ai.py

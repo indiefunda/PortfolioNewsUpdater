@@ -14,6 +14,87 @@
   "ai_provider": "deepseek",
   "ai_model": "deepseek-v4-flash",
   "ai_base_url": "https://api.deepseek.com",
+  "news_retention_days": 21,
+  "seen_retention_days": 60,
+  "push_mode": "all",
+  "push_min_score": 7,
+  "push_min_importance": 4,
+  "push_max_per_ticker": 3,
+  "tavily_max_daily_searches": 15,
+  "tavily_max_monthly_searches": 850,
+  "tavily_min_free_items": 4,
+  "lookup_refresh_days": 30,
+  "sources": {
+    "sec": true,
+    "google_news_zh": true,
+    "eastmoney": true,
+    "baidu": false,
+    "tavily": true,
+    "google_news_en": true
+  },
+  "ticker_meta": {
+    "HUIZ": {
+      "name_zh": "\u6167\u62e9",
+      "name_en": "Huize Holding",
+      "aliases_zh": [
+        "\u6167\u62e9\u4fdd\u9669",
+        "\u6167\u62e9\u63a7\u80a1"
+      ],
+      "subsidiaries_zh": []
+    },
+    "YB": {
+      "name_zh": "\u5143\u4fdd",
+      "name_en": "Yuanbao Inc.",
+      "aliases_zh": [
+        "\u5143\u4fdd\u4fdd\u9669",
+        "\u5143\u4fdd\u79d1\u6280"
+      ],
+      "subsidiaries_zh": []
+    },
+    "LX": {
+      "name_zh": "\u4e50\u4fe1",
+      "name_en": "LexinFintech Holdings",
+      "aliases_zh": [
+        "\u4e50\u4fe1\u96c6\u56e2",
+        "\u4e50\u4fe1\u91d1\u878d"
+      ],
+      "subsidiaries_zh": [
+        "\u5206\u671f\u4e50",
+        "\u6854\u5b50\u7406\u8d22"
+      ],
+      "subsidiaries_other": [
+        "Fenqile"
+      ]
+    },
+    "CAAS": {
+      "name_zh": "\u4e2d\u6c7d\u7cfb\u7edf",
+      "name_en": "China Automotive Systems",
+      "aliases_zh": [
+        "\u4e2d\u56fd\u6c7d\u8f66\u7cfb\u7edf"
+      ],
+      "subsidiaries_zh": []
+    },
+    "QFIN": {
+      "name_zh": "\u5947\u5bcc\u79d1\u6280",
+      "name_en": "Qifu Technology",
+      "aliases_zh": [
+        "\u5947\u5bcc",
+        "360\u6570\u79d1"
+      ],
+      "subsidiaries_zh": [
+        "\u5947\u5bcc\u501f\u6761",
+        "360\u501f\u6761"
+      ]
+    },
+    "LU": {
+      "name_zh": "\u9646\u91d1\u6240",
+      "name_en": "Lufax Holding",
+      "aliases_zh": [
+        "\u9646\u91d1\u6240\u63a7\u80a1"
+      ],
+      "subsidiaries_zh": []
+    }
+  },
   "rss_feeds": {
     "HUIZ": [],
     "YB": [],

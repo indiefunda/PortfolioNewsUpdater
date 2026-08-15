@@ -48,12 +48,48 @@ DEFAULT_CONFIG = {
     "ai_provider": "deepseek",
     "ai_model": "deepseek-v4-flash",
     "ai_base_url": "https://api.deepseek.com",
+    # Rolling retention: ~3 weeks of news AND dedup hashes (so recycled news
+    # re-surfaces after the window; dedup still stops re-push inside it).
+    "news_retention_days": 21,
+    "seen_retention_days": 21,
+    # "all" pushes the top-N by importance; "score" only pushes >= push_min_score.
+    # Either way: nothing below push_min_importance (floor) is pushed, the AI's
+    # per-item push veto is honored, and a ticker can't take more than
+    # push_max_per_ticker slots while another name has news.
+    "push_mode": "all",
+    "push_min_score": 7,
+    "push_min_importance": 4,
+    "push_max_per_ticker": 3,
+    # Tavily free plan = 1,000 credits/month; 1 basic search = 1 credit.
+    # Daily cap 15 (~450/month worst case) + monthly hard cap 850, and a
+    # ticker is skipped when free sources already covered it that run.
+    "tavily_max_daily_searches": 15,
+    "tavily_max_monthly_searches": 850,
+    "tavily_min_free_items": 4,
+    # Company lookup: re-run auto-discovery for a ticker after this many days
+    # (monthly default - new subsidiaries found are alerted on Telegram).
+    "lookup_refresh_days": 30,
+    "sources": {
+        "sec": True,
+        "google_news_zh": True,
+        "eastmoney": True,
+        "baidu": False,  # captcha-blocked from server IPs - off by default
+        "tavily": True,
+        "google_news_en": True,
+    },
+    # Per-ticker Chinese identity: the key to finding real Chinese news.
+    #   name_zh         -> company's Chinese name (e.g. 乐信)
+    #   name_en         -> English name (for the AI prompt)
+    #   aliases_zh      -> other names the company goes by
+    #   subsidiaries_zh -> brands/subsidiaries (e.g. 分期乐, 桔子理财)
+    "ticker_meta": {},
     "rss_feeds": {},
 }
 DEFAULT_SECRETS = {
     "telegram_bot_token": "",
     "telegram_chat_id": "",
     "ai_api_key": "",
+    "tavily_api_key": "",
 }
 
 
@@ -324,7 +360,7 @@ HTML = """<!DOCTYPE html>
 </head>
 <body>
   <h1>📰 PortfolioNewsUpdater — Cloud</h1>
-  <div class="sub">Searches SEC, news and RSS for your tickers, filters with AI, sends a Telegram digest. Runs twice a day at 9:15 ET &amp; 16:45 ET (auto-adjusts for DST).</div>
+  <div class="sub">Searches SEC, Chinese news (乐信/分期乐… via Google News zh, Eastmoney, Baidu, Tavily), English news and RSS — translates &amp; scores everything with AI, pushes the top items to Telegram. Runs twice a day at 9:15 ET &amp; 16:45 ET (auto-adjusts for DST).</div>
   <div class="msg" id="msg"></div>
 
   <div class="card">
@@ -366,6 +402,58 @@ HTML = """<!DOCTYPE html>
     <input id="chatid" type="text" placeholder="e.g. 123456789">
     <label>AI API key (DeepSeek / Gemini)</label>
     <input id="aikey" type="password" placeholder="paste your key">
+    <label>Tavily API key (free: 1,000 news searches/month)</label>
+    <input id="tavilyKey" type="password" placeholder="paste your free Tavily key (optional)">
+    <div class="row">
+      <div class="status" id="tavilyUsage" style="flex:1;margin-bottom:0">Tavily usage: —</div>
+      <button class="btn-ghost" onclick="loadUsage()" style="margin-top:0">↻ Check</button>
+    </div>
+    <label>Chinese names — ticker_meta (this is where the Chinese edge comes from)</label>
+    <textarea id="tickerMeta" rows="8" style="width:100%;padding:12px;border-radius:8px;border:1px solid var(--border);background:#12151c;color:var(--text);font-family:monospace;font-size:13px;" placeholder='{"LX":{"name_zh":"乐信","name_en":"LexinFintech","aliases_zh":["乐信集团"],"subsidiaries_zh":["分期乐","桔子理财"]}}'></textarea>
+    <div class="hint">Per ticker: Chinese name + aliases + subsidiary brands (e.g. LX → 分期乐). Used to search Google News zh-CN, Eastmoney, Baidu and Tavily.</div>
+    <div class="row">
+      <div style="flex:1">
+        <label>Push mode</label>
+        <select id="pushMode">
+          <option value="all">All → push top-N by importance (cap below)</option>
+          <option value="score">Only importance ≥ min score</option>
+        </select>
+      </div>
+      <div style="flex:1">
+        <label>Push min importance (1–10, for score mode)</label>
+        <input id="pushMinScore" type="number" min="1" max="10" value="7">
+      </div>
+    </div>
+    <div class="row">
+      <div style="flex:1">
+        <label>Push floor (both modes, kills ⭐1–3 noise)</label>
+        <input id="pushMinImportance" type="number" min="1" max="10" value="4">
+      </div>
+      <div style="flex:1">
+        <label>Max items per ticker per digest</label>
+        <input id="pushMaxPerTicker" type="number" min="1" value="3">
+      </div>
+    </div>
+    <div class="row">
+      <div style="flex:1">
+        <label>News retention (days, rolling)</label>
+        <input id="retentionDays" type="number" min="1" value="21">
+      </div>
+      <div style="flex:1">
+        <label>Tavily max searches/day</label>
+        <input id="tavilyDaily" type="number" min="1" value="15">
+      </div>
+    </div>
+    <div class="row">
+      <div style="flex:1">
+        <label>Tavily max searches/month</label>
+        <input id="tavilyMonthly" type="number" min="1" value="850">
+      </div>
+      <div style="flex:1">
+        <label>Tavily skip if free sources found ≥ (items)</label>
+        <input id="tavilyMinFree" type="number" min="0" value="4">
+      </div>
+    </div>
     <div class="toggle" style="margin-top:14px">
       <span>Run the news updater (2x daily)</span>
       <label class="switch"><input type="checkbox" id="enabledToggle"><span class="slider"></span></label>
@@ -384,8 +472,30 @@ HTML = """<!DOCTYPE html>
     <div id="logTableWrap"></div>
   </div>
 
+  <div class="card">
+    <h2>5. Stored news (last 2 weeks, browsable)</h2>
+    <div class="row" style="margin-bottom:8px">
+      <input id="newsFilter" placeholder="Filter: ticker, category, title, source..." style="flex:1" onkeyup="renderNews()">
+      <button class="btn-ghost" onclick="loadNews()">📥 Load stored news</button>
+    </div>
+    <div class="status" id="newsStatus">Click "Load stored news" to fetch from the server.</div>
+    <div id="newsTableWrap"></div>
+    <div class="hint">Every item the updater found is stored here for ~3 weeks (rolling cleanup). Only the top-N by AI importance are pushed to Telegram.</div>
+  </div>
+
+  <div class="card">
+    <h2>6. Company lookup (auto-discovered)</h2>
+    <div class="row" style="margin-bottom:8px">
+      <button class="btn-ghost" onclick="loadLookup()">📖 Load company lookup</button>
+    </div>
+    <div class="status" id="lookupStatus">Shows what the updater knows about each company: Chinese names, aliases and subsidiaries (分期乐, Fenqile…). New tickers are looked up and populated automatically.</div>
+    <textarea id="lookupView" rows="10" readonly style="width:100%;padding:12px;border-radius:8px;border:1px solid var(--border);background:#12151c;color:var(--text);font-family:monospace;font-size:12px;"></textarea>
+    <div class="hint">This grows automatically (runs on the server). To override anything, edit the Chinese names JSON in Step 3 — config overrides always win.</div>
+  </div>
+
 <script>
 let tickers = [];
+let news = [];
 function $(id){ return document.getElementById(id); }
 function showMsg(t, type){ const m=$('msg'); m.textContent=t; m.className='msg '+type;
   setTimeout(()=>{ m.className='msg'; }, 8000); }
@@ -393,7 +503,8 @@ function showMsg(t, type){ const m=$('msg'); m.textContent=t; m.className='msg '
 function renderChips(){ const el=$('chips'); el.innerHTML='';
   tickers.forEach(t=>{ const c=document.createElement('span'); c.className='chip';
     c.innerHTML=t+' <button onclick="removeTicker(\\''+t+'\\')">&times;</button>'; el.appendChild(c); }); }
-function addTicker(){ const v=$('tickerInput').value.trim().toUpperCase();
+function addTicker(){ // Sanitize: only A-Z 0-9 . - (also blocks HTML/JS injection via quotes)
+  const v = $('tickerInput').value.trim().toUpperCase().replace(/[^A-Z0-9.-]/g,'');
   if(v && !tickers.includes(v)){ tickers.push(v); renderChips(); } $('tickerInput').value=''; }
 function removeTicker(t){ tickers=tickers.filter(x=>x!==t); renderChips(); }
 
@@ -413,8 +524,18 @@ async function load(){
   $('token').value = d.secrets.telegram_bot_token || '';
   $('chatid').value = d.secrets.telegram_chat_id || '';
   $('aikey').value = d.secrets.ai_api_key || '';
+  $('tavilyKey').value = d.secrets.tavily_api_key || '';
+  $('tickerMeta').value = JSON.stringify(d.config.ticker_meta || {}, null, 2);
+  $('pushMode').value = d.config.push_mode || 'all';
+  $('pushMinScore').value = d.config.push_min_score || 7;
+  $('pushMinImportance').value = d.config.push_min_importance || 4;
+  $('pushMaxPerTicker').value = d.config.push_max_per_ticker || 3;
+  $('retentionDays').value = d.config.news_retention_days || 21;
+  $('tavilyDaily').value = d.config.tavily_max_daily_searches || 15;
+  $('tavilyMonthly').value = d.config.tavily_max_monthly_searches || 850;
+  $('tavilyMinFree').value = d.config.tavily_min_free_items || 4;
   renderChips();
-  refreshStatus(); loadCron(); loadLogs();
+  refreshStatus(); loadCron(); loadLogs(); loadUsage();
 }
 
 async function refreshStatus(){
@@ -441,16 +562,71 @@ async function createVM(){
 
 async function uploadConfig(){
   showMsg('Uploading to server...','ok');
+  let tickerMeta = {};
+  try { tickerMeta = JSON.parse($('tickerMeta').value || '{}'); }
+  catch(e){ showMsg('❌ ticker_meta is not valid JSON: '+e.message, 'err'); return; }
   const d = await api('/api/upload', {
     tickers, enabled: $('enabledToggle').checked,
     ai_provider: $('aiProvider').value, ai_model: $('aiModel').value.trim(),
     ai_base_url: $('aiBase').value.trim(),
     telegram_bot_token: $('token').value.trim(), telegram_chat_id: $('chatid').value.trim(),
-    ai_api_key: $('aikey').value.trim(),
+    ai_api_key: $('aikey').value.trim(), tavily_api_key: $('tavilyKey').value.trim(),
+    ticker_meta: tickerMeta,
+    push_mode: $('pushMode').value, push_min_score: parseInt($('pushMinScore').value)||7,
+    push_min_importance: parseInt($('pushMinImportance').value)||4,
+    push_max_per_ticker: parseInt($('pushMaxPerTicker').value)||3,
+    news_retention_days: parseInt($('retentionDays').value)||21,
+    tavily_max_daily_searches: parseInt($('tavilyDaily').value)||15,
+    tavily_max_monthly_searches: parseInt($('tavilyMonthly').value)||850,
+    tavily_min_free_items: parseInt($('tavilyMinFree').value)||4,
+    lookup_refresh_days: 30,
   });
   $('log').textContent = d.output || '';
   showMsg(d.ok ? '✅ Config uploaded!' : '❌ '+d.error, d.ok?'ok':'err');
-  loadCron(); }
+  loadCron(); loadNews(); }
+
+async function loadUsage(){
+  const d = await api('/api/tavily');
+  if(!d.ok){ $('tavilyUsage').textContent = 'Tavily usage: ❌ '+(d.error||'?'); return; }
+  const u = d.usage || {};
+  const daily = $('tavilyDaily').value || 15, monthly = $('tavilyMonthly').value || 850;
+  $('tavilyUsage').textContent = 'Tavily usage: '+(u.count||0)+'/'+daily+' today · '+(u.month_count||0)+'/'+monthly+' this month';
+}
+
+async function loadNews(){
+  $('newsStatus').textContent = 'Fetching stored news from the server...';
+  const d = await api('/api/news');
+  if(!d.ok){ $('newsStatus').textContent = '❌ '+(d.error||'could not fetch news'); return; }
+  news = d.news || [];
+  $('newsStatus').textContent = news.length + ' stored item(s) (last 2 weeks).';
+  renderNews();
+}
+
+function renderNews(){
+  const q = $('newsFilter').value.trim().toLowerCase();
+  const rows = news.filter(n => !q || JSON.stringify(n).toLowerCase().includes(q));
+  if(!rows.length){ $('newsTableWrap').innerHTML = '<div class="empty">No stored news (or filter matches nothing).</div>'; return; }
+  let html = '';
+  for(const n of rows){
+    const title = n.title_en || n.title_raw || '';
+    const imp = n.importance!=null ? '⭐'+n.importance : '—';
+    const pushed = n.pushed ? '<span class="badge ok">pushed</span>' : '<span class="badge gray">stored</span>';
+    const src = (n.source||'') + (n.lang==='zh' ? ' 🇨🇳' : '');
+    html += '<tr><td>'+escapeHtml(n.first_seen||'')+'</td><td>'+escapeHtml(n.ticker||'')+'</td>'+
+      '<td>'+escapeHtml(src)+'</td><td>'+escapeHtml(n.category||'')+'</td><td>'+imp+'</td>'+
+      '<td>'+pushed+'</td><td>'+(n.url?'<a href="'+escapeHtml(n.url)+'" target="_blank">'+escapeHtml(title)+'</a>':escapeHtml(title))+'</td></tr>';
+  }
+  $('newsTableWrap').innerHTML = '<div class="tablewrap"><table><thead><tr><th>Seen (ET)</th><th>Ticker</th><th>Source</th><th>Cat</th><th>Imp</th><th>Status</th><th>Title (EN)</th></tr></thead><tbody>'+html+'</tbody></table></div>';
+}
+
+async function loadLookup(){
+  $('lookupStatus').textContent = 'Fetching company lookup from the server...';
+  const d = await api('/api/lookup');
+  if(!d.ok){ $('lookupStatus').textContent = '❌ '+(d.error||'could not fetch lookup'); return; }
+  $('lookupView').value = JSON.stringify(d.lookup || {}, null, 2);
+  const n = Object.keys(d.lookup || {}).length;
+  $('lookupStatus').textContent = n + ' company profile(s) on the server. New tickers get looked up + populated automatically on the next run.';
+}
 
 async function loadCron(){
   $('cronStatus').textContent = 'Checking schedule...';
@@ -548,6 +724,12 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_create_vm()
         elif parsed.path == "/api/run_now":
             self._handle_run_now()
+        elif parsed.path == "/api/news":
+            self._handle_news()
+        elif parsed.path == "/api/lookup":
+            self._handle_lookup()
+        elif parsed.path == "/api/tavily":
+            self._handle_tavily_usage()
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -615,8 +797,68 @@ class Handler(BaseHTTPRequestHandler):
         ok, out, err = run_gcloud([
             "compute", "ssh", "--zone", zone, VM_NAME,
             "--command", f"cd {home} && python3 news_updater.py --force 2>&1",
-            "--quiet"], timeout=180)
+            "--quiet"], timeout=600)
         self._send_json({"ok": ok, "error": (err or "") if not ok else "", "output": out + err})
+
+    def _handle_news(self):
+        """Fetch the stored news DB from the VM via the updater's --dump-news mode."""
+        zone = find_vm_zone()
+        if not zone:
+            self._send_json({"ok": False, "error": "VM not found. Create the server first."})
+            return
+        home = get_vm_home(zone)
+        ok, out, err = run_gcloud([
+            "compute", "ssh", "--zone", zone, VM_NAME,
+            "--command", f"cd {home} && python3 news_updater.py --dump-news 2>/dev/null",
+            "--quiet"], timeout=90)
+        if not ok:
+            self._send_json({"ok": False, "error": (err or "SSH failed").strip()[:400]})
+            return
+        try:
+            data = json.loads(out)
+            self._send_json({"ok": True, "news": data if isinstance(data, list) else []})
+        except Exception:
+            self._send_json({"ok": False, "error": "Could not parse stored news from the server."})
+
+    def _handle_lookup(self):
+        """Fetch the auto-grown company lookup from the VM (--dump-lookup)."""
+        zone = find_vm_zone()
+        if not zone:
+            self._send_json({"ok": False, "error": "VM not found. Create the server first."})
+            return
+        home = get_vm_home(zone)
+        ok, out, err = run_gcloud([
+            "compute", "ssh", "--zone", zone, VM_NAME,
+            "--command", f"cd {home} && python3 news_updater.py --dump-lookup 2>/dev/null || echo '{{}}'",
+            "--quiet"], timeout=90)
+        if not ok:
+            self._send_json({"ok": False, "error": (err or "SSH failed").strip()[:400]})
+            return
+        try:
+            data = json.loads(out)
+            self._send_json({"ok": True, "lookup": data if isinstance(data, dict) else {}})
+        except Exception:
+            self._send_json({"ok": False, "error": "Could not parse company lookup from the server."})
+
+    def _handle_tavily_usage(self):
+        """Fetch the Tavily usage tracker from the VM (--dump-usage)."""
+        zone = find_vm_zone()
+        if not zone:
+            self._send_json({"ok": False, "error": "VM not found. Create the server first."})
+            return
+        home = get_vm_home(zone)
+        ok, out, err = run_gcloud([
+            "compute", "ssh", "--zone", zone, VM_NAME,
+            "--command", f"cd {home} && python3 news_updater.py --dump-usage 2>/dev/null || echo '{{}}'",
+            "--quiet"], timeout=60)
+        if not ok:
+            self._send_json({"ok": False, "error": (err or "SSH failed").strip()[:400]})
+            return
+        try:
+            data = json.loads(out)
+            self._send_json({"ok": True, "usage": data if isinstance(data, dict) else {}})
+        except Exception:
+            self._send_json({"ok": False, "error": "Could not parse Tavily usage from the server."})
 
     def do_POST(self):
         parsed = urlparse(self.path)
@@ -624,7 +866,10 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(length).decode("utf-8"))
             cfg = load_config(); secrets = load_secrets()
-            cfg["tickers"] = [t.strip().upper() for t in data.get("tickers", []) if t.strip()]
+            # Sanitize tickers (A-Z 0-9 . -) - also blocks HTML/JS injection.
+            cfg["tickers"] = [
+                ''.join(c for c in t.strip().upper() if c.isascii() and (c.isalnum() or c in '.-'))
+                for t in data.get("tickers", []) if t.strip()]
             cfg["enabled"] = bool(data.get("enabled", True))
             cfg["initial_lookback_hours"] = int(data.get("initial_lookback_hours", 24))
             cfg["max_items_per_run"] = int(data.get("max_items_per_run", 40))
@@ -632,9 +877,22 @@ class Handler(BaseHTTPRequestHandler):
             cfg["ai_provider"] = data.get("ai_provider", "deepseek")
             cfg["ai_model"] = data.get("ai_model", "deepseek-v4-flash")
             cfg["ai_base_url"] = data.get("ai_base_url", "https://api.deepseek.com")
+            cfg["ticker_meta"] = data.get("ticker_meta", {}) or {}
+            cfg["push_mode"] = data.get("push_mode", "all")
+            cfg["push_min_score"] = int(data.get("push_min_score", 7))
+            cfg["push_min_importance"] = int(data.get("push_min_importance", 4))
+            cfg["push_max_per_ticker"] = int(data.get("push_max_per_ticker", 3))
+            cfg["news_retention_days"] = int(data.get("news_retention_days", 21))
+            cfg["seen_retention_days"] = max(int(data.get("news_retention_days", 21)),
+                                             int(data.get("seen_retention_days", 60)))
+            cfg["tavily_max_daily_searches"] = int(data.get("tavily_max_daily_searches", 15))
+            cfg["tavily_max_monthly_searches"] = int(data.get("tavily_max_monthly_searches", 850))
+            cfg["tavily_min_free_items"] = int(data.get("tavily_min_free_items", 4))
+            cfg["lookup_refresh_days"] = int(data.get("lookup_refresh_days", 90))
             secrets["telegram_bot_token"] = data.get("telegram_bot_token", "")
             secrets["telegram_chat_id"] = data.get("telegram_chat_id", "")
             secrets["ai_api_key"] = data.get("ai_api_key", "")
+            secrets["tavily_api_key"] = data.get("tavily_api_key", "")
             save_config(cfg); save_secrets(secrets)
             project = get_project()
             if not project:
