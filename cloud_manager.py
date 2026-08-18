@@ -472,8 +472,12 @@ HTML = """<!DOCTYPE html>
   <div class="card">
     <h2>4. Schedule & run history</h2>
     <div class="status" id="cronStatus">—</div>
-    <button class="btn-ghost" onclick="loadCron()">↻ Check schedule</button>
-    <button class="btn-ok" onclick="runNow()">▶ Run now (test)</button>
+    <div class="row">
+      <button class="btn-ghost" onclick="loadCron()">↻ Check schedule</button>
+      <button class="btn-ok" onclick="runNow(false)">▶ Run now (test)</button>
+      <button class="btn-ok" onclick="runNow(true)" title="Real run; if nothing is NEW it sends a 📊 snapshot of the current picture instead of nothing">📊 Run now + snapshot</button>
+    </div>
+    <div class="hint">Both buttons run the REAL updater (fetch + AI + Telegram). If nothing is new since the last run, no digest is sent (dedup) — the snapshot button always delivers the current picture.</div>
     <div class="log" id="log">Command output will appear here.</div>
     <div class="status" id="logStatus">—</div>
     <div id="logTableWrap"></div>
@@ -682,11 +686,17 @@ async function loadCron(){
   }
 }
 
-async function runNow(){
-  showMsg('Running news updater on the server now...','ok');
-  const d = await api('/api/run_now');
+async function runNow(withSnapshot){
+  showMsg('Running the real updater on the server now...','ok');
+  const d = await api('/api/run_now' + (withSnapshot ? '?snapshot=1' : ''));
   $('log').textContent = d.output || '';
-  showMsg(d.ok ? '✅ Ran successfully.' : '❌ '+d.error, d.ok?'ok':'err');
+  // Reflect what actually happened instead of a generic "test works" message.
+  const out = d.output || '';
+  let msg = '';
+  if(out.includes('Digest sent') || out.includes('snapshot sent')) msg = '✅ Real run done - Telegram message sent.';
+  else if(out.includes('No items to push') || out.includes('No new items') || out.includes('nothing to do') || out.includes('nothing sent')) msg = 'ℹ️ Run done - nothing NEW to send (dedup). ' + (withSnapshot ? 'No notable news in the last 24h.' : 'Try 📊 Run now + snapshot for the current picture.');
+  else msg = d.ok ? '✅ Real run completed (see log).' : '❌ '+(d.error||'run failed');
+  showMsg(msg, d.ok?'ok':'err');
   loadLogs(); }
 
 async function loadLogs(){
@@ -760,7 +770,7 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/create_vm":
             self._handle_create_vm()
         elif parsed.path == "/api/run_now":
-            self._handle_run_now()
+            self._handle_run_now(snapshot="snapshot=1" in parsed.query)
         elif parsed.path == "/api/news":
             self._handle_news()
         elif parsed.path == "/api/lookup":
@@ -844,15 +854,16 @@ class Handler(BaseHTTPRequestHandler):
         out += o; err += e
         return ok, out, err
 
-    def _handle_run_now(self):
+    def _handle_run_now(self, snapshot=False):
         zone = find_vm_zone()
         if not zone:
             self._send_json({"ok": False, "error": "VM not found. Create the server first."})
             return
         home = get_vm_home(zone)
+        extra = " --snapshot" if snapshot else ""
         ok, out, err = run_gcloud([
             "compute", "ssh", "--zone", zone, VM_NAME,
-            "--command", f"cd {home} && python3 news_updater.py --force 2>&1",
+            "--command", f"cd {home} && python3 news_updater.py --force{extra} 2>&1",
             "--quiet"], timeout=600)
         self._send_json({"ok": ok, "error": (err or "") if not ok else "", "output": out + err})
 

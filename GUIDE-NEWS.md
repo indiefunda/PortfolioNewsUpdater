@@ -205,7 +205,9 @@ allowance unused. Usage is tracked in `tavily_usage.json`.
 ```bash
 python3 news_updater.py --force           # run now (bypass schedule guard)
 python3 news_updater.py --force --dry-run  # run but DON'T send Telegram; print digest
-python3 news_updater.py --force --dry-run --no-write  # full test: no DB/lookup/history writes, no Tavily credits used
+python3 news_updater.py --force --snapshot # real run; if nothing NEW, send a 📊
+                                            # snapshot of the current picture instead
+python3 news_updater.py --force --dry-run --no-write  # full test: no DB/lookup/history writes, no Tavily/EXA credits used
 python3 news_updater.py --dump-news       # print stored news as JSON (panel browse)
 python3 news_updater.py --dump-news=LX    # ... only for LX
 python3 news_updater.py --dump-lookup     # print the company lookup as JSON (panel)

@@ -2034,6 +2034,38 @@ def format_macro(items):
     return "\n".join(lines)
 
 
+def build_snapshot(conn, hours=24, limit=10):
+    """
+    'Manual run' digest: the most important stored items from the last
+    'hours' (regardless of push state), so a manual run ALWAYS delivers
+    something - the current picture - instead of 'nothing new to push'
+    (which is what a normal run says when the dedup ledger has seen it all).
+    Returns the formatted message, or None if there is nothing notable.
+    """
+    cutoff = (datetime.now(EASTERN) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    rows = conn.execute(
+        "SELECT ticker, COALESCE(NULLIF(title_en,''), title_raw), importance, "
+        "category, impact, url FROM news WHERE first_seen >= ? "
+        "AND importance IS NOT NULL ORDER BY importance DESC, first_seen DESC LIMIT ?",
+        (cutoff, limit)).fetchall()
+    if not rows:
+        return None
+    lines = ["📊 Manual snapshot — most important items (last 24h)", ""]
+    for ticker, title, importance, category, impact, url in rows:
+        header = f"• [{ticker}] {title}"
+        if importance:
+            header += f" ⭐{importance}"
+        if category:
+            header += f" ({category})"
+        lines.append(header)
+        if impact:
+            lines.append(f"    → {impact}")
+        if url:
+            lines.append(f"    {url}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
@@ -2277,6 +2309,7 @@ def main():
         sys.exit(0)
 
     dry_run = "--dry-run" in sys.argv
+    snapshot = "--snapshot" in sys.argv  # manual run: always deliver (current picture)
     start_time = datetime.now(EASTERN)
     run_start = start_time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2628,6 +2661,25 @@ def main():
                     print(f"  Macro digest sent ({len(macro_pushed)} item(s)).")
                 else:
                     record["alerts_failed"] = record.get("alerts_failed", []) + ["macro"]
+        elif snapshot and token and chat_id and not dry_run:
+            # Manual run with nothing new: deliver the current picture instead.
+            snap_msg = build_snapshot(conn)
+            if snap_msg and send_telegram(token, chat_id, snap_msg):
+                print("  Manual snapshot sent (nothing new since last run - current picture).")
+            elif snap_msg:
+                record["alerts_failed"] = record.get("alerts_failed", []) + ["snapshot"]
+            else:
+                print("  Manual snapshot: nothing notable in the last 24h - nothing sent.")
+        elif snapshot and dry_run:
+            snap_msg = build_snapshot(conn)
+            if snap_msg:
+                print("\n" + "=" * 60)
+                print("DRY RUN - manual snapshot would be sent:")
+                print("=" * 60)
+                print(snap_msg)
+                print("=" * 60)
+            else:
+                print("  (snapshot: nothing notable in the last 24h)")
         conn.close()
         record["duration_sec"] = round((datetime.now(EASTERN) - start_time).total_seconds(), 2)
         append_run_record(record)
@@ -2687,6 +2739,25 @@ def main():
                       f"regular {len(pushed)} item(s)).")
         else:
             print("  Digest ready but Telegram not configured.")
+    elif snapshot and token and chat_id and not dry_run:
+        # Manual run with nothing push-worthy: deliver the current picture.
+        snap_msg = build_snapshot(conn)
+        if snap_msg and send_telegram(token, chat_id, snap_msg):
+            print("  Manual snapshot sent (nothing push-worthy - current picture).")
+        elif snap_msg:
+            record["alerts_failed"] = record.get("alerts_failed", []) + ["snapshot"]
+        else:
+            print("  Manual snapshot: nothing notable in the last 24h - nothing sent.")
+    elif snapshot and dry_run:
+        snap_msg = build_snapshot(conn)
+        if snap_msg:
+            print("\n" + "=" * 60)
+            print("DRY RUN - manual snapshot would be sent:")
+            print("=" * 60)
+            print(snap_msg)
+            print("=" * 60)
+        else:
+            print("  (snapshot: nothing notable in the last 24h)")
     else:
         print("  No items to push - nothing sent.")
 
