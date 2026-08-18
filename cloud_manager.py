@@ -68,10 +68,19 @@ DEFAULT_CONFIG = {
     # Company lookup: re-run auto-discovery for a ticker after this many days
     # (monthly default - new subsidiaries found are alerted on Telegram).
     "lookup_refresh_days": 30,
+    # China macro watch: huge policy/market news (rate cuts, stimulus,
+    # assisted-loan regulation) gated FREE by regex; only matched items reach
+    # the AI (one tiny batched call per run), pushed in their own digest
+    # section, capped at macro_max_per_run. macro_translate=false = zero AI.
+    "macro_enabled": True,
+    "macro_max_per_run": 3,
+    "macro_translate": True,
+    "macro_keywords": [],
     "sources": {
         "sec": True,
         "google_news_zh": True,
         "google_news_site": True,  # official company websites (site: search)
+        "google_news_macro": True,  # macro query (rate cuts / loan regulation)
         "eastmoney": True,
         "eastmoney_724": True,  # Eastmoney 7x24 fast-news wire (real-time tape)
         "sina_724": True,  # Sina 7x24 fast-news wire

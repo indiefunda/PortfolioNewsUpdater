@@ -11,8 +11,10 @@ to Telegram — **three times a day**, pinned to US market time (DST-aware),
 including a **23:00 ET run that catches the Chinese morning news burst**.
 
 **The edge:** a penalty to 分期乐, a HK subsidiary's license news, an
-official-site announcement, or a flash item on the Chinese wire — the stuff US
-English media never covers, delivered hours earlier.
+official-site announcement, a flash item on the Chinese wire — or a **huge
+China macro move (rate cuts, stimulus, assisted-loan regulation) pushed in a
+dedicated 📢 CHINA MACRO section, gated by free regex so it costs almost no
+AI** — the stuff US English media never covers, delivered hours earlier.
 
 - Everything runs on a **free** Google Cloud e2-micro VM ($0).
 - Cost is **$0/month** (see below). No spam: importance floors, per-ticker

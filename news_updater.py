@@ -1330,6 +1330,57 @@ def fetch_tavily(query, secrets, config, since_dt=None, limit=8, topic="news"):
 
 
 # ---------------------------------------------------------------------------
+# China macro watch - the "I HAVE TO KNOW" tier (huge policy/market news)
+# ---------------------------------------------------------------------------
+# A FREE regex gate decides whether an item is macro-relevant - NO AI cost to
+# filter. Only the few items that match ever reach the AI (one tiny batched
+# call per run). This is how "huge Chinese news" gets delivered without
+# burning tokens on everything else.
+MACRO_KEYWORDS = [
+    # Monetary policy
+    r"降息", r"加息", r"降准", r"LPR", r"贷款市场报价利率", r"中期借贷便利|MLF",
+    r"逆回购", r"存款准备金", r"货币政策", r"利率下调|下调利率|降低利率",
+    # Fiscal / stimulus
+    r"刺激(经济|消费|内需|市场)", r"万亿", r"特别国债", r"专项债",
+    r"财政(刺激|政策)", r"扩大内需", r"消费券", r"国常会", r"政治局会议",
+    r"中央经济工作会议", r"中央金融工作会议",
+    # Fintech / consumer-loan regulation (the names that matter to the user)
+    r"助贷", r"网络小额贷款|网络小贷|互联网小额贷款", r"消费金融(监管|新规|公司)?",
+    r"小额贷款(新规|利率|监管)?", r"个人征信|征信(新规|监管)?",
+    r"金融监管总局|银保监会|国家金融监督管理总局", r"互联网金融(监管|整治|新规)?",
+    r"互联网贷款(新规|监管)?", r"贷款(新规|年化利率|利率上限)", r"利率上限",
+    r"现金贷", r"金融科技(监管|新规)?", r"人工智能(金融|信贷|风控)|AI(金融|贷款|信贷)",
+    # Markets / external risk
+    r"中概股", r"中国金龙指数", r"熔断", r"千股跌停", r"退市新规",
+    r"制裁", r"关税", r"出口管制", r"实体清单",
+]
+# English labels for the most important patterns (used as a tag in the digest
+# and as the fallback when macro_translate is off - zero AI).
+MACRO_TAGS = [
+    ("降息", "RATE CUT"), ("加息", "RATE HIKE"), ("降准", "RRR CUT"),
+    ("LPR", "LPR"), ("特别国债", "T-BOND ISSUE"), ("万亿", "HUGE STIMULUS"),
+    ("刺激", "STIMULUS"), ("国常会", "STATE COUNCIL"), ("政治局", "POLITBURO"),
+    ("助贷", "ASSISTED-LOAN REG"), ("消费金融", "CONSUMER-FINANCE REG"),
+    ("网络小贷|网络小额贷款|互联网小额贷款", "ONLINE-LENDING REG"),
+    ("催收", "DEBT-COLLECTION"), ("现金贷", "CASH-LOAN REG"),
+    ("金融监管总局|银保监会|国家金融监督管理总局", "FIN REGULATOR"),
+    ("中概股|中国金龙", "CHINA ADR"), ("关税", "TARIFF"), ("制裁", "SANCTIONS"),
+    ("出口管制|实体清单", "EXPORT CONTROL"),
+]
+# One compact Google News query for longer-form macro coverage (the wires
+# carry the flash items; this catches the articles).
+MACRO_GNEWS_QUERY = "中国 央行 降息 降准 LPR 助贷 消费金融 中概股 刺激政策"
+
+
+def macro_tag(text):
+    """English label for a macro item (first matching pattern), or 'MACRO'."""
+    for pat, label in MACRO_TAGS:
+        if re.search(pat, text, re.IGNORECASE):
+            return label
+    return "MACRO"
+
+
+# ---------------------------------------------------------------------------
 # Chinese fast-news wires (the real-time "tape" - where alpha breaks first)
 # ---------------------------------------------------------------------------
 # 东财 7x24 快讯 (Eastmoney) and 新浪 7x24 (Sina): global breaking-news feeds
@@ -1562,7 +1613,34 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None):
         # (known_event) - this replaces the old separate dedup AI call.
         history = get_recent_seen_titles(conn, ticker, before=run_start) if conn else []
         hist_lines = [f"- {t}" for t in history]
-        prompt = (
+        if ticker == "MACRO":
+            # China macro: framed around impact on the user's fintech names.
+            prompt = (
+                "You are a China macro analyst. Below are major China policy / "
+                "market news items found today (already gated as macro-relevant).\n"
+                "For EACH item return one JSON object with keys:\n"
+                "  number, title_en (concise English translation), summary (one "
+                "English sentence), category (one of monetary, fiscal, "
+                "regulatory, fintech_reg, market, geopolitical, other), "
+                "importance (integer 1-10: 8-10 = will move Chinese stocks or "
+                "directly affects consumer-lending fintechs like QFIN/LX/LU; "
+                "6-7 = significant market news; <6 = minor), sentiment "
+                "(positive/negative/neutral), push (true if the user must know "
+                "about it NOW), duplicate_of (number of an earlier item that is "
+                "the same event, else null), known_event (true if same as an "
+                "ALREADY SEEN headline), reason (one short English sentence why "
+                "it matters), impact (one short English sentence: what this "
+                "means for US-listed Chinese fintech/consumer-lending companies "
+                "like 奇富科技 QFIN, 乐信 LX, 陆金所 LU - e.g. 'cheaper funding "
+                "for 分期乐's lending' or 'tighter assisted-loan rules pressure "
+                "origination volume'; empty string if not applicable).\n"
+                "Return ONLY a JSON array of these objects, same order as the items.\n\n"
+                "ALREADY SEEN (last few weeks):\n"
+                + ("\n".join(hist_lines) if hist_lines else "(none)")
+                + "\n\nITEMS:\n" + json.dumps(lines, ensure_ascii=False)
+            )
+        else:
+            prompt = (
             f"You are an investor's news analyst for the stock {ticker} "
             f"({name_zh}{(' / ' + name_en) if name_en else ''}"
             f"{(' | official site: ' + site) if site else ''}).\n"
@@ -1677,6 +1755,119 @@ def get_recent_seen_titles(conn, ticker, limit=SEMANTIC_DEDUP_HISTORY, before=No
             (ticker, limit),
         )
     return [r[0] for r in cur.fetchall() if r[0]]
+
+
+def is_macro(text, extra=None):
+    """Free regex gate: does this item look like BIG China macro news?
+    'extra' = user-supplied additional keywords from config (macro_keywords)."""
+    if not text:
+        return False
+    pats = MACRO_KEYWORDS + [str(p) for p in (extra or []) if str(p).strip()]
+    return any(re.search(p, text) for p in pats)
+
+
+def collect_macro_items(conn, config, secrets, wire_cache, src_on,
+                        initial_hours, run_start, now_utc_str):
+    """
+    The 'China macro' tier: huge policy/market news the user MUST know about
+    (rate cuts, stimulus, assisted-loan regulation, ...). Gated FREE by
+    regex (no AI cost to filter). Sources: the two 7x24 wires (already
+    fetched once per run) + one Google News macro query. New items are
+    stored under the pseudo-ticker "MACRO" and returned.
+    """
+    if not config.get("macro_enabled", True):
+        return []
+    extra = [str(k) for k in (config.get("macro_keywords") or []) if str(k).strip()]
+    raw_items = []
+    for wire_src in ("Eastmoney724", "Sina724"):
+        raw = wire_cache.get(wire_src)
+        if raw is None:
+            print(f"  [warn] macro: {wire_src} wire unavailable (delta not advanced).")
+            continue
+        if raw:
+            set_last_fetched(conn, "MACRO", wire_src, now_utc_str)
+        for it in raw:
+            if is_macro(f"{it.get('title', '')} {it.get('snippet', '')}", extra):
+                item = dict(it)
+                item["ticker"] = "MACRO"
+                item["source"] = wire_src
+                raw_items.append(item)
+    if src_on("google_news_macro"):
+        last = get_last_fetched(conn, "MACRO", "GoogleNewsMacro")
+        since_dt = (datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=EASTERN)
+                    if last else datetime.now(EASTERN) - timedelta(hours=initial_hours))
+        res = fetch_rss(google_news_url(MACRO_GNEWS_QUERY, "zh"), "MACRO", since_dt,
+                        source="GoogleNewsMacro", lang="zh")
+        if res is None:
+            print("  [warn] macro: Google News macro query failed - NOT advancing delta.")
+        else:
+            for it in res:
+                if is_macro(f"{it.get('title', '')} {it.get('snippet', '')}", extra):
+                    raw_items.append(it)
+            set_last_fetched(conn, "MACRO", "GoogleNewsMacro", now_utc_str)
+    seen_keys = set()
+    new_items = []
+    for it in raw_items:
+        key = (it["source"], it["id"])
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        it["published_at"] = _normalize_pub(it.get("date", ""))
+        it["first_seen"] = run_start
+        if is_new(conn, "MACRO", it["source"], it["id"], it["title"]):
+            new_items.append(it)
+            mark_seen(conn, "MACRO", it["source"], it["id"], it["title"], it.get("url", ""))
+            insert_news(conn, it)
+    return new_items
+
+
+def analyze_macro(macro_items, config, secrets, conn, run_start):
+    """
+    ONE tiny batched AI call for the macro items (translate + score + impact
+    on the user's fintech names) - typically 0-3 items, so a few hundred
+    tokens per run at most. When macro_translate is off (or no AI key), falls
+    back to pushing the raw Chinese headline + an English tag: ZERO AI cost.
+    """
+    if not macro_items:
+        return []
+    key = secrets.get("ai_api_key", "")
+    if config.get("macro_translate", True) and key:
+        meta = {"MACRO": {"name_zh": "中国宏观", "name_en": "China Macro",
+                          "subsidiaries_zh": [], "subsidiaries_other": []}}
+        analyzed = ai_analyze(macro_items, config, secrets, meta,
+                              conn=conn, run_start=run_start)
+        for it in analyzed:
+            update_news_ai(conn, it)
+        ranked = sorted(
+            [it for it in analyzed
+             if not it.get("is_dup") and not it.get("is_known") and it.get("push", True)],
+            key=lambda it: it.get("importance") or 0, reverse=True)
+        return ranked[:_cfg_int(config, "macro_max_per_run", 3)]
+    # Zero-AI fallback: raw Chinese + English tag, always pushed (capped).
+    for it in macro_items:
+        it["title_en"] = it.get("title", "")
+        it["impact"] = ""
+        it["importance"] = 8
+        it["push"] = True
+    return macro_items[:_cfg_int(config, "macro_max_per_run", 3)]
+
+
+def format_macro(items):
+    """The 'China Macro' digest section - big policy/market news, shown at the
+    top of the digest, tagged with an English label."""
+    if not items:
+        return None
+    lines = ["📢 CHINA MACRO — big policy/market news", ""]
+    for it in items:
+        title = it.get("title_en") or it.get("title", "")
+        tag = macro_tag(f"{it.get('title', '')} {it.get('snippet', '')}")
+        lines.append(f"• [{tag}] {title}")
+        if it.get("impact"):
+            lines.append(f"    → {it['impact']}")
+        if it.get("url"):
+            lines.append(f"    {it['url']}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1981,6 +2172,8 @@ def main():
         wire_cache["Eastmoney724"] = fetch_eastmoney_724()
     if src_on("sina_724"):
         wire_cache["Sina724"] = fetch_sina_724()
+    # Extra user keywords for the macro gate (config macro_keywords).
+    macro_extra = [str(k) for k in (config.get("macro_keywords") or []) if str(k).strip()]
 
     for ticker in tickers:
         # The lookup step: pull the company profile (Chinese name, aliases,
@@ -2041,6 +2234,10 @@ def main():
             found = 0
             for raw in raw_items:
                 hay = f"{raw.get('title', '')} {raw.get('snippet', '')}"
+                # Macro-matched items belong to the 📢 CHINA MACRO section -
+                # skip them here so they are not pushed twice.
+                if is_macro(hay, macro_extra):
+                    continue
                 if not any(t in hay for t in terms):
                     continue
                 pub_dt = _parse_pub(raw.get("date", ""))
@@ -2172,6 +2369,20 @@ def main():
     record["new_items"] = len(all_new)
     print(f"  {len(all_new)} new item(s) found (all stored in the news DB).")
 
+    # ---- China macro watch: the "I HAVE TO KNOW" tier ----
+    # Huge policy/market news (rate cuts, stimulus, assisted-loan regulation).
+    # Gated FREE by regex; only matched items reach the AI (one tiny batched
+    # call). Always pushed in their own digest section, never floor-capped.
+    macro_items = collect_macro_items(conn, config, secrets, wire_cache, src_on,
+                                      initial_hours, run_start, now_utc_str)
+    macro_pushed = analyze_macro(macro_items, config, secrets, conn, run_start)
+    for it in macro_items:
+        mark_pushed(conn, it, it in macro_pushed)
+    if macro_items:
+        print(f"  {len(macro_items)} China macro item(s) -> {len(macro_pushed)} "
+              f"pushed (the 'must know' tier).")
+    macro_digest = format_macro(macro_pushed)
+
     # Keep only the freshest items for the AI pass when there's a flood.
     # Real publish dates first; undated items (rare Tavily/Baidu hits) fall
     # back to first_seen so they are NOT treated as the oldest and trimmed.
@@ -2196,47 +2407,77 @@ def main():
         print(f"  Trimming to the {max_to_filter} most recent for AI analysis.")
         all_new = all_new[:max_to_filter]
 
-    if not all_new:
+    if not all_new and not macro_pushed:
         print("  No new items - nothing to do.")
+        if macro_digest:
+            if dry_run:
+                print("\n" + "=" * 60)
+                print("DRY RUN - CHINA MACRO:")
+                print("=" * 60)
+                print(macro_digest)
+                print("=" * 60)
+            elif token and chat_id:
+                if send_telegram(token, chat_id, macro_digest):
+                    print(f"  Macro digest sent ({len(macro_pushed)} item(s)).")
+                else:
+                    record["alerts_failed"] = record.get("alerts_failed", []) + ["macro"]
         conn.close()
         record["duration_sec"] = round((datetime.now(EASTERN) - start_time).total_seconds(), 2)
         append_run_record(record)
         return
 
-    # ---- AI analysis: translate + summarize + score + dedup in ONE call
-    # per ticker (the seen-ledger history is folded into the prompt, so no
-    # separate semantic-dedup AI call is needed - half the AI calls). ----
-    enriched = ai_analyze(all_new, config, secrets, effective_meta,
-                          conn=conn, run_start=run_start)
-    # Push selection FIRST: the regulatory force-push mutates importance /
-    # category in place, so it must run before update_news_ai persists the
-    # boosted values (otherwise the DB would show the pre-boost score).
-    pushed = select_push_items(enriched, config)
-    for it in enriched:
-        update_news_ai(conn, it)
-    for it in enriched:
-        mark_pushed(conn, it, it in pushed)
-    record["sent_items"] = len(pushed)
-    floor = _cfg_int(config, "push_min_importance", 4)
-    max_digest = _cfg_int(config, "max_digest_items", 10)
-    max_per_ticker = _cfg_int(config, "push_max_per_ticker", 3)
-    print(f"  Pushing {len(pushed)} item(s) to Telegram "
-          f"(importance >= {floor}, cap {max_digest}, max {max_per_ticker}/ticker). "
-          f"{len(enriched) - len(pushed)} item(s) stored for browsing.")
+    pushed = []
+    if all_new:
+        # ---- AI analysis: translate + summarize + score + dedup in ONE call
+        # per ticker (the seen-ledger history is folded into the prompt, so no
+        # separate semantic-dedup AI call is needed - half the AI calls). ----
+        enriched = ai_analyze(all_new, config, secrets, effective_meta,
+                              conn=conn, run_start=run_start)
+        # Push selection FIRST: the regulatory force-push mutates importance /
+        # category in place, so it must run before update_news_ai persists the
+        # boosted values (otherwise the DB would show the pre-boost score).
+        pushed = select_push_items(enriched, config)
+        for it in enriched:
+            update_news_ai(conn, it)
+        for it in enriched:
+            mark_pushed(conn, it, it in pushed)
+        record["sent_items"] = len(pushed)
+        floor = _cfg_int(config, "push_min_importance", 4)
+        max_digest = _cfg_int(config, "max_digest_items", 10)
+        max_per_ticker = _cfg_int(config, "push_max_per_ticker", 3)
+        print(f"  Pushing {len(pushed)} item(s) to Telegram "
+              f"(importance >= {floor}, cap {max_digest}, max {max_per_ticker}/ticker). "
+              f"{len(enriched) - len(pushed)} item(s) stored for browsing.")
 
-    digest = format_digest(pushed, len(tickers), stored_count=len(enriched) - len(pushed))
-    if digest:
+    digest = format_digest(pushed, len(tickers),
+                           stored_count=len(all_new) - len(pushed)) if pushed else None
+    if digest or macro_digest:
         if dry_run:
-            print("\n" + "=" * 60)
-            print("DRY RUN - digest would be sent to Telegram:")
-            print("=" * 60)
-            print(digest)
-            print("=" * 60)
+            if macro_digest:
+                print("\n" + "=" * 60)
+                print("DRY RUN - CHINA MACRO:")
+                print("=" * 60)
+                print(macro_digest)
+                print("=" * 60)
+            if digest:
+                print("\n" + "=" * 60)
+                print("DRY RUN - digest would be sent to Telegram:")
+                print("=" * 60)
+                print(digest)
+                print("=" * 60)
         elif token and chat_id:
-            if send_telegram(token, chat_id, digest):
-                print(f"  Digest sent with {len(pushed)} item(s).")
-            else:
+            sent_any = False
+            if macro_digest and send_telegram(token, chat_id, macro_digest):
+                sent_any = True
+            elif macro_digest:
+                record["alerts_failed"] = record.get("alerts_failed", []) + ["macro"]
+            if digest and send_telegram(token, chat_id, digest):
+                sent_any = True
+            elif digest:
                 record["alerts_failed"] = record.get("alerts_failed", []) + ["digest"]
+            if sent_any:
+                print(f"  Digest sent (macro {len(macro_pushed)} + "
+                      f"regular {len(pushed)} item(s)).")
         else:
             print("  Digest ready but Telegram not configured.")
     else:

@@ -60,6 +60,21 @@ company's business or stock") — shown in the digest with a → arrow, and stor
 with each item. Everything else stays in the DB — browse it from the panel
 (Step 5).
 
+## 📢 China Macro watch — the "I HAVE TO KNOW" tier
+
+Huge policy / market news — **rate cuts (降息/降准/LPR), stimulus (万亿/特别国债),
+assisted-loan regulation (助贷/消费金融/利率上限), 金融监管总局 actions, 中概股
+moves, tariffs/sanctions** — is caught in real time from the 7x24 wires plus a
+macro Google News query and pushed in its **own digest section at the top**,
+always (never floor-capped), capped at `macro_max_per_run` (default 3).
+
+**Cost:** the gate is a **free regex** — no AI is spent filtering. Only the
+few matched items (typically 0–3 per run) get ONE tiny batched AI call that
+translates and scores **impact on your fintech names (奇富科技 QFIN, 乐信 LX,
+陆金所 LU)**. Set `macro_translate: false` for zero AI on macro entirely (raw
+Chinese headline + English tag like `[RATE CUT]`). Add your own watchwords via
+`macro_keywords` (e.g. `["房地产新政", "平台经济"]`).
+
 ## Company lookup & auto-discovery (the "alpha" config)
 
 Real alpha is never on the ticker symbol — it's on the **subsidiaries**
