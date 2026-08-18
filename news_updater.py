@@ -2088,6 +2088,29 @@ def main():
     NO_WRITE = "--no-write" in sys.argv
 
     # ---- CLI modes first (never blocked by the schedule guard) ----
+    if "--purge-junk" in sys.argv:
+        # One-time cleanup of stored trash (never-pushed items scored at or
+        # below the junk bar). Run this after a filter fix to clean history.
+        threshold = 2
+        for a in sys.argv:
+            if a.startswith("--purge-junk"):
+                parts = a.split("=", 1)
+                if len(parts) == 2 and parts[1].strip().isdigit():
+                    threshold = int(parts[1].strip())
+        if NO_WRITE:
+            print("  [purge] --no-write set - nothing deleted.")
+            sys.exit(0)
+        conn = _db()
+        cur = conn.execute(
+            "DELETE FROM news WHERE pushed=0 AND importance IS NOT NULL "
+            "AND importance <= ?", (threshold,))
+        deleted = cur.rowcount
+        conn.commit()
+        conn.close()
+        print(f"  [purge] deleted {deleted} stored junk item(s) "
+              f"(pushed=0, importance <= {threshold}).")
+        sys.exit(0)
+
     if "--rediscover" in sys.argv:
         ticker_arg = None
         for a in sys.argv:

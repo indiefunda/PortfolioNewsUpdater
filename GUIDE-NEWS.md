@@ -202,6 +202,8 @@ python3 news_updater.py --dump-lookup     # print the company lookup as JSON (pa
 python3 news_updater.py --dump-usage      # print Tavily usage counters (panel meter)
 python3 news_updater.py --rediscover      # force re-discovery of ALL tickers now
 python3 news_updater.py --rediscover=LU   # ... only for LU
+python3 news_updater.py --purge-junk      # delete stored junk (never-pushed, importance<=2)
+python3 news_updater.py --purge-junk=3    # ... with a custom junk bar
 ```
 
 ## Important security note

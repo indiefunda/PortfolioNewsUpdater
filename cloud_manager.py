@@ -474,6 +474,7 @@ HTML = """<!DOCTYPE html>
     <div class="row" style="margin-bottom:8px">
       <input id="newsFilter" placeholder="Filter: ticker, category, title, source..." style="flex:1" onkeyup="renderNews()">
       <button class="btn-ghost" onclick="loadNews()">📥 Load stored news</button>
+      <button class="btn-ghost" onclick="purgeJunk()" title="Delete stored, never-pushed items scored <= 2 (old filter gaps)">🧹 Purge junk</button>
     </div>
     <div class="status" id="newsStatus">Click "Load stored news" to fetch from the server.</div>
     <div id="newsTableWrap"></div>
@@ -611,6 +612,14 @@ async function loadNews(){
   renderNews();
 }
 
+async function purgeJunk(){
+  if(!confirm('Delete all STORED (never-pushed) items scored <= 2? This cleans out old filter-gap junk (Heineken for LX, etc.). Pushed items and higher-scored stored items are kept.')) return;
+  $('newsStatus').textContent = '🧹 Purging junk on the server...';
+  const d = await api('/api/purge_junk');
+  $('newsStatus').textContent = d.ok ? '✅ '+d.output : '❌ '+(d.error||'failed');
+  loadNews();
+}
+
 function renderNews(){
   const q = $('newsFilter').value.trim().toLowerCase();
   const rows = news.filter(n => !q || JSON.stringify(n).toLowerCase().includes(q));
@@ -744,6 +753,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_lookup()
         elif parsed.path == "/api/tavily":
             self._handle_tavily_usage()
+        elif parsed.path == "/api/purge_junk":
+            self._handle_purge_junk()
         elif parsed.path == "/api/rediscover":
             self._handle_rediscover()
         else:
@@ -904,6 +915,22 @@ class Handler(BaseHTTPRequestHandler):
             "--quiet"], timeout=600)
         tail = (out + err).strip().splitlines()
         tail = tail[-15:] if len(tail) > 15 else tail
+        self._send_json({"ok": ok, "error": (err or "") if not ok else "",
+                         "output": "\n".join(tail)})
+
+    def _handle_purge_junk(self):
+        """Delete stored junk (never-pushed, importance<=2) on the VM."""
+        zone = find_vm_zone()
+        if not zone:
+            self._send_json({"ok": False, "error": "VM not found. Create the server first."})
+            return
+        home = get_vm_home(zone)
+        ok, out, err = run_gcloud([
+            "compute", "ssh", "--zone", zone, VM_NAME,
+            "--command", f"cd {home} && python3 news_updater.py --purge-junk 2>&1",
+            "--quiet"], timeout=120)
+        tail = (out + err).strip().splitlines()
+        tail = tail[-10:] if len(tail) > 10 else tail
         self._send_json({"ok": ok, "error": (err or "") if not ok else "",
                          "output": "\n".join(tail)})
 
