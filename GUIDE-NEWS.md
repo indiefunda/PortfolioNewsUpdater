@@ -20,7 +20,15 @@ instant no-op, so exactly **two real runs happen per day**.
 
 ## What it checks (per ticker, per run — only the "delta" since last time)
 
-1. **SEC EDGAR** filings (8-K, 10-Q, 10-K, 6-K, 20-F, SCHEDULE 13D/13G, …)
+1. **SEC EDGAR** filings — 8-K/8-K/A, 10-Q, 10-K, **6-K/6-K/A** (the
+   workhorse for Chinese ADRs), 20-F, F-1, 424B3/424B4, DEF 14A, **Form 3/4**
+   (insider ownership), 144, SCHEDULE 13D/13G + amendments, SC 13E-3/13E-4
+   (going-private), **25** (delisting), 13F-HR. For 6-K and 8-K the updater
+   reads the filing text and extracts what actually happened (the "INFORMATION
+   CONTAINED IN THIS REPORT" paragraph / the 8-K Item codes) so the AI scores
+   substance, not just the form name. (Chinese ADRs are foreign private
+   issuers: they file 6-K/20-F, not 8-K/10-K, and don't file Form 4 — form 3
+   catches new insiders.)
 2. **Google News zh-CN** — searches the company's **Chinese name and its
    subsidiaries** (e.g. LX → `乐信 OR 分期乐 OR 桔子理财`)
 3. **Eastmoney (东方财富)** — Chinese financial news search API, one query per

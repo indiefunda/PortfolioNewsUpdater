@@ -111,8 +111,11 @@ COMPANY_LOOKUP_FILE = os.path.join(BASE_DIR, "company_lookup.json")
 # New tickers are discovered on their first run; failed lookups retry weekly.
 LOOKUP_REFRESH_DAYS = 30
 
-# SEC identity (required by edgartools / SEC fair-access policy).
-SEC_IDENTITY = "PortfolioNewsUpdater personal-use news monitor"
+# SEC identity (required by edgartools / SEC fair-access policy). NOTE: the
+# email part is REQUIRED by edgartools for filing-level requests (f.obj(),
+# f.text()); without it, enrichment silently fails. Replace with your own
+# contact email if you prefer.
+SEC_IDENTITY = "PortfolioNewsUpdater personal-use news monitor news@example.com"
 
 # Eastmoney (东方财富) search API - public JSONP endpoint used to search
 # Chinese financial news by company name (works for US-listed Chinese
@@ -827,11 +830,66 @@ def ensure_company_meta(ticker, config, secrets, force=False):
 # ---------------------------------------------------------------------------
 # SEC EDGAR (via edgartools)
 # ---------------------------------------------------------------------------
+# Form types that matter to an investor. Includes the company's own reports
+# AND ownership filings. Note: US-listed Chinese ADRs are FOREIGN PRIVATE
+# ISSUERS - they file 6-K (all material events) and 20-F (annual), NOT 8-K
+# or 10-K, and they are exempt from Section 16, so Form 4 (insider trades)
+# never appears for them; form "3" (new insider initial ownership) does.
 SEC_FORMS = [
-    "8-K", "10-Q", "10-K", "6-K", "20-F", "F-1", "424B4",
-    "DEF 14A", "SCHEDULE 13D", "SC 13D", "SCHEDULE 13D/A", "SC 13D/A",
+    "8-K", "8-K/A", "10-Q", "10-K", "6-K", "6-K/A", "20-F", "F-1", "424B3",
+    "424B4", "DEF 14A", "3", "4", "144",
+    "SCHEDULE 13D", "SC 13D", "SCHEDULE 13D/A", "SC 13D/A",
     "SCHEDULE 13G", "SC 13G", "SCHEDULE 13G/A", "SC 13G/A",
+    "SC 13E-3", "SC 13E-4", "25", "13F-HR",
 ]
+
+
+def _extract_sec_substance(form, text):
+    """
+    Best-effort extraction of WHAT a filing is about from its primary
+    document text. Returns (title_suffix, snippet); ('', '') when nothing
+    useful is found (caller keeps the plain "form filed date" title).
+
+      - 6-K (the workhorse for Chinese ADRs): the "INFORMATION CONTAINED IN
+        THIS REPORT ON FORM 6-K" paragraph (e.g. "...issued a press release
+        announcing financial results...").
+      - 8-K / 8-K/A (US companies): the Item codes (Item 1.01, 5.02, ...).
+      - Form 4 / Form 3 (US companies): insider name + buy/sell + shares.
+    """
+    if not text:
+        return "", ""
+    flat = re.sub(r"\s+", " ", text)
+    if form in ("6-K", "6-K/A"):
+        m = re.search(r"INFORMATION CONTAINED IN THIS REPORT ON FORM 6-K\s*(.+)",
+                      flat, re.IGNORECASE)
+        para = (m.group(1).strip() if m else "")
+        if len(para) < 20:
+            return "", ""
+        first_sent = re.split(r"(?<=[.!?])\s+", para)[0].strip()
+        return first_sent[:130], para[:300]
+    if form in ("8-K", "8-K/A"):
+        found = []
+        for it in re.findall(r"Item\s+(\d\.\d{2}(?:\([a-z]\))?)", flat, re.IGNORECASE):
+            code = it.strip()
+            if code not in found:
+                found.append(code)
+        if found:
+            return "Item " + ", ".join(found[:6]), "Items: " + ", ".join(found[:8])
+        return "", ""
+    if form in ("4", "3"):
+        m_name = re.search(r"rptOwnerName[^>]*>\s*([^<]+)", flat, re.IGNORECASE)
+        name = m_name.group(1).strip() if m_name else ""
+        if form == "4":
+            code = re.search(r"transactionCode[^>]*>\s*([A-Z])", flat, re.IGNORECASE)
+            code = code.group(1).upper() if code else ""
+            shares = re.search(r"transactionShares[^>]*>.*?<value>\s*([\d,.]+)",
+                               flat, re.IGNORECASE)
+            sh = shares.group(1).strip() if shares else ""
+            label = {"P": "BOUGHT", "S": "SOLD"}.get(code, code or "")
+            parts = [p for p in (name, label, (sh + " sh" if sh else "")) if p]
+            return ("Form 4: " + " ".join(parts)) if parts else "", ""
+        return (f"Form 3: {name}") if name else "", ""
+    return "", ""
 
 
 def fetch_sec_filings(ticker, since_dt):
@@ -864,6 +922,20 @@ def fetch_sec_filings(ticker, since_dt):
             else:
                 url = ""
             title = f"{company_name} - {form} filed {filed}"
+            snippet = ""
+            # Enrichment: pull the primary document text for the forms where
+            # the substance matters (6-K for ADRs; 8-K/Form 4/3 for US names)
+            # and extract WHAT happened. Fully guarded - any failure keeps the
+            # plain title (never break the SEC fetch).
+            if form in ("6-K", "6-K/A", "8-K", "8-K/A", "4", "3"):
+                try:
+                    text = f.text()
+                    suffix, snippet = _extract_sec_substance(form, text)
+                    if suffix:
+                        title = f"{company_name} - {form}: {suffix}"
+                except Exception as exc:
+                    print(f"  [warn] SEC {ticker} {form} enrichment failed: {exc}",
+                          file=sys.stderr)
             items.append({
                 "source": "SEC",
                 "ticker": ticker,
@@ -872,7 +944,7 @@ def fetch_sec_filings(ticker, since_dt):
                 "url": url,
                 "date": filed,
                 "lang": "en",
-                "snippet": "",
+                "snippet": snippet,
                 "form": form,
                 "company": company_name,
             })
