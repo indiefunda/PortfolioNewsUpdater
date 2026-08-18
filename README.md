@@ -50,6 +50,11 @@ official-site announcement — the stuff US English media never covers.
    updater auto-discovers each company's Chinese name, subsidiaries and
    websites, and alerts you on Telegram when it finds new ones.
 
+> Your personal `config_local.json` (tickers/holdings) is created by the
+> panel on first upload and is **git-ignored — never committed**. For local
+> CLI testing, copy `config_local.example.json` → `config_local.json` and
+> edit it.
+
 Full details, troubleshooting and all knobs: **GUIDE-NEWS.md**.
 
 ---
@@ -67,4 +72,7 @@ Full details, troubleshooting and all knobs: **GUIDE-NEWS.md**.
 
 - Keys live in `secrets_local.json`, which is **git-ignored** — never commit
   or share it. Every user uses their own keys and their own VM.
+- Your **personal config** (`config_local.json` — tickers/holdings) is also
+  **git-ignored**; the repo ships a blank `config_local.example.json`
+  template instead.
 - The control panel binds to `127.0.0.1` only (never exposed to the network).

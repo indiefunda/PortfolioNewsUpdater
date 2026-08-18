@@ -1,0 +1,31 @@
+{
+  "tickers": [],
+  "enabled": true,
+  "initial_lookback_hours": 24,
+  "max_items_per_run": 40,
+  "max_digest_items": 10,
+  "ai_provider": "deepseek",
+  "ai_model": "deepseek-v4-flash",
+  "ai_base_url": "https://api.deepseek.com",
+  "news_retention_days": 21,
+  "seen_retention_days": 21,
+  "push_mode": "all",
+  "push_min_score": 7,
+  "push_min_importance": 4,
+  "push_max_per_ticker": 3,
+  "tavily_max_daily_searches": 15,
+  "tavily_max_monthly_searches": 850,
+  "tavily_min_free_items": 4,
+  "lookup_refresh_days": 30,
+  "sources": {
+    "sec": true,
+    "google_news_zh": true,
+    "google_news_site": true,
+    "eastmoney": true,
+    "baidu": false,
+    "tavily": true,
+    "google_news_en": true
+  },
+  "ticker_meta": {},
+  "rss_feeds": {}
+}

@@ -11,6 +11,9 @@ secrets_local.json
 .env
 *.env
 
+# Personal config (contains YOUR tickers / holdings - never commit)
+config_local.json
+
 # Runtime data
 news.db
 run_history.json
