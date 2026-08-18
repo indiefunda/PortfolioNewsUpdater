@@ -88,7 +88,8 @@ knowledge base in `company_lookup.json` (on the server):
 
 3. In the panel:
    - **Connect to Google** → Authenticate.
-   - **Your server** → **Create/update free server** (reuses your `stock-monitor` VM).
+   - **Your server** → **Create/update free server** (creates the free
+     e2-micro VM; re-runs safely if it already exists).
    - **Configuration** → add tickers, pick AI provider, paste Telegram +
      AI keys, and paste your free **Tavily key** (optional but recommended).
    - **Chinese names (ticker_meta)** → per-ticker JSON with `name_zh`,
@@ -105,7 +106,9 @@ knowledge base in `company_lookup.json` (on the server):
      }
      ```
    - **Push mode**: `all` pushes the top-N by AI importance; `score` only
-     pushes items ≥ the min score. `max_digest_items` caps the digest.
+     pushes items ≥ the min score. **Both modes apply the importance floor**
+     (`push_min_importance`, default 4) and the per-ticker cap.
+     `max_digest_items` caps the digest.
    - **Upload config to server**, then **Run now (test)**, then check
      **Stored news (Step 5)** to see everything it found.
 
@@ -176,8 +179,9 @@ python3 news_updater.py --rediscover=LU   # ... only for LU
 
 Your **AI key**, **Telegram token**, and **Tavily key** live in
 `secrets_local.json`, which is **git-ignored** — never commit or share it.
-Tavily usage is tracked in `tavily_usage.json` (also runtime data, git-ignored
-via `*.json` patterns if added — see below).
+Your **tickers/holdings** live in `config_local.json` (also git-ignored; the
+repo ships a blank `config_local.example.json` template). Runtime data —
+`news.db`, `company_lookup.json`, `tavily_usage.json` — is git-ignored too.
 
 ## Stopping it (if you ever need to)
 

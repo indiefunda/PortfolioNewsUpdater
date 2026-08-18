@@ -12,26 +12,32 @@ translated to English and scored by AI, and only the most important items
 are pushed to Telegram.
 
 Pipeline (v2):
-  TICKERS (+ Chinese names/aliases/subsidiaries)
-    -> [SEC EDGAR, Google News EN, Google News ZH, Eastmoney,
-       Baidu News, Tavily news search, company RSS]
+  TICKERS (+ Chinese names/aliases/subsidiaries + websites, auto-discovered)
+    -> [SEC EDGAR (6-K/8-K content extracted), Google News EN/ZH, Google News
+       site: (official websites), Eastmoney, Baidu, Tavily news search, RSS]
     -> NORMALIZE -> DEDUPLICATE (SQLite exact hash)
     -> store EVERY new item in the `news` table
     -> AI ANALYSIS (one batched call per ticker): translate to English,
-       summarize, categorize, importance 1-10, sentiment, push/store
-    -> SEMANTIC DEDUP vs already-pushed news (no re-push of the same event)
+       summarize, categorize, importance 1-10, sentiment, push/store, AND
+       folded dedup (known_event vs the `seen` ledger - no separate call)
     -> PUSH selection: importance floor + AI veto + regulatory force-push,
        ranked by importance (Chinese sources weigh higher), per-ticker cap,
        max_digest_items -> TELEGRAM digest (split into <=4000-char messages)
-    -> ROLLING CLEANUP: news kept 21 days, dedup hashes 60 days (configurable)
+    -> ROLLING CLEANUP: news kept 21 days, dedup hashes 21 days (configurable)
 
 New CLI modes:
   --force          bypass the schedule guard (panel "Run now" uses this)
   --dry-run        do everything except sending Telegram (prints the digest)
-  --dump-news[=TICKER]   print the stored news (last 2 weeks) as JSON and exit
+  --no-write       do everything except touching ANY state (in-memory DB, no
+                   writes, no alerts, no Tavily credit usage) - safe testing
+  --dump-news[=TICKER]   print the stored news as JSON and exit
                          (used by the panel's "stored news" browse view)
+  --dump-lookup    print the company lookup (names/subsidiaries/websites)
+  --dump-usage     print the Tavily usage counters (panel meter)
+  --rediscover[=TICKER]  force a re-discovery of the company lookup now
 
-Reads config_local.json and secrets_local.json (git-ignored).
+Reads config_local.json and secrets_local.json (both git-ignored), plus the
+auto-grown company_lookup.json and tavily_usage.json (also git-ignored).
 """
 
 import hashlib
@@ -245,7 +251,7 @@ def _db():
         )"""
     )
     # The real news database: every item ever fetched is stored here (raw +
-    # AI-enriched), so you can browse the last ~2 weeks of news even when it
+    # AI-enriched), so you can browse the last ~3 weeks of news even when it
     # wasn't pushed to Telegram.
     conn.execute(
         """CREATE TABLE IF NOT EXISTS news (
@@ -373,7 +379,7 @@ def mark_pushed(conn, item, pushed):
 
 
 def list_news(conn, ticker=None, limit=300):
-    """Return stored news (last 2 weeks) as a list of dicts for browsing."""
+    """Return stored news (last ~3 weeks) as a list of dicts for browsing."""
     cols = ["ticker", "source", "lang", "title_en", "title_raw", "summary",
             "category", "importance", "sentiment", "pushed", "url",
             "published_at", "first_seen", "reason"]
@@ -676,6 +682,13 @@ def discover_company(ticker, config, secrets, existing=None):
         "subsidiaries_zh": list(existing.get("subsidiaries_zh", []) or []),
         "subsidiaries_other": list(existing.get("subsidiaries_other", []) or []),
         "keywords": list(existing.get("keywords", []) or []),
+        # Carry discovered websites forward! On the 30-day re-discovery the
+        # AI's new result set often won't re-emit the company URL - without
+        # this, a refresh would silently delete the websites and the
+        # GoogleNewsSite (site:) source would go dark for that ticker.
+        "website": str(existing.get("website") or "").strip(),
+        "news_url": str(existing.get("news_url") or "").strip(),
+        "subsidiary_websites": dict(existing.get("subsidiary_websites") or {}),
         "last_updated": today,
         "lookup_attempted": True,
     }
@@ -892,9 +905,14 @@ def _extract_sec_substance(form, text):
     return "", ""
 
 
-def fetch_sec_filings(ticker, since_dt):
+def fetch_sec_filings(ticker, since_dt, conn=None):
     """
     SEC filings for this ticker filed since since_dt, using edgartools.
+
+    'conn' (the DB) lets us skip the expensive primary-document fetch for
+    filings already seen in previous runs - the delta date filter already
+    limits the list, but after a long gap or a re-run we avoid re-downloading
+    documents just to re-dedupe them.
 
     Returns a list of items, or None if the fetch FAILED (so the caller knows
     NOT to advance the delta timestamp and risk missing news).
@@ -926,8 +944,12 @@ def fetch_sec_filings(ticker, since_dt):
             # Enrichment: pull the primary document text for the forms where
             # the substance matters (6-K for ADRs; 8-K/Form 4/3 for US names)
             # and extract WHAT happened. Fully guarded - any failure keeps the
-            # plain title (never break the SEC fetch).
-            if form in ("6-K", "6-K/A", "8-K", "8-K/A", "4", "3"):
+            # plain title (never break the SEC fetch). Skip the download for
+            # filings already seen in a previous run (deduped anyway).
+            already_seen = (conn is not None
+                            and not is_new(conn, ticker, "SEC",
+                                           acc or f"{form}-{filed}", title))
+            if form in ("6-K", "6-K/A", "8-K", "8-K/A", "4", "3") and not already_seen:
                 try:
                     text = f.text()
                     suffix, snippet = _extract_sec_substance(form, text)
@@ -952,6 +974,23 @@ def fetch_sec_filings(ticker, since_dt):
         print(f"  [error] SEC {ticker}: {exc}", file=sys.stderr)
         return None
     return items
+
+
+SEC_VALIDATE_FILE = os.path.join(BASE_DIR, "sec_validate.json")
+
+
+def sec_validate_due():
+    """Run the (informational) SEC coverage check at most once a week -
+    it costs one EDGAR request per ticker, which adds up at 15 tickers."""
+    data = _read_json(SEC_VALIDATE_FILE, {})
+    last = str(data.get("last") or "")
+    if not last:
+        return True
+    try:
+        return (datetime.strptime(last, "%Y-%m-%d").date()
+                < (datetime.now(EASTERN) - timedelta(days=7)).date())
+    except Exception:
+        return True
 
 
 def validate_sec_tickers(tickers):
@@ -1400,10 +1439,14 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None):
 
     enriched = []
     for ticker, ticker_items in by_ticker.items():
-        meta = meta_map.get(ticker, {})
-        name_zh = meta.get("name_zh", "") or ticker
-        name_en = meta.get("name_en", "") or ""
-        subs = "、".join(meta.get("subsidiaries_zh", []) or []) or "its subsidiaries"
+        meta = meta_map.get(ticker, {}) or {}
+        # Normalize - the lookup file is AI-grown and could hold odd shapes
+        # (a string where a list belongs); never let that crash the run.
+        name_zh = str(meta.get("name_zh") or ticker)
+        name_en = str(meta.get("name_en") or "")
+        subs = ("、".join(str(x) for x in (meta.get("subsidiaries_zh") or [])
+                          if str(x).strip())) or "its subsidiaries"
+        site = str(meta.get("website") or "")
         lines = []
         for i, it in enumerate(ticker_items, 1):
             entry = {
@@ -1424,7 +1467,7 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None):
         prompt = (
             f"You are an investor's news analyst for the stock {ticker} "
             f"({name_zh}{(' / ' + name_en) if name_en else ''}"
-            f"{(' | official site: ' + meta['website']) if meta.get('website') else ''}).\n"
+            f"{(' | official site: ' + site) if site else ''}).\n"
             f"Chinese-language news about this company or its subsidiaries "
             f"(e.g. {subs}) is especially valuable - weigh it heavily; it often "
             f"contains information English media misses.\n"
@@ -1780,7 +1823,12 @@ def main():
         record["status"] = "error"; record["error"] = "No tickers."
         append_run_record(record); return
 
-    validate_sec_tickers(tickers)
+    if sec_validate_due():
+        validate_sec_tickers(tickers)
+        if not NO_WRITE:
+            _write_json(SEC_VALIDATE_FILE, {"last": start_time.strftime("%Y-%m-%d")})
+    else:
+        print("  [sec] coverage check skipped (ran within the last 7 days).")
 
     secrets = load_secrets()
     token = secrets.get("telegram_bot_token", "")
@@ -1803,6 +1851,7 @@ def main():
     record["tickers_checked"] = len(tickers)
 
     initial_hours = _cfg_int(config, "initial_lookback_hours", 24)
+    # ET wall-clock string used for the per-source last_fetched deltas.
     now_utc_str = datetime.now(EASTERN).strftime("%Y-%m-%d %H:%M:%S")
     sources_cfg = config.get("sources", {})
     # The effective per-ticker profiles (company_lookup.json + config
@@ -1819,8 +1868,14 @@ def main():
     for ticker in tickers:
         # The lookup step: pull the company profile (Chinese name, aliases,
         # subsidiaries like 分期乐/Fenqile) - discovering + populating the
-        # lookup file if this ticker is new or stale.
-        meta = ensure_company_meta(ticker, config, secrets)
+        # lookup file if this ticker is new or stale. Isolated so one
+        # ticker's lookup failure (network, AI, disk) never kills the run.
+        try:
+            meta = ensure_company_meta(ticker, config, secrets)
+        except Exception as exc:
+            print(f"  [error] company lookup for {ticker} failed: {exc}",
+                  file=sys.stderr)
+            continue
         effective_meta[ticker] = meta
         zh_terms = build_zh_terms(meta)
         en_terms = build_en_terms(meta)
@@ -1859,7 +1914,7 @@ def main():
 
         # 1) SEC filings (English, ADR regulatory coverage).
         if src_on("sec"):
-            process_source("SEC", lambda sd: fetch_sec_filings(ticker, sd))
+            process_source("SEC", lambda sd: fetch_sec_filings(ticker, sd, conn=conn))
 
         # 2) Chinese sources (the alpha) - require Chinese search terms.
         if zh_terms:
@@ -1968,7 +2023,9 @@ def main():
                 return datetime.strptime(fs, "%Y-%m-%d %H:%M:%S").replace(tzinfo=EASTERN)
             except Exception:
                 pass
-        return datetime.min
+        # Aware, like every other branch - a naive datetime.min here would
+        # raise TypeError when sorting mixed-aware datetimes.
+        return datetime.min.replace(tzinfo=EASTERN)
     all_new.sort(key=_sort_key, reverse=True)
 
     max_to_filter = _cfg_int(config, "max_items_per_run", 40)
@@ -1988,11 +2045,12 @@ def main():
     # separate semantic-dedup AI call is needed - half the AI calls). ----
     enriched = ai_analyze(all_new, config, secrets, effective_meta,
                           conn=conn, run_start=run_start)
+    # Push selection FIRST: the regulatory force-push mutates importance /
+    # category in place, so it must run before update_news_ai persists the
+    # boosted values (otherwise the DB would show the pre-boost score).
+    pushed = select_push_items(enriched, config)
     for it in enriched:
         update_news_ai(conn, it)
-
-    # ---- Push selection (floor, AI veto, regulatory boost, per-ticker cap) ----
-    pushed = select_push_items(enriched, config)
     for it in enriched:
         mark_pushed(conn, it, it in pushed)
     record["sent_items"] = len(pushed)

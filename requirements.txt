@@ -1,3 +1,5 @@
 requests>=2.31
 feedparser>=6.0.10
-edgartools>=2.0
+edgartools>=5.0
+# zoneinfo needs the tzdata wheel on Windows (local dry-runs); Debian VM has it
+tzdata>=2024.1; platform_system == "Windows"

@@ -21,6 +21,9 @@ news_run_history.json
 seen.json
 tavily_usage.json
 company_lookup.json
+sec_validate.json
+*.log
+*.tmp
 
 # Test artifacts
 _test_ai.py

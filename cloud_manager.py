@@ -18,9 +18,9 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config_local.json")
@@ -29,7 +29,6 @@ PORT = 8001
 
 # VM defaults (reuse the same free VM as the price monitor)
 VM_NAME = "stock-monitor"
-VM_ZONE = "us-east1-b"
 VM_MACHINE = "e2-micro"
 VM_IMAGE = "debian-12"
 VM_ZONES = [
@@ -105,8 +104,12 @@ def _read_json(path, default):
 
 
 def _write_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
+    """Atomic write (tmp + os.replace) - a crash mid-write must never corrupt
+    config_local.json / secrets_local.json into silently-wiped defaults."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp, path)
 
 
 def load_config():
@@ -275,24 +278,6 @@ def fetch_vm_cron_status():
     }
 
 
-def fetch_vm_network_usage():
-    zone = find_vm_zone()
-    if not zone:
-        return {}
-    home = get_vm_home(zone)
-    ok, out, _ = run_gcloud([
-        "compute", "ssh", "--zone", zone, VM_NAME,
-        "--command", f"cat {home}/network_usage.json 2>/dev/null || echo '{{}}'",
-        "--quiet"], timeout=60)
-    if not ok:
-        return {}
-    try:
-        data = json.loads(out)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
 # ---------------------------------------------------------------------------
 # HTML dashboard
 # ---------------------------------------------------------------------------
@@ -361,14 +346,14 @@ HTML = """<!DOCTYPE html>
 </head>
 <body>
   <h1>📰 PortfolioNewsUpdater — Cloud</h1>
-  <div class="sub">Searches SEC, Chinese news (乐信/分期乐… via Google News zh, Eastmoney, Baidu, Tavily), English news and RSS — translates &amp; scores everything with AI, pushes the top items to Telegram. Runs twice a day at 9:15 ET &amp; 16:45 ET (auto-adjusts for DST).</div>
+  <div class="sub">Searches SEC (with 6-K/8-K content), Chinese news (乐信/分期乐… via Google News zh, Eastmoney, Tavily, official websites), English news and RSS — translates &amp; scores everything with AI, pushes the top items to Telegram. Runs twice a day at 9:15 ET &amp; 16:45 ET (auto-adjusts for DST).</div>
   <div class="msg" id="msg"></div>
 
   <div class="card">
     <h2>1. Connect to Google</h2>
     <div class="status" id="authStatus">Checking...</div>
     <button class="btn-ghost" onclick="authGoogle()">🔑 Authenticate to Google</button>
-    <div class="hint">Opens Google's own login page in your browser.</div>
+    <div class="hint">Opens Google's login page in your browser. If nothing opens, copy the printed URL.</div>
   </div>
 
   <div class="card">
@@ -474,7 +459,7 @@ HTML = """<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <h2>5. Stored news (last 2 weeks, browsable)</h2>
+    <h2>5. Stored news (last ~3 weeks, browsable)</h2>
     <div class="row" style="margin-bottom:8px">
       <input id="newsFilter" placeholder="Filter: ticker, category, title, source..." style="flex:1" onkeyup="renderNews()">
       <button class="btn-ghost" onclick="loadNews()">📥 Load stored news</button>
@@ -527,7 +512,9 @@ function aiProviderChanged(){
 
 async function load(){
   const d = await api('/api/config');
-  tickers = d.config.tickers || [];
+  // Sanitize on load too - a hand-edited config_local.json could otherwise
+  // inject into the chip onclick handlers.
+  tickers = (d.config.tickers || []).map(t => String(t).toUpperCase().replace(/[^A-Z0-9.-]/g,'')).filter(Boolean);
   $('aiProvider').value = d.config.ai_provider || 'deepseek';
   $('aiModel').value = d.config.ai_model || 'deepseek-v4-flash';
   $('aiBase').value = d.config.ai_base_url || 'https://api.deepseek.com';
@@ -546,7 +533,7 @@ async function load(){
   $('tavilyMonthly').value = d.config.tavily_max_monthly_searches || 850;
   $('tavilyMinFree').value = d.config.tavily_min_free_items || 4;
   renderChips();
-  refreshStatus(); loadCron(); loadLogs(); loadUsage();
+  refreshStatus(); loadCron(); loadLogs();
 }
 
 async function refreshStatus(){
@@ -609,7 +596,7 @@ async function loadNews(){
   const d = await api('/api/news');
   if(!d.ok){ $('newsStatus').textContent = '❌ '+(d.error||'could not fetch news'); return; }
   news = d.news || [];
-  $('newsStatus').textContent = news.length + ' stored item(s) (last 2 weeks).';
+  $('newsStatus').textContent = news.length + ' stored item(s) (last ~3 weeks).';
   renderNews();
 }
 
@@ -732,9 +719,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "logs": fetch_vm_run_history()})
         elif parsed.path == "/api/cron":
             self._send_json({"ok": True, "cron": fetch_vm_cron_status()})
-        elif parsed.path == "/api/network":
-            self._send_json({"ok": True, "network": fetch_vm_network_usage(),
-                             "monthly_limit_bytes": 1 * 1024 * 1024 * 1024})
         elif parsed.path == "/api/auth":
             ok, out, err = run_gcloud(["auth", "login", "--no-launch-browser",
                                        "--brief"], timeout=300)
@@ -765,15 +749,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         # Fresh projects need the Compute Engine API enabled before any
         # 'gcloud compute' call works. Idempotent; ~10-30s on first use.
-        run_gcloud(["services", "enable", "compute.googleapis.com",
-                    "--project", project, "--quiet"], timeout=120)
+        # Surface a failure instead of leaving the user with a confusing
+        # create error (e.g. billing not enabled).
+        ok_api, out_api, err_api = run_gcloud(
+            ["services", "enable", "compute.googleapis.com",
+             "--project", project, "--quiet"], timeout=120)
+        api_note = ""
+        if not ok_api:
+            api_note = (f"  [warn] Could not enable Compute Engine API: "
+                        f"{(err_api or out_api).strip()[:200]}\n")
         existing = vm_status()
         if existing:
             ok, out, err = self._deploy_to_vm(project)
             self._send_json({"ok": ok, "error": (err or "") if not ok else "",
                              "output": (f"VM already exists (status: {existing}).\n" + out + err)})
             return
-        ok, out, err = False, "", ""
+        ok, out, err = False, api_note, ""
         created_zone = None
         for zone in VM_ZONES:
             ok, out, err = run_gcloud([
@@ -916,24 +907,38 @@ class Handler(BaseHTTPRequestHandler):
                 ''.join(c for c in t.strip().upper() if c.isascii() and (c.isalnum() or c in '.-'))
                 for t in data.get("tickers", []) if t.strip()]
             cfg["enabled"] = bool(data.get("enabled", True))
-            cfg["initial_lookback_hours"] = int(data.get("initial_lookback_hours", 24))
-            cfg["max_items_per_run"] = int(data.get("max_items_per_run", 40))
-            cfg["max_digest_items"] = int(data.get("max_digest_items", 10))
-            cfg["ai_provider"] = data.get("ai_provider", "deepseek")
-            cfg["ai_model"] = data.get("ai_model", "deepseek-v4-flash")
-            cfg["ai_base_url"] = data.get("ai_base_url", "https://api.deepseek.com")
-            cfg["ticker_meta"] = data.get("ticker_meta", {}) or {}
-            cfg["push_mode"] = data.get("push_mode", "all")
-            cfg["push_min_score"] = int(data.get("push_min_score", 7))
-            cfg["push_min_importance"] = int(data.get("push_min_importance", 4))
-            cfg["push_max_per_ticker"] = int(data.get("push_max_per_ticker", 3))
-            cfg["news_retention_days"] = int(data.get("news_retention_days", 21))
-            cfg["seen_retention_days"] = max(int(data.get("news_retention_days", 21)),
-                                             int(data.get("seen_retention_days", 60)))
-            cfg["tavily_max_daily_searches"] = int(data.get("tavily_max_daily_searches", 15))
-            cfg["tavily_max_monthly_searches"] = int(data.get("tavily_max_monthly_searches", 850))
-            cfg["tavily_min_free_items"] = int(data.get("tavily_min_free_items", 4))
-            cfg["lookup_refresh_days"] = int(data.get("lookup_refresh_days", 90))
+            # Only update keys the panel actually sends - this preserves any
+            # hand-tuned values (initial_lookback_hours, max_items_per_run,
+            # seen_retention_days, lookup_refresh_days, ...) instead of
+            # silently resetting them on every upload.
+            for key, cast in (("initial_lookback_hours", int), ("max_items_per_run", int),
+                              ("max_digest_items", int), ("lookup_refresh_days", int)):
+                if key in data:
+                    try:
+                        cfg[key] = cast(data[key])
+                    except (TypeError, ValueError):
+                        pass
+            if "seen_retention_days" in data:
+                try:
+                    cfg["seen_retention_days"] = max(int(data.get("news_retention_days", 21)),
+                                                     int(data["seen_retention_days"]))
+                except (TypeError, ValueError):
+                    pass
+            cfg["ai_provider"] = data.get("ai_provider", cfg.get("ai_provider", "deepseek"))
+            cfg["ai_model"] = data.get("ai_model", cfg.get("ai_model", "deepseek-v4-flash"))
+            cfg["ai_base_url"] = data.get("ai_base_url", cfg.get("ai_base_url", "https://api.deepseek.com"))
+            cfg["ticker_meta"] = data.get("ticker_meta", cfg.get("ticker_meta", {})) or {}
+            cfg["push_mode"] = data.get("push_mode", cfg.get("push_mode", "all"))
+            for key, default in (("push_min_score", 7), ("push_min_importance", 4),
+                                 ("push_max_per_ticker", 3), ("news_retention_days", 21),
+                                 ("tavily_max_daily_searches", 15),
+                                 ("tavily_max_monthly_searches", 850),
+                                 ("tavily_min_free_items", 4)):
+                if key in data:
+                    try:
+                        cfg[key] = int(data[key])
+                    except (TypeError, ValueError):
+                        pass
             secrets["telegram_bot_token"] = data.get("telegram_bot_token", "")
             secrets["telegram_chat_id"] = data.get("telegram_chat_id", "")
             secrets["ai_api_key"] = data.get("ai_api_key", "")
@@ -941,7 +946,11 @@ class Handler(BaseHTTPRequestHandler):
             save_config(cfg); save_secrets(secrets)
             project = get_project()
             if not project:
-                self._send_json({"ok": False, "error": "Not authenticated to Google."})
+                self._send_json({"ok": False, "error":
+                                 "No Google Cloud project found. First open "
+                                 "https://console.cloud.google.com once, accept the terms and "
+                                 "enable billing (the Always-Free tier stays free), then click "
+                                 "Authenticate again."})
                 return
             ok, out, err = self._deploy_to_vm(project)
             self._send_json({"ok": ok, "error": err or ("" if ok else out), "output": out + err})
