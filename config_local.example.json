@@ -22,6 +22,8 @@
     "google_news_zh": true,
     "google_news_site": true,
     "eastmoney": true,
+    "eastmoney_724": true,
+    "sina_724": true,
     "baidu": false,
     "tavily": true,
     "google_news_en": true

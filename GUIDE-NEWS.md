@@ -1,22 +1,24 @@
 # 📰 PortfolioNewsUpdater — setup
 
 Searches your tickers for **new** SEC filings, **Chinese** news (Google News
-zh-CN, Eastmoney, Baidu, Tavily), English news, and RSS items **twice a day**.
-Everything found is stored in a SQLite news database (rolling ~3 weeks),
-translated to English and scored 1–10 by **DeepSeek AI**; only the **top items
-by importance** are pushed to your Telegram. Runs on the same **free** Google
-Cloud VM as your price monitor, so it costs **$0** for VM/network/storage.
+zh-CN, Eastmoney, Sina/Eastmoney 7x24 wires, Tavily), English news, and RSS
+items **three times a day**. Everything found is stored in a SQLite news
+database (rolling ~3 weeks), translated to English and scored 1–10 by
+**DeepSeek AI**; only the **top items by importance** are pushed to your
+Telegram. Runs on the same **free** Google Cloud VM as your price monitor,
+so it costs **$0** for VM/network/storage.
 
 ## Schedule (pinned to US market time, DST-aware)
 
 | Run | Time (US Eastern) | Why |
 |-----|-------------------|-----|
 | 1 | **9:15 ET** | 15 minutes before the 9:30 ET market open |
-| 2 | **16:45 ET** | 7.5 hours later, just after the 16:00 ET close |
+| 2 | **16:45 ET** | just after the 16:00 ET close |
+| 3 | **23:00 ET** | **Beijing noon** — catches the Chinese **morning** news burst (alpha breaks 9:00–12:00 Beijing time; run 2 misses it entirely) |
 
-The installer puts two cron jobs on the VM (one per DST season) and a tiny
-DST-aware guard inside `news_updater.py` makes the out-of-season job an
-instant no-op, so exactly **two real runs happen per day**.
+The installer puts cron jobs on the VM for both DST seasons and a tiny
+DST-aware guard inside `news_updater.py` makes the out-of-season jobs an
+instant no-op, so exactly **three real runs happen per day**.
 
 ## What it checks (per ticker, per run — only the "delta" since last time)
 
@@ -33,23 +35,30 @@ instant no-op, so exactly **two real runs happen per day**.
    subsidiaries** (e.g. LX → `乐信 OR 分期乐 OR 桔子理财`)
 3. **Eastmoney (东方财富)** — Chinese financial news search API, one query per
    Chinese name/subsidiary
-4. **Baidu News** — best-effort Chinese news search (off by default: Baidu
+4. **Eastmoney / Sina 7x24 fast-news wires** — the real-time Chinese
+   financial "tape" (东财快讯 + 新浪7x24). Fetched once per run, filtered by
+   each ticker's Chinese names/subsidiaries — this is where the alpha breaks
+   first, before search engines even index it
+5. **Baidu News** — best-effort Chinese news search (off by default: Baidu
    serves a CAPTCHA to server IPs, so it rarely returns anything — you can
    re-enable it via `sources.baidu`)
-5. **Tavily** — agent-grade news search (free plan: 1,000 credits/month;
+6. **Tavily** — agent-grade news search (free plan: 1,000 credits/month;
    budgeted hard: max 15/day, max 850/month, and skipped entirely for a
    ticker when the free sources already found enough items that run)
-6. **Google News EN** — kept as a low-priority backup, but now also searches
+7. **Google News EN** — kept as a low-priority backup, but now also searches
    the company's English brand names (e.g. Fenqile, Temu)
-7. **Google News `site:`** — searches the company's OWN discovered websites
+8. **Google News `site:`** — searches the company's OWN discovered websites
    (official site, news page, subsidiary sites) so official announcements and
    press releases are caught even when no news outlet covers them
-8. **Company RSS / press-release feeds** (optional, per-ticker)
+9. **Company RSS / press-release feeds** (optional, per-ticker)
 
 All new items are stored in `news.db`, translated + summarized + scored by AI
 (one batched call per ticker to keep token usage tiny), then the **top-N by
 importance** (Chinese-language items tie-break higher) are pushed to Telegram.
-Everything else stays in the DB — browse it from the panel (Step 5).
+The AI also writes a short **impact sentence** ("what this means for the
+company's business or stock") — shown in the digest with a → arrow, and stored
+with each item. Everything else stays in the DB — browse it from the panel
+(Step 5).
 
 ## Company lookup & auto-discovery (the "alpha" config)
 
@@ -203,9 +212,10 @@ crontab -l | grep -v news_updater | crontab -
 
 ## How the schedule stays reliable across DST
 
-- **Two cron jobs** are installed, one for summer (EDT) and one for winter
-  (EST), each firing at the correct UTC times for 9:15 ET and 16:45 ET.
-- `news_updater.py` has a **DST-aware guard** that skips the out-of-season job
-  instantly, so exactly **two** real runs per day.
+- **Six cron jobs** are installed (three runs × two seasons), firing at the
+  correct UTC times for 9:15, 16:45 and 23:00 ET in summer (EDT) and winter
+  (EST).
+- `news_updater.py` has a **DST-aware guard** that skips the out-of-season
+  jobs instantly, so exactly **three** real runs per day.
 - The installer also enables the cron daemon at boot and installs Python deps
   with `sudo` (so cron can import them).

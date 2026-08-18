@@ -2,14 +2,17 @@
 
 A personal stock-news monitor that actually finds the news that matters for
 **US-listed Chinese companies**. It searches **Chinese-language sources**
-(Google News zh-CN, 东方财富/Eastmoney, Tavily) using each company's **Chinese
-name and its subsidiaries** (e.g. LX → 乐信/分期乐/Fenqile, plus their official
-websites), stores everything in a small database, translates + scores it with
-AI, and pushes only the most important items to Telegram — twice a day,
-pinned to US market time (DST-aware).
+(Google News zh-CN, 东方财富/Eastmoney, the **Eastmoney + Sina 7x24
+real-time news wires**, Tavily) using each company's **Chinese name and its
+subsidiaries** (e.g. LX → 乐信/分期乐/Fenqile, plus their official websites),
+stores everything in a small database, translates + scores it with AI (with a
+"what this means" impact sentence), and pushes only the most important items
+to Telegram — **three times a day**, pinned to US market time (DST-aware),
+including a **23:00 ET run that catches the Chinese morning news burst**.
 
 **The edge:** a penalty to 分期乐, a HK subsidiary's license news, an
-official-site announcement — the stuff US English media never covers.
+official-site announcement, or a flash item on the Chinese wire — the stuff US
+English media never covers, delivered hours earlier.
 
 - Everything runs on a **free** Google Cloud e2-micro VM ($0).
 - Cost is **$0/month** (see below). No spam: importance floors, per-ticker

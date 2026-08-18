@@ -47,8 +47,8 @@ sudo python3 -m pip install --break-system-packages -r requirements.txt 2>/dev/n
 python3 -c "import requests, feedparser; print('  deps OK')" 2>/dev/null \
   || python3 -c "import requests; print('  (edgartools optional)')"
 
-# --- 3. Set up the 2x-daily DST-aware schedule (cron)
-echo "[3/3] Setting up the DST-aware 2x-daily schedule (cron)..."
+# --- 3. Set up the 3x-daily DST-aware schedule (cron)
+echo "[3/3] Setting up the DST-aware 3x-daily schedule (cron)..."
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MONITOR="$PROJECT_DIR/news_updater.py"
 LOG="$PROJECT_DIR/news_updater.log"
@@ -61,8 +61,9 @@ sudo rm -f /etc/cron.d/news-summer /etc/cron.d/news-winter 2>/dev/null || true
 
 # Compute both seasons' UTC firing times from the SAME source of truth as
 # news_updater.py (America/New_York DST rules). This keeps the schedule
-# correct for every year automatically. 9:15 ET = 15 min before the 9:30 ET
-# open; 16:45 ET = 7.5h later, just after the 16:00 ET close.
+# correct for every year automatically. Runs (ET): 9:15 (15 min before the
+# 9:30 open), 16:45 (just after the 16:00 close), and 23:00 (Beijing noon -
+# the Chinese MORNING news burst that the 16:45 run misses entirely).
 SCHEDULE_JSON="$("$PYTHON" - <<'PYEOF'
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -78,42 +79,42 @@ def cron_fields(month, day, hour, minute):
     dt = datetime(2026, month, day, hour, minute, tzinfo=EASTERN)
     u = dt.astimezone(UTC)
     return u.strftime("%M"), u.strftime("%H")
-# July 1 = EDT (summer), Jan 1 = EST (winter). Runs: 9:15 ET and 16:45 ET.
-smin, sh1 = cron_fields(7, 1, 9, 15)
-_,    sh2 = cron_fields(7, 1, 16, 45)
-wmin, wh1 = cron_fields(1, 1, 9, 15)
-_,    wh2 = cron_fields(1, 1, 16, 45)
-# Both runs are at the same minute past the hour, so the minute field is a
-# single value and the hour field is a comma list.
-print(f"summer_min={smin}")
-print(f"summer_hours={sh1},{sh2}")
-print(f"winter_min={wmin}")
-print(f"winter_hours={wh1},{wh2}")
+# July 1 = EDT (summer), Jan 1 = EST (winter). Each run gets its OWN line
+# because the minutes differ (23:00 is at minute 0, not 15).
+RUNS = [(9, 15), (16, 45), (23, 0)]
+for season, month, day in (("summer", 7, 1), ("winter", 1, 1)):
+    for i, (h, m) in enumerate(RUNS):
+        mn, hr = cron_fields(month, day, h, m)
+        print(f"{season}_{i}_min={mn}")
+        print(f"{season}_{i}_hour={hr}")
 PYEOF
 )"
-SUMMER_MIN="$(printf '%s\n' "$SCHEDULE_JSON" | grep '^summer_min=' | cut -d= -f2)"
-SUMMER_HOURS="$(printf '%s\n' "$SCHEDULE_JSON" | grep '^summer_hours=' | cut -d= -f2)"
-WINTER_MIN="$(printf '%s\n' "$SCHEDULE_JSON" | grep '^winter_min=' | cut -d= -f2)"
-WINTER_HOURS="$(printf '%s\n' "$SCHEDULE_JSON" | grep '^winter_hours=' | cut -d= -f2)"
-echo "  Summer (EDT) cron: $SUMMER_MIN $SUMMER_HOURS * * 1-5"
-echo "  Winter (EST) cron: $WINTER_MIN $WINTER_HOURS * * 1-5"
+
+# Build the cron lines for a season (one per run; minute/hour from the JSON).
+build_cron() {
+  local season="$1" lines="" mn hr
+  for i in 0 1 2; do
+    mn="$(printf '%s\n' "$SCHEDULE_JSON" | grep "^${season}_${i}_min=" | cut -d= -f2)"
+    hr="$(printf '%s\n' "$SCHEDULE_JSON" | grep "^${season}_${i}_hour=" | cut -d= -f2)"
+    lines+="$mn $hr * * 1-5 cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"$'\n'
+  done
+  printf '%s' "$lines"
+}
+SUMMER_LINES="$(build_cron summer)"
+WINTER_LINES="$(build_cron winter)"
+echo "  Summer (EDT) cron: $(printf '%s' "$SUMMER_LINES" | tr '\n' '; ')"
+echo "  Winter (EST) cron: $(printf '%s' "$WINTER_LINES" | tr '\n' '; ')"
 
 CRONTAB="$(command -v crontab || echo /usr/bin/crontab)"
 MKTEMP="$(command -v mktemp || echo /usr/bin/mktemp)"
 GREP="$(command -v grep || echo /bin/grep)"
 
-# Build the two cron lines. Each fires exactly twice a day at its season's
-# UTC times. We filter out old copies by matching "news_updater.py" (the
-# marker unique to our jobs). The old code filtered on the whole line's
-# schedule, which let duplicates accumulate - matching the script name is
-# the reliable way to remove all previous copies.
-SUMMER_CRON="$SUMMER_MIN $SUMMER_HOURS * * 1-5 cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
-WINTER_CRON="$WINTER_MIN $WINTER_HOURS * * 1-5 cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"
-
+# Install six cron lines (3 runs x 2 seasons). We filter out old copies by
+# matching "news_updater.py" (the marker unique to our jobs) - matching the
+# script name is the reliable way to remove all previous copies.
 TMPCRON="$("$MKTEMP")"
 "$CRONTAB" -l 2>/dev/null | "$GREP" -v 'news_updater.py' > "$TMPCRON" || true
-echo "$SUMMER_CRON" >> "$TMPCRON"
-echo "$WINTER_CRON" >> "$TMPCRON"
+printf '%s%s' "$SUMMER_LINES" "$WINTER_LINES" >> "$TMPCRON"
 if "$CRONTAB" "$TMPCRON"; then
   echo "  ✅ Cron jobs installed (user crontab)."
 else
@@ -121,8 +122,8 @@ else
   # Fallback: install a system cron file (needs root). Format is the same
   # as a crontab but with the username field inserted after the schedule.
   USERNAME="$(id -un 2>/dev/null || echo root)"
-  echo "$SUMMER_MIN $SUMMER_HOURS * * 1-5 $USERNAME cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1" > /tmp/news-summer
-  echo "$WINTER_MIN $WINTER_HOURS * * 1-5 $USERNAME cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1" > /tmp/news-winter
+  printf '%s' "$SUMMER_LINES" | sed "s/^/$USERNAME /" > /tmp/news-summer
+  printf '%s' "$WINTER_LINES" | sed "s/^/$USERNAME /" > /tmp/news-winter
   sudo mv /tmp/news-summer /etc/cron.d/news-summer 2>/dev/null || true
   sudo mv /tmp/news-winter /etc/cron.d/news-winter 2>/dev/null || true
   if sudo test -f /etc/cron.d/news-summer; then
@@ -149,9 +150,10 @@ python3 "$MONITOR"
 
 echo ""
 echo "=============================================="
-echo " DONE! The news updater runs twice a day, pinned to US market time:"
+echo " DONE! The news updater runs three times a day, pinned to US market time:"
 echo "   Run 1: 9:15 ET (15 min before the 9:30 ET open)"
-echo "   Run 2: 16:45 ET (7.5h later, just after the 16:00 ET close)"
+echo "   Run 2: 16:45 ET (just after the 16:00 ET close)"
+echo "   Run 3: 23:00 ET (Beijing noon - catches the Chinese MORNING news)"
 echo " It auto-adjusts for summer (EDT) and winter (EST)."
 echo ""
 echo " To check it's working:"

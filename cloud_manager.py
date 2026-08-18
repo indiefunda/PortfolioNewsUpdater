@@ -73,6 +73,8 @@ DEFAULT_CONFIG = {
         "google_news_zh": True,
         "google_news_site": True,  # official company websites (site: search)
         "eastmoney": True,
+        "eastmoney_724": True,  # Eastmoney 7x24 fast-news wire (real-time tape)
+        "sina_724": True,  # Sina 7x24 fast-news wire
         "baidu": False,  # captcha-blocked from server IPs - off by default
         "tavily": True,
         "google_news_en": True,

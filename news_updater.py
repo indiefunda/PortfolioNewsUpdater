@@ -269,12 +269,18 @@ def _db():
             sentiment TEXT,
             pushed INTEGER DEFAULT 0,
             reason TEXT,
+            impact TEXT,
             url TEXT,
             published_at TEXT,
             first_seen TEXT NOT NULL,
             UNIQUE (ticker, source, item_hash)
         )"""
     )
+    # Migration for DBs created before the `impact` column existed.
+    try:
+        conn.execute("ALTER TABLE news ADD COLUMN impact TEXT")
+    except Exception:
+        pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_news_first_seen ON news (first_seen)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_news_ticker ON news (ticker)")
     return conn
@@ -357,10 +363,11 @@ def update_news_ai(conn, item):
     h = item_hash(item["source"], item["id"], item.get("title", ""))
     conn.execute(
         "UPDATE news SET title_en=?, summary=?, category=?, importance=?, "
-        "sentiment=?, reason=? WHERE ticker=? AND source=? AND item_hash=?",
+        "sentiment=?, reason=?, impact=? WHERE ticker=? AND source=? AND item_hash=?",
         (item.get("title_en", ""), item.get("summary", ""),
          item.get("category", "other"), item.get("importance"),
          item.get("sentiment", "neutral"), item.get("reason", ""),
+         item.get("impact", ""),
          item["ticker"], item["source"], h),
     )
     conn.commit()
@@ -382,18 +389,18 @@ def list_news(conn, ticker=None, limit=300):
     """Return stored news (last ~3 weeks) as a list of dicts for browsing."""
     cols = ["ticker", "source", "lang", "title_en", "title_raw", "summary",
             "category", "importance", "sentiment", "pushed", "url",
-            "published_at", "first_seen", "reason"]
+            "published_at", "first_seen", "reason", "impact"]
     if ticker:
         rows = conn.execute(
             "SELECT ticker, source, lang, title_en, title_raw, summary, category, "
-            "importance, sentiment, pushed, url, published_at, first_seen, reason "
+            "importance, sentiment, pushed, url, published_at, first_seen, reason, impact "
             "FROM news WHERE ticker=? ORDER BY first_seen DESC, id DESC LIMIT ?",
             (ticker, limit),
         ).fetchall()
     else:
         rows = conn.execute(
             "SELECT ticker, source, lang, title_en, title_raw, summary, category, "
-            "importance, sentiment, pushed, url, published_at, first_seen, reason "
+            "importance, sentiment, pushed, url, published_at, first_seen, reason, impact "
             "FROM news ORDER BY first_seen DESC, id DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -1323,6 +1330,96 @@ def fetch_tavily(query, secrets, config, since_dt=None, limit=8, topic="news"):
 
 
 # ---------------------------------------------------------------------------
+# Chinese fast-news wires (the real-time "tape" - where alpha breaks first)
+# ---------------------------------------------------------------------------
+# 东财 7x24 快讯 (Eastmoney) and 新浪 7x24 (Sina): global breaking-news feeds
+# in Chinese. Fetched ONCE per run and filtered per ticker by Chinese
+# name/subsidiary terms inside the loop (no per-ticker queries, so just one
+# request per wire per run). cls.cn now requires signed requests and
+# 格隆汇's API is unstable - not worth the fragility.
+EASTMONEY_724_API = "https://np-listapi.eastmoney.com/comm/web/getFastNewsList"
+SINA_724_API = "https://zhibo.sina.com.cn/api/zhibo/feed"
+WIRE_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+}
+
+
+def fetch_eastmoney_724(limit=50):
+    """
+    Eastmoney 7x24 breaking-news wire (kuaixun). Returns a list of raw items
+    (ticker/source filled by the caller), or None on failure (so no delta is
+    advanced for that wire).
+    """
+    try:
+        resp = requests.get(
+            EASTMONEY_724_API,
+            params={"client": "web", "biz": "web_724", "fastColumn": "102",
+                    "sortEnd": "", "pageSize": str(limit),
+                    "req_trace": str(int(time.time() * 1000))},
+            headers={**WIRE_HEADERS, "Referer": "https://kuaixun.eastmoney.com/"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        items = []
+        for it in (resp.json().get("data") or {}).get("fastNewsList") or []:
+            title = strip_tags(it.get("title") or "") or strip_tags(it.get("summary") or "")
+            if not title:
+                continue
+            items.append({
+                "source": "",
+                "ticker": "",
+                "id": str(it.get("code") or title),
+                "title": title,
+                "url": it.get("url") or "",
+                "date": it.get("showTime") or "",
+                "lang": "zh",
+                "snippet": strip_tags(it.get("summary") or "")[:300],
+            })
+        return items
+    except Exception as exc:
+        print(f"  [error] Eastmoney 7x24 wire: {exc}", file=sys.stderr)
+        return None
+
+
+def fetch_sina_724(limit=100):
+    """
+    Sina 7x24 fast-news wire (财经7x24). Returns a list of raw items, or None
+    on failure.
+    """
+    try:
+        resp = requests.get(
+            SINA_724_API,
+            params={"page": "1", "page_size": str(limit), "zhibo_id": "152",
+                    "tag_id": "0", "dire": "f", "dpc": "1"},
+            headers={**WIRE_HEADERS, "Referer": "https://finance.sina.com.cn/7x24/"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        items = []
+        for it in (((resp.json().get("result") or {}).get("data") or {})
+                   .get("feed") or {}).get("list") or []:
+            title = strip_tags(it.get("rich_text") or it.get("text") or "")
+            if not title:
+                continue
+            items.append({
+                "source": "",
+                "ticker": "",
+                "id": str(it.get("id") or title),
+                "title": title[:200],
+                "url": "",
+                "date": it.get("create_time") or "",
+                "lang": "zh",
+                "snippet": title[:300],
+            })
+        return items
+    except Exception as exc:
+        print(f"  [error] Sina 7x24 wire: {exc}", file=sys.stderr)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # AI helpers
 # ---------------------------------------------------------------------------
 AI_RETRIES = 2
@@ -1429,6 +1526,7 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None):
             it["sentiment"] = "neutral"
             it["push"] = True
             it["reason"] = ""
+            it["impact"] = ""
             it["is_dup"] = False
             it["is_known"] = False
         return items
@@ -1491,7 +1589,11 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None):
             "event as one of the ALREADY SEEN headlines below - possibly "
             "translated, possibly re-published under a new URL; false if it "
             "is genuinely new), "
-            "reason (one short English sentence why it matters).\n"
+            "reason (one short English sentence why it matters), "
+            "impact (one short English sentence: what this means for the "
+            "company's business or stock - e.g. 'this could pressure next "
+            "quarter's loan volume'; empty string '' if routine or not "
+            "applicable).\n"
             "Return ONLY a JSON array of these objects, same order as the items.\n\n"
             "ALREADY SEEN (last few weeks):\n"
             + ("\n".join(hist_lines) if hist_lines else "(none)")
@@ -1534,6 +1636,7 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None):
             it["sentiment"] = str(obj.get("sentiment") or "neutral").strip()
             it["push"] = bool(obj.get("push", True))
             it["reason"] = str(obj.get("reason") or "").strip()
+            it["impact"] = str(obj.get("impact") or "").strip()
             it["is_known"] = bool(obj.get("known_event", False))
             enriched.append(it)
         n_dups = sum(1 for it in ticker_items if it.get("is_dup"))
@@ -1645,6 +1748,8 @@ def format_digest(filtered, ticker_count, stored_count=0):
         lines.append(header)
         if reason:
             lines.append(f"    {reason}")
+        if item.get("impact"):
+            lines.append(f"    → {item['impact']}")
         if url:
             lines.append(f"    {url}")
         lines.append("")
@@ -1720,7 +1825,11 @@ def select_push_items(enriched, config):
 # ---------------------------------------------------------------------------
 # Schedule guard
 # ---------------------------------------------------------------------------
-SCHEDULE_RUN_TIMES = (dtime(9, 15), dtime(16, 45))
+# Three runs a day, pinned to US market time. The third run (23:00 ET =
+# 12:00 Beijing noon) catches the Chinese MORNING news burst - the alpha
+# breaks 9:00-12:00 Beijing time, long before US media picks it up, and the
+# 16:45 ET run misses it entirely.
+SCHEDULE_RUN_TIMES = (dtime(9, 15), dtime(16, 45), dtime(23, 0))
 SCHEDULE_TOLERANCE_MIN = 5
 
 
@@ -1735,7 +1844,7 @@ def _schedule_guard(now_et):
         if delta <= SCHEDULE_TOLERANCE_MIN * 60:
             return
     print(f"[{now_et.strftime('%Y-%m-%d %H:%M %Z')}] "
-          f"Outside scheduled times (9:15 / 16:45 ET) - skipping.")
+          f"Outside scheduled times (9:15 / 16:45 / 23:00 ET) - skipping.")
     sys.exit(0)
 
 
@@ -1863,7 +1972,15 @@ def main():
 
     print(f"[{start_time.strftime('%Y-%m-%d %H:%M %Z')}] Checking {len(tickers)} "
           f"ticker(s) for new news (sources: SEC, GoogleNews, GoogleNewsZH, "
-          f"GoogleNewsSite, Eastmoney, Baidu, Tavily, RSS)...")
+          f"GoogleNewsSite, Eastmoney, Eastmoney724, Sina724, Baidu, Tavily, RSS)...")
+
+    # Global Chinese fast-news wires - ONE fetch per wire per run, shared by
+    # all tickers (filtered per ticker by its Chinese terms inside the loop).
+    wire_cache = {}
+    if src_on("eastmoney_724"):
+        wire_cache["Eastmoney724"] = fetch_eastmoney_724()
+    if src_on("sina_724"):
+        wire_cache["Sina724"] = fetch_sina_724()
 
     for ticker in tickers:
         # The lookup step: pull the company profile (Chinese name, aliases,
@@ -1911,6 +2028,38 @@ def main():
                               item["title"], item.get("url", ""))
                     insert_news(conn, item)
             set_last_fetched(conn, ticker, source, now_utc_str)
+
+        def process_wire(source, raw_items, terms):
+            """Filter a global fast-news wire's items by this ticker's Chinese
+            terms + delta, then fold matches into all_new / the DB (same
+            semantics as process_source - None wire => delta not advanced)."""
+            if not terms:
+                return
+            last = get_last_fetched(conn, ticker, source)
+            since_dt = (datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=EASTERN)
+                        if last else datetime.now(EASTERN) - timedelta(hours=initial_hours))
+            found = 0
+            for raw in raw_items:
+                hay = f"{raw.get('title', '')} {raw.get('snippet', '')}"
+                if not any(t in hay for t in terms):
+                    continue
+                pub_dt = _parse_pub(raw.get("date", ""))
+                if pub_dt and pub_dt < since_dt:
+                    continue
+                item = dict(raw)
+                item["ticker"] = ticker
+                item["source"] = source
+                if is_new(conn, ticker, source, item["id"], item["title"]):
+                    item["published_at"] = _normalize_pub(item.get("date", ""))
+                    item["first_seen"] = run_start
+                    all_new.append(item)
+                    mark_seen(conn, ticker, source, item["id"], item["title"],
+                              item.get("url", ""))
+                    insert_news(conn, item)
+                    found += 1
+            set_last_fetched(conn, ticker, source, now_utc_str)
+            if found:
+                print(f"  {ticker}: {found} new {source} wire item(s).")
 
         # 1) SEC filings (English, ADR regulatory coverage).
         if src_on("sec"):
@@ -1980,6 +2129,20 @@ def main():
                 "GoogleNews",
                 lambda sd: fetch_rss(google_news_url(en_query, "en"), ticker, sd,
                                      source="GoogleNews", lang="en"))
+
+        # 3.5) Chinese fast-news wires (the real-time tape): one global fetch
+        #      per wire per run, filtered here by this ticker's Chinese
+        #      names/subsidiaries. This is where the alpha breaks first.
+        for wire_src, wire_key in (("Eastmoney724", "eastmoney_724"),
+                                   ("Sina724", "sina_724")):
+            if not src_on(wire_key) or wire_src not in wire_cache:
+                continue
+            raw = wire_cache.get(wire_src)
+            if raw is None:
+                print(f"  [warn] {ticker} {wire_src} wire fetch failed - "
+                      f"NOT advancing delta.")
+                continue
+            process_wire(wire_src, raw, zh_terms)
 
         # 4) Company RSS feeds (configured per ticker) - source "RSS".
         feeds = config.get("rss_feeds", {}).get(ticker, [])
