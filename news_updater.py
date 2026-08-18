@@ -452,6 +452,30 @@ def is_chinese(text):
     return bool(text and CJK_RE.search(text))
 
 
+# Characters that commonly continue a 2-char CJK term into an UNRELATED word
+# (e.g. "元保" inside "元保险" or "美元保证金" - 保 continued by 险/证/金).
+# A 2-char term followed by one of these is treated as a coincidental
+# substring, not a real company mention.
+CONTINUATION_BLOCK = set("险证金单券押汇据费额契担票据息利收付")
+
+
+def _term_in_text(term, text):
+    """
+    Does 'term' appear in 'text' as a real mention (not a coincidental
+    substring)? For 2-char CJK terms we reject matches where the character
+    right after the term extends it into a different common word.
+    """
+    if not term or not text:
+        return False
+    idx = text.find(term)
+    while idx >= 0:
+        after = text[idx + len(term):idx + len(term) + 1]
+        if not (len(term) == 2 and is_chinese(term) and after and after in CONTINUATION_BLOCK):
+            return True
+        idx = text.find(term, idx + 1)
+    return False
+
+
 def strip_tags(text):
     return html.unescape(re.sub(r"<[^>]+>", "", text or "")).strip()
 
@@ -1160,9 +1184,10 @@ def fetch_eastmoney_search(query, since_dt=None, limit=10, terms=None):
             title = strip_tags(a.get("title", ""))
             if not title:
                 continue
-            # Precision filter: the title must mention one of the ticker's
-            # Chinese names/subsidiaries, otherwise it's keyword noise.
-            if not any(t in title for t in terms):
+            # Precision filter: the title must really mention one of the
+            # ticker's Chinese names/subsidiaries (not a coincidental
+            # substring like 元保 inside 元保险 / 美元保证金).
+            if not any(_term_in_text(t, title) for t in terms):
                 continue
             url = a.get("url", "") or ""
             content = strip_tags(a.get("content", ""))
@@ -1214,7 +1239,7 @@ def fetch_baidu_news(query, since_dt=None, limit=10, terms=None):
             url, raw_title = m.group(1), strip_tags(m.group(2))
             if not raw_title:
                 continue
-            if terms and not any(t in raw_title for t in terms):
+            if terms and not any(_term_in_text(t, raw_title) for t in terms):
                 continue
             items.append({
                 "source": "Baidu",
@@ -1253,10 +1278,17 @@ def tavily_usage_today():
     return data
 
 
-def fetch_tavily(query, secrets, config, since_dt=None, limit=8, topic="news"):
+def fetch_tavily(query, secrets, config, since_dt=None, limit=8, topic="news",
+                 terms=None):
     """
     Tavily search (default topic=news for fresh news; topic=general for
     company/lookup research). One "basic" search = 1 credit on the free plan.
+
+    'terms' = the ticker's search terms (zh + en). When given, results whose
+    title/snippet mention NONE of them are DROPPED - Tavily can return
+    completely unrelated items (Heineken buybacks for LX, random tech news
+    for QFIN), and without a precision filter they would be stored + analyzed
+    (wasted tokens). Discovery calls pass no terms (it WANTS broad results).
 
     Budget (configurable):
       - daily cap  tavily_max_daily_searches   (default 15)
@@ -1309,6 +1341,12 @@ def fetch_tavily(query, secrets, config, since_dt=None, limit=8, topic="news"):
             if not title:
                 continue
             content = (r.get("content") or "")[:300]
+            # Precision filter (news path only): drop results that mention
+            # none of the ticker's terms - kills Tavily's off-topic filler.
+            if terms:
+                hay = f"{title} {content}"
+                if not any(_term_in_text(t, hay) for t in terms):
+                    continue
             date = r.get("published_date", "") or ""
             pub_dt = _parse_pub(date)
             if topic == "news" and since_dt is not None and pub_dt and pub_dt < since_dt:
@@ -2238,7 +2276,7 @@ def main():
                 # skip them here so they are not pushed twice.
                 if is_macro(hay, macro_extra):
                     continue
-                if not any(t in hay for t in terms):
+                if not any(_term_in_text(t, hay) for t in terms):
                     continue
                 pub_dt = _parse_pub(raw.get("date", ""))
                 if pub_dt and pub_dt < since_dt:
@@ -2303,7 +2341,8 @@ def main():
                     tav_query = " OR ".join(zh_terms[:2] + en_terms[:2])
                     process_source(
                         "Tavily",
-                        lambda sd: fetch_tavily(tav_query, secrets, config, sd))
+                        lambda sd: fetch_tavily(tav_query, secrets, config, sd,
+                                                terms=zh_terms + en_terms))
 
         # 2.5) Google News restricted to the company's OWN websites (site:)
         #      - catches official announcements / press releases that no news

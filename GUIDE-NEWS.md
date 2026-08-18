@@ -139,6 +139,11 @@ knowledge base in `company_lookup.json` (on the server):
 ## No-spam behavior
 
 - Exact dedup (SQLite hash per source+URL).
+- **Precision filters**: every source result must really mention one of the
+  ticker's Chinese names/subsidiaries (with a smarter matcher that rejects
+  coincidental substrings like 元保 inside 元保险 / 美元保证金) — Tavily,
+  which previously passed through unrelated filler (Heineken buybacks for
+  LX), is filtered too.
 - **Semantic dedup folded into the analysis call**: the per-ticker AI call
   also sees the recent `seen` history and marks recycled / same-event stories
   (`known_event`) — no separate dedup call, so **half the AI calls** per run.
