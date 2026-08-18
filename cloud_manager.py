@@ -72,6 +72,7 @@ DEFAULT_CONFIG = {
     "sources": {
         "sec": True,
         "google_news_zh": True,
+        "google_news_site": True,  # official company websites (site: search)
         "eastmoney": True,
         "baidu": False,  # captcha-blocked from server IPs - off by default
         "tavily": True,
@@ -387,9 +388,9 @@ HTML = """<!DOCTYPE html>
       <button class="btn-ghost" onclick="addTicker()">Add</button>
     </div>
     <label>AI provider</label>
-    <select id="aiProvider">
+    <select id="aiProvider" onchange="aiProviderChanged()">
       <option value="deepseek">DeepSeek (cheap, reliable)</option>
-      <option value="gemini">Gemini (free tier)</option>
+      <option value="gemini">Gemini (free tier — $0)</option>
       <option value="openai">OpenAI</option>
     </select>
     <label>AI model</label>
@@ -487,10 +488,11 @@ HTML = """<!DOCTYPE html>
     <h2>6. Company lookup (auto-discovered)</h2>
     <div class="row" style="margin-bottom:8px">
       <button class="btn-ghost" onclick="loadLookup()">📖 Load company lookup</button>
+      <button class="btn-ok" onclick="rediscover()">🔍 Re-discover subsidiaries now</button>
     </div>
-    <div class="status" id="lookupStatus">Shows what the updater knows about each company: Chinese names, aliases and subsidiaries (分期乐, Fenqile…). New tickers are looked up and populated automatically.</div>
+    <div class="status" id="lookupStatus">Shows what the updater knows about each company: Chinese names, aliases, subsidiaries (分期乐, Temu…) and their websites. New tickers are looked up and populated automatically.</div>
     <textarea id="lookupView" rows="10" readonly style="width:100%;padding:12px;border-radius:8px;border:1px solid var(--border);background:#12151c;color:var(--text);font-family:monospace;font-size:12px;"></textarea>
-    <div class="hint">This grows automatically (runs on the server). To override anything, edit the Chinese names JSON in Step 3 — config overrides always win.</div>
+    <div class="hint">This grows automatically (monthly re-search per ticker; new subsidiaries are alerted on Telegram). "Re-discover now" forces it immediately — costs ~1–2 Tavily searches + 1 AI call per ticker. To override anything, edit the Chinese names JSON in Step 3 — config overrides always win.</div>
   </div>
 
 <script>
@@ -512,6 +514,15 @@ async function api(path, body){
   const opts = body ? {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify(body)} : {};
   const r = await fetch(path, opts); return r.json();
+}
+
+// Switching the provider auto-fills the correct base URL + a sensible model
+// (Gemini has a real free tier - the $0 option for sharing the app).
+function aiProviderChanged(){
+  const p = $('aiProvider').value;
+  if(p === 'gemini'){ $('aiBase').value = 'https://generativelanguage.googleapis.com/v1beta/openai'; $('aiModel').value = 'gemini-2.0-flash'; }
+  else if(p === 'openai'){ $('aiBase').value = 'https://api.openai.com/v1'; $('aiModel').value = 'gpt-4o-mini'; }
+  else { $('aiBase').value = 'https://api.deepseek.com'; $('aiModel').value = 'deepseek-v4-flash'; }
 }
 
 async function load(){
@@ -628,6 +639,14 @@ async function loadLookup(){
   $('lookupStatus').textContent = n + ' company profile(s) on the server. New tickers get looked up + populated automatically on the next run.';
 }
 
+async function rediscover(){
+  if(!confirm('Force a re-discovery of all tickers now? (~1-2 Tavily searches + 1 AI call per ticker; new subsidiaries will be alerted on Telegram)')) return;
+  $('lookupStatus').textContent = '🔍 Re-discovering subsidiaries on the server...';
+  const d = await api('/api/rediscover');
+  $('lookupStatus').textContent = d.ok ? '✅ Discovery done: '+d.output : '❌ '+(d.error||'failed');
+  loadLookup();
+}
+
 async function loadCron(){
   $('cronStatus').textContent = 'Checking schedule...';
   const d = await api('/api/cron');
@@ -730,14 +749,24 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_lookup()
         elif parsed.path == "/api/tavily":
             self._handle_tavily_usage()
+        elif parsed.path == "/api/rediscover":
+            self._handle_rediscover()
         else:
             self._send_json({"error": "not found"}, 404)
 
     def _handle_create_vm(self):
         project = get_project()
         if not project:
-            self._send_json({"ok": False, "error": "Not authenticated. Click 'Authenticate to Google' first."})
+            self._send_json({"ok": False, "error":
+                             "No Google Cloud project found. First open "
+                             "https://console.cloud.google.com once, accept the terms and "
+                             "enable billing (the Always-Free tier stays free), then come "
+                             "back here and click Authenticate again."})
             return
+        # Fresh projects need the Compute Engine API enabled before any
+        # 'gcloud compute' call works. Idempotent; ~10-30s on first use.
+        run_gcloud(["services", "enable", "compute.googleapis.com",
+                    "--project", project, "--quiet"], timeout=120)
         existing = vm_status()
         if existing:
             ok, out, err = self._deploy_to_vm(project)
@@ -859,6 +888,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "usage": data if isinstance(data, dict) else {}})
         except Exception:
             self._send_json({"ok": False, "error": "Could not parse Tavily usage from the server."})
+
+    def _handle_rediscover(self):
+        """Force a full company re-discovery on the VM (--rediscover)."""
+        zone = find_vm_zone()
+        if not zone:
+            self._send_json({"ok": False, "error": "VM not found. Create the server first."})
+            return
+        home = get_vm_home(zone)
+        ok, out, err = run_gcloud([
+            "compute", "ssh", "--zone", zone, VM_NAME,
+            "--command", f"cd {home} && python3 news_updater.py --rediscover 2>&1",
+            "--quiet"], timeout=600)
+        tail = (out + err).strip().splitlines()
+        tail = tail[-15:] if len(tail) > 15 else tail
+        self._send_json({"ok": ok, "error": (err or "") if not ok else "",
+                         "output": "\n".join(tail)})
 
     def do_POST(self):
         parsed = urlparse(self.path)

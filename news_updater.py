@@ -137,9 +137,9 @@ NO_WRITE = False
 # How many Chinese search terms we build per ticker (name + aliases +
 # subsidiaries), capped so we stay polite to free APIs and keep Tavily
 # credit usage low.
-MAX_ZH_TERMS = 6
+MAX_ZH_TERMS = 8
 # Sub-queries per ticker per run for Eastmoney (1 per term).
-EASTMONEY_MAX_QUERIES = 5
+EASTMONEY_MAX_QUERIES = 6
 # Tavily free plan = 1,000 credits/month; 1 basic search = 1 credit.
 # Defaults are conservative: a daily cap of 15 (~450/month worst case) plus a
 # monthly hard cap of 850 as insurance, and an adaptive skip that avoids using
@@ -573,7 +573,7 @@ def _parse_json_object(content):
 def _merge_lookup_entry(existing, parsed):
     """Merge AI-extracted discovery data into an existing lookup entry."""
     merged = dict(existing or {})
-    for k in ("name_zh", "name_en"):
+    for k in ("name_zh", "name_en", "website", "news_url"):
         v = str((parsed or {}).get(k) or "").strip()
         if v:
             merged[k] = v
@@ -581,7 +581,34 @@ def _merge_lookup_entry(existing, parsed):
         vals = [str(x).strip() for x in (parsed or {}).get(k) or [] if str(x).strip()]
         old = [str(x).strip() for x in (merged.get(k) or [])]
         merged[k] = list(dict.fromkeys(old + vals))[:12]
+    sw = (parsed or {}).get("subsidiary_websites")
+    if isinstance(sw, dict):
+        old_sw = merged.get("subsidiary_websites") or {}
+        old_sw.update({str(k): str(v) for k, v in sw.items() if k and v})
+        merged["subsidiary_websites"] = old_sw
     return merged
+
+
+def build_site_domains(meta):
+    """
+    Domains from the profile's websites (official site, news page, subsidiary
+    sites) - used for `site:` Google News queries so news posted on the
+    company's OWN websites is caught even if no news outlet covers it.
+    """
+    domains = []
+    for key in ("website", "news_url"):
+        v = str((meta or {}).get(key) or "").strip()
+        if v:
+            d = re.sub(r"^https?://(www\.)?", "", v).strip("/").split("/")[0]
+            if d and d not in domains:
+                domains.append(d)
+    for v in ((meta or {}).get("subsidiary_websites") or {}).values():
+        v = str(v or "").strip()
+        if v:
+            d = re.sub(r"^https?://(www\.)?", "", v).strip("/").split("/")[0]
+            if d and d not in domains:
+                domains.append(d)
+    return domains[:3]
 
 
 def discover_company(ticker, config, secrets, existing=None):
@@ -661,15 +688,21 @@ def discover_company(ticker, config, secrets, existing=None):
             "  name_zh: official Chinese name (or '' if unknown)\n"
             "  name_en: official English name\n"
             "  aliases_zh: list of other Chinese names/abbreviations\n"
-            "  subsidiaries_zh: list of Chinese subsidiary/brand names (e.g. "
-            "分期乐 for LexinFintech) - include brands, apps, fintech platforms\n"
+            "  subsidiaries_zh: list of Chinese subsidiary/brand names - "
+            "include brands, apps, fintech platforms, BANKS, brokers, "
+            "overseas/HK entities and any subsidiary mentioned (e.g. 分期乐 "
+            "for LexinFintech, 平安普惠 for Lufax)\n"
             "  subsidiaries_other: list of non-Chinese subsidiaries/brands "
-            "(e.g. Fenqile, Temu)\n"
+            "(e.g. Fenqile, Temu, LU Global)\n"
+            "  website: the official corporate website URL (or '' if unknown)\n"
+            "  news_url: the official news / press-release page URL (or '' if unknown)\n"
+            "  subsidiary_websites: JSON object mapping each subsidiary/brand "
+            "name to its website URL when visible in the results (or {})\n"
             "  keywords: 3-8 search keywords (Chinese and English names/brands) "
             "that will be used to find news about this company AND its "
             "subsidiaries\n"
-            "ONLY include names you can support from the search results below. "
-            "If something is unclear, omit it rather than guessing.\n"
+            "ONLY include names and URLs you can support from the search results "
+            "below. If something is unclear, omit it rather than guessing.\n"
             "Return ONLY a JSON object with exactly these keys.\n\n"
             "SEARCH RESULTS:\n" + "\n".join(snippets[:12])
         )
@@ -679,6 +712,7 @@ def discover_company(ticker, config, secrets, existing=None):
             entry = _merge_lookup_entry(entry, parsed)
             print(f"  [discovery] {ticker}: extracted profile "
                   f"(zh={entry.get('name_zh') or '?'}, "
+                  f"site={entry.get('website') or '?'}, "
                   f"subs_zh={entry.get('subsidiaries_zh')}, "
                   f"subs_other={entry.get('subsidiaries_other')})")
         else:
@@ -729,12 +763,13 @@ def discover_company(ticker, config, secrets, existing=None):
     return entry
 
 
-def ensure_company_meta(ticker, config, secrets):
+def ensure_company_meta(ticker, config, secrets, force=False):
     """
     The per-startup entry point: look the ticker up in company_lookup.json
     (seeded from config ticker_meta), run discovery when it is missing,
-    stale, or too sparse (no subsidiaries known), then return the effective
-    profile (discovered entry overlaid with explicit config overrides).
+    stale, too sparse (no subsidiaries known), or force=True (--rediscover),
+    then return the effective profile (discovered entry overlaid with
+    explicit config overrides).
     """
     lookup = load_lookup()
     lookup, seed_changed = seed_lookup_from_config(config, lookup)
@@ -747,7 +782,7 @@ def ensure_company_meta(ticker, config, secrets):
     today = datetime.now(EASTERN).strftime("%Y-%m-%d")
     refresh_days = _cfg_int(config, "lookup_refresh_days", LOOKUP_REFRESH_DAYS)
 
-    needs_discovery = entry is None
+    needs_discovery = force or entry is None
     if entry is not None:
         attempted = entry.get("lookup_attempted")
         sparse = not (entry.get("subsidiaries_zh") or entry.get("subsidiaries_other"))
@@ -767,11 +802,12 @@ def ensure_company_meta(ticker, config, secrets):
         # enough - no need to burn a search + AI call re-discovering it. A
         # sparse entry that WAS attempted stays until it goes stale, so we
         # don't burn Tavily credits re-searching every single run.
-        if stale or (sparse and not attempted):
+        if not force and (stale or (sparse and not attempted)):
             needs_discovery = True
 
     if needs_discovery:
-        print(f"  [lookup] {ticker}: not in company lookup "
+        print(f"  [lookup] {ticker}: {'FORCED ' if force else ''}"
+              f"not in company lookup "
               f"{'(or stale/sparse)' if entry else ''} - searching and populating...")
         entry = discover_company(ticker, config, secrets, existing=entry or {})
     elif entry is not None:
@@ -1315,7 +1351,8 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None):
         hist_lines = [f"- {t}" for t in history]
         prompt = (
             f"You are an investor's news analyst for the stock {ticker} "
-            f"({name_zh}{(' / ' + name_en) if name_en else ''}).\n"
+            f"({name_zh}{(' / ' + name_en) if name_en else ''}"
+            f"{(' | official site: ' + meta['website']) if meta.get('website') else ''}).\n"
             f"Chinese-language news about this company or its subsidiaries "
             f"(e.g. {subs}) is especially valuable - weigh it heavily; it often "
             f"contains information English media misses.\n"
@@ -1591,7 +1628,31 @@ def _schedule_guard(now_et):
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    # Parse --no-write FIRST so every mode below (including --rediscover)
+    # respects it: no DB/lookup/history writes, no Telegram alerts, no
+    # Tavily credit usage.
+    global NO_WRITE
+    NO_WRITE = "--no-write" in sys.argv
+
     # ---- CLI modes first (never blocked by the schedule guard) ----
+    if "--rediscover" in sys.argv:
+        ticker_arg = None
+        for a in sys.argv:
+            if a.startswith("--rediscover"):
+                parts = a.split("=", 1)
+                if len(parts) == 2 and parts[1].strip():
+                    ticker_arg = parts[1].strip().upper()
+        config = load_config()
+        secrets = load_secrets()
+        tickers = [t.strip().upper() for t in config.get("tickers", []) if t.strip()]
+        if ticker_arg:
+            tickers = [t for t in tickers if t == ticker_arg]
+        print(f"  [rediscover] forcing company discovery for {len(tickers)} ticker(s)...")
+        for t in tickers:
+            ensure_company_meta(t, config, secrets, force=True)
+        print("  [rediscover] done.")
+        sys.exit(0)
+
     if "--dump-lookup" in sys.argv:
         print(json.dumps(load_lookup(), ensure_ascii=False, indent=1))
         sys.exit(0)
@@ -1612,8 +1673,6 @@ def main():
         conn.close()
         sys.exit(0)
 
-    global NO_WRITE
-    NO_WRITE = "--no-write" in sys.argv
     dry_run = "--dry-run" in sys.argv
     start_time = datetime.now(EASTERN)
     run_start = start_time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1683,7 +1742,7 @@ def main():
 
     print(f"[{start_time.strftime('%Y-%m-%d %H:%M %Z')}] Checking {len(tickers)} "
           f"ticker(s) for new news (sources: SEC, GoogleNews, GoogleNewsZH, "
-          f"Eastmoney, Baidu, Tavily, RSS)...")
+          f"GoogleNewsSite, Eastmoney, Baidu, Tavily, RSS)...")
 
     for ticker in tickers:
         # The lookup step: pull the company profile (Chinese name, aliases,
@@ -1772,6 +1831,19 @@ def main():
                     process_source(
                         "Tavily",
                         lambda sd: fetch_tavily(tav_query, secrets, config, sd))
+
+        # 2.5) Google News restricted to the company's OWN websites (site:)
+        #      - catches official announcements / press releases that no news
+        #      outlet picks up. Free, no Tavily credits. Only runs when the
+        #      lookup has discovered website domains.
+        site_domains = build_site_domains(meta)
+        if site_domains and src_on("google_news_site"):
+            site_query = " OR ".join(f"site:{d}" for d in site_domains)
+            print(f"  {ticker}: official-site search -> {site_query}")
+            process_source(
+                "GoogleNewsSite",
+                lambda sd: fetch_rss(google_news_url(site_query, "zh"), ticker, sd,
+                                     source="GoogleNewsSite", lang="zh"))
 
         # 3) Google News English - includes the company's EN names/brands so
         #    subsidiary news is found even when the ticker symbol isn't in it.

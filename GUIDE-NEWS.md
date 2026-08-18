@@ -33,7 +33,10 @@ instant no-op, so exactly **two real runs happen per day**.
    ticker when the free sources already found enough items that run)
 6. **Google News EN** — kept as a low-priority backup, but now also searches
    the company's English brand names (e.g. Fenqile, Temu)
-7. **Company RSS / press-release feeds** (optional, per-ticker)
+7. **Google News `site:`** — searches the company's OWN discovered websites
+   (official site, news page, subsidiary sites) so official announcements and
+   press releases are caught even when no news outlet covers them
+8. **Company RSS / press-release feeds** (optional, per-ticker)
 
 All new items are stored in `news.db`, translated + summarized + scored by AI
 (one batched call per ticker to keep token usage tiny), then the **top-N by
@@ -47,12 +50,14 @@ Real alpha is never on the ticker symbol — it's on the **subsidiaries**
 knowledge base in `company_lookup.json` (on the server):
 
 - Each **configured** ticker's profile: `name_zh`, `name_en`, `aliases_zh`,
-  `subsidiaries_zh`, `subsidiaries_other` (non-Chinese brands), `keywords`.
+  `subsidiaries_zh`, `subsidiaries_other` (non-Chinese brands),
+  **`website` / `news_url` / `subsidiary_websites`** (official sites — used
+  for `site:` news searches), and `keywords`.
 - **Whenever a new stock is added to the configuration**, the updater checks
   the lookup; if the ticker isn't there (or the profile is stale/too sparse),
   it **searches the web and populates it automatically** (Tavily reference
   lookup → AI extraction → written back), then runs the news search with the
-  discovered names and subsidiaries.
+  discovered names, subsidiaries and websites.
 - **How often**: every **`lookup_refresh_days`** (default **30** — monthly)
   each ticker's profile is re-searched for new subsidiaries (~1–2 Tavily
   searches + 1 AI call per ticker per month). New tickers are discovered on
@@ -60,9 +65,10 @@ knowledge base in `company_lookup.json` (on the server):
 - **New-subsidiary alert**: when discovery finds names the lookup didn't
   have (e.g. Temu, LU Global, a Hong Kong broker), you get a **Telegram
   alert** so you know your searches just expanded.
-- Profiles are also refreshed every `lookup_refresh_days`.
-- Your explicit Chinese names in Step 3 always **override** the discovered
-  profile. View what the server knows in Step 6.
+- **Step 6 in the panel** shows the live lookup (including websites) and has
+  a **"Re-discover subsidiaries now"** button to force an immediate re-search.
+  Step 3 is your explicit override (`ticker_meta`) — it always wins over
+  discovered data. Both views stay in sync on the next run.
 
 ## One-time setup
 
@@ -154,6 +160,8 @@ python3 news_updater.py --dump-news       # print stored news as JSON (panel bro
 python3 news_updater.py --dump-news=LX    # ... only for LX
 python3 news_updater.py --dump-lookup     # print the company lookup as JSON (panel)
 python3 news_updater.py --dump-usage      # print Tavily usage counters (panel meter)
+python3 news_updater.py --rediscover      # force re-discovery of ALL tickers now
+python3 news_updater.py --rediscover=LU   # ... only for LU
 ```
 
 ## Important security note
