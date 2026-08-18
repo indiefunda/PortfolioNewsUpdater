@@ -17,6 +17,9 @@
   "tavily_max_monthly_searches": 850,
   "tavily_min_free_items": 4,
   "lookup_refresh_days": 30,
+  "exa_max_daily_searches": 32,
+  "exa_max_monthly_searches": 980,
+  "exa_min_free_items": 6,
   "macro_enabled": true,
   "macro_max_per_run": 3,
   "macro_translate": true,
@@ -29,6 +32,8 @@
     "eastmoney": true,
     "eastmoney_724": true,
     "sina_724": true,
+    "exa": true,
+    "exa_macro": true,
     "baidu": false,
     "tavily": true,
     "google_news_en": true

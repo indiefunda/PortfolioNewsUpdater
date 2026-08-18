@@ -135,6 +135,25 @@ BAIDU_NEWS_URL = "https://www.baidu.com/s"
 # topic=news + days= recency filter finds fresh Chinese coverage.
 TAVILY_API = "https://api.tavily.com/search"
 
+# EXA - neural/semantic search (free plan ~1,000 credits/month). Finds pages
+# ABOUT a concept, not just containing keywords - catches differently-worded
+# big news the regex never sees, and related entities during discovery.
+# Hard-budgeted (daily + monthly, tracked in exa_usage.json).
+EXA_API = "https://api.exa.ai/search"
+EXA_MAX_DAILY_SEARCHES = 32
+EXA_MAX_MONTHLY_SEARCHES = 980
+# Per-ticker EXA is skipped when the free sources already found at least this
+# many NEW items for the ticker that run (EXA fills the gaps the free sources
+# leave - busy days cost nothing, quiet days find the conceptually-relevant
+# big news).
+EXA_MIN_FREE_ITEMS = 6
+EXA_USAGE_FILE = os.path.join(BASE_DIR, "exa_usage.json")
+# Semantic macro query - one EXA news search per run for BIG China news
+# (monetary, fiscal, fintech regulation, market risk) without relying on the
+# exact keywords.
+MACRO_EXA_QUERY = ("中国 重大经济政策 金融监管 助贷 消费金融 降息 降准 刺激 "
+                   "对金融科技和消费信贷公司的影响")
+
 # Matches CJK characters to tag items as Chinese-language.
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
@@ -670,14 +689,21 @@ def discover_company(ticker, config, secrets, existing=None):
     ai_key = secrets.get("ai_api_key", "")
     snippets = []
 
-    # 1) Tavily - one or two general-topic reference searches (counts toward
-    #    the same daily/monthly budget; discovery is a one-time cost per new
-    #    ticker). For tickers with a Chinese name hint, one targeted query
-    #    works well (e.g. LX -> Fortaprest, Mexico subsidiary). For unknown
-    #    tickers (bare 2-4 letter symbols like PDD), search engines often
-    #    ignore the symbol itself, so we also try a disambiguating English
-    #    corporate query and a Chinese query.
-    if secrets.get("tavily_api_key"):
+    # 1) EXA (neural) - the best discovery source: finds related companies /
+    #    subsidiaries semantically (e.g. 深圳市分期乐网络科技 for LX, 陆金申华
+    #    for LU) that keyword search never surfaces. Category "company" returns
+    #    company-profile pages; small text snippets for the AI grounding.
+    if secrets.get("exa_api_key"):
+        q = f"{name_hint or ticker} 子公司 旗下品牌 相关企业 subsidiaries related companies"
+        res = fetch_exa(q, secrets, config, since_dt=None, limit=6,
+                        with_text=True, category="company")
+        if res:
+            snippets.extend(f"- {it['title']}: {it.get('snippet', '')[:200]}" for it in res)
+            print(f"  [discovery] {ticker}: EXA returned {len(res)} company result(s) "
+                  f"for profile lookup.")
+
+    # 1b) Tavily general - fallback / enrichment (only if EXA gave us nothing).
+    if not snippets and secrets.get("tavily_api_key"):
         queries = []
         if name_hint:
             queries.append(f"{name_hint} 公司 子公司 旗下品牌 subsidiaries brands")
@@ -1418,6 +1444,88 @@ def macro_tag(text):
     return "MACRO"
 
 
+def exa_usage_today():
+    """EXA usage tracker: daily count (resets at midnight ET) + monthly count.
+    Both caps are enforced so the free ~1,000/month plan is never blown."""
+    data = _read_json(EXA_USAGE_FILE, {})
+    today = datetime.now(EASTERN).strftime("%Y-%m-%d")
+    month = today[:7]
+    if data.get("date") != today:
+        data["date"] = today
+        data["count"] = 0
+    if data.get("month") != month:
+        data["month"] = month
+        data["month_count"] = 0
+    return data
+
+
+def fetch_exa(query, secrets, config, since_dt=None, limit=6, with_text=False,
+              category="news"):
+    """
+    EXA AI neural search. Finds pages ABOUT the concept, not just containing
+    the keywords - catches differently-worded big news the regex never sees,
+    and related entities during discovery (category="company" finds company
+    profile pages, e.g. 深圳市分期乐网络科技 for LX).
+
+    Budget (configurable): daily cap exa_max_daily_searches (default 32),
+    monthly cap exa_max_monthly_searches (default 980). Returns a list of
+    items, or None on failure / when capped (delta not advanced).
+    'with_text' is used only for discovery (small maxCharacters; costs a
+    little more, but discovery runs monthly).
+    """
+    key = secrets.get("exa_api_key", "")
+    if not key:
+        return []
+    daily_cap = _cfg_int(config, "exa_max_daily_searches", EXA_MAX_DAILY_SEARCHES)
+    monthly_cap = _cfg_int(config, "exa_max_monthly_searches", EXA_MAX_MONTHLY_SEARCHES)
+    usage = exa_usage_today()
+    if usage.get("count", 0) >= daily_cap:
+        print(f"  [warn] EXA daily cap ({daily_cap}) reached - skipping (delta not advanced).")
+        return None
+    if usage.get("month_count", 0) >= monthly_cap:
+        print(f"  [warn] EXA monthly cap ({monthly_cap}) reached - skipping (delta not advanced).")
+        return None
+    try:
+        payload = {"query": query, "numResults": limit, "type": "neural",
+                   "category": category}
+        if with_text:
+            payload["contents"] = {"text": {"maxCharacters": 300}}
+        if category == "news" and since_dt is not None:
+            payload["startPublishedDate"] = (
+                since_dt.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+        resp = requests.post(EXA_API,
+                             headers={"x-api-key": key, "Content-Type": "application/json"},
+                             json=payload, timeout=25)
+        resp.raise_for_status()
+        data = resp.json()
+        # Count the credit ONLY after a successful call (and never in
+        # --no-write mode).
+        if not NO_WRITE:
+            usage["count"] += 1
+            usage["month_count"] += 1
+            _write_json(EXA_USAGE_FILE, usage)
+        items = []
+        for r in data.get("results", []) or []:
+            title = (r.get("title") or "").strip()
+            url = r.get("url") or ""
+            if not title:
+                continue
+            items.append({
+                "source": "Exa",
+                "ticker": "",
+                "id": url or title,
+                "title": title,
+                "url": url,
+                "date": r.get("publishedDate") or "",
+                "lang": "zh" if is_chinese(title) else "en",
+                "snippet": (r.get("text") or "")[:300],
+            })
+        return items
+    except Exception as exc:
+        print(f"  [error] EXA search '{query[:50]}': {exc}", file=sys.stderr)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Chinese fast-news wires (the real-time "tape" - where alpha breaks first)
 # ---------------------------------------------------------------------------
@@ -1843,6 +1951,24 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
                 if is_macro(f"{it.get('title', '')} {it.get('snippet', '')}", extra):
                     raw_items.append(it)
             set_last_fetched(conn, "MACRO", "GoogleNewsMacro", now_utc_str)
+
+    # EXA neural macro search: finds BIG China news semantically - no regex
+    # needed, catches differently-worded items (e.g. "助贷的生死时刻").
+    if secrets.get("exa_api_key") and src_on("exa_macro"):
+        last = get_last_fetched(conn, "MACRO", "ExaMacro")
+        since_dt = (datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=EASTERN)
+                    if last else datetime.now(EASTERN) - timedelta(hours=initial_hours))
+        res = fetch_exa(MACRO_EXA_QUERY, secrets, config, since_dt=since_dt,
+                        limit=8, category="news")
+        if res is None:
+            print("  [warn] macro: EXA macro search failed - NOT advancing delta.")
+        else:
+            for it in res:
+                item = dict(it)
+                item["ticker"] = "MACRO"
+                item["source"] = "ExaMacro"
+                raw_items.append(item)
+            set_last_fetched(conn, "MACRO", "ExaMacro", now_utc_str)
     seen_keys = set()
     new_items = []
     for it in raw_items:
@@ -2134,7 +2260,8 @@ def main():
         sys.exit(0)
 
     if "--dump-usage" in sys.argv:
-        print(json.dumps(tavily_usage_today(), ensure_ascii=False))
+        print(json.dumps({"tavily": tavily_usage_today(), "exa": exa_usage_today()},
+                         ensure_ascii=False))
         sys.exit(0)
 
     if "--dump-news" in sys.argv:
@@ -2402,6 +2529,24 @@ def main():
                       f"NOT advancing delta.")
                 continue
             process_wire(wire_src, raw, zh_terms)
+
+        # 3.6) EXA neural search - semantic recall: finds big/impact news
+        #      about the company that keyword sources miss ("the Shenzhen-
+        #      based insurer" instead of "Huize"). Skipped when the free
+        #      sources already covered the ticker this run (budget).
+        if src_on("exa") and secrets.get("exa_api_key"):
+            free_count = sum(1 for it in all_new if it.get("ticker") == ticker)
+            exa_min_free = _cfg_int(config, "exa_min_free_items", EXA_MIN_FREE_ITEMS)
+            if free_count >= exa_min_free:
+                print(f"  {ticker}: free sources already found {free_count} item(s) "
+                      f"this run - skipping EXA (saving credits).")
+            else:
+                exa_query = (f"{' '.join(zh_terms[:2])} {' '.join(en_terms[:2])} "
+                             f"重大 监管 政策 影响 风险")
+                process_source(
+                    "Exa",
+                    lambda sd: fetch_exa(exa_query, secrets, config, sd,
+                                         limit=5, category="news"))
 
         # 4) Company RSS feeds (configured per ticker) - source "RSS".
         feeds = config.get("rss_feeds", {}).get(ticker, [])

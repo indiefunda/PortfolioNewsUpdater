@@ -3,18 +3,20 @@
 A personal stock-news monitor that actually finds the news that matters for
 **US-listed Chinese companies**. It searches **Chinese-language sources**
 (Google News zh-CN, 东方财富/Eastmoney, the **Eastmoney + Sina 7x24
-real-time news wires**, Tavily) using each company's **Chinese name and its
-subsidiaries** (e.g. LX → 乐信/分期乐/Fenqile, plus their official websites),
-stores everything in a small database, translates + scores it with AI (with a
-"what this means" impact sentence), and pushes only the most important items
-to Telegram — **three times a day**, pinned to US market time (DST-aware),
-including a **23:00 ET run that catches the Chinese morning news burst**.
+real-time news wires**, **EXA neural search**, Tavily) using each company's
+**Chinese name and its subsidiaries** (e.g. LX → 乐信/分期乐/Fenqile, plus
+their official websites), stores everything in a small database, translates +
+scores it with AI (with a "what this means" impact sentence), and pushes only
+the most important items to Telegram — **three times a day**, pinned to US
+market time (DST-aware), including a **23:00 ET run that catches the Chinese
+morning news burst**.
 
 **The edge:** a penalty to 分期乐, a HK subsidiary's license news, an
-official-site announcement, a flash item on the Chinese wire — or a **huge
-China macro move (rate cuts, stimulus, assisted-loan regulation) pushed in a
-dedicated 📢 CHINA MACRO section, gated by free regex so it costs almost no
-AI** — the stuff US English media never covers, delivered hours earlier.
+official-site announcement, a flash item on the Chinese wire, a **semantic
+EXA find** ("the Shenzhen-based insurer" → Huize) — or a **huge China macro
+move (rate cuts, stimulus, assisted-loan regulation) pushed in a dedicated
+📢 CHINA MACRO section** — the stuff US English media never covers, delivered
+hours earlier.
 
 - Everything runs on a **free** Google Cloud e2-micro VM ($0).
 - Cost is **$0/month** (see below). No spam: importance floors, per-ticker
@@ -30,6 +32,7 @@ AI** — the stuff US English media never covers, delivered hours earlier.
 | Google Cloud CLI (on the Windows PC) | **$0** | https://cloud.google.com/sdk/docs/install |
 | Telegram bot token + chat id | **$0** | @BotFather creates the bot; @userinfobot gives your chat id |
 | Tavily API key | **$0** | tavily.com free plan = 1,000 searches/month (the app budgets itself: max 15/day, 850/month) |
+| EXA AI key | **$0** | exa.ai free plan ≈ 1,000 semantic searches/month (the app budgets itself: max 32/day, 980/month) |
 | AI key — **DeepSeek (only paid item) OR Gemini free tier** | **$0–$2** | DeepSeek: platform.deepseek.com (tiny top-up, lasts months). **Gemini: aistudio.google.com/apikey → free tier is enough.** Pick it in the panel — AI provider → Gemini |
 
 ---

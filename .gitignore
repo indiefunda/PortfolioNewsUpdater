@@ -20,6 +20,7 @@ run_history.json
 news_run_history.json
 seen.json
 tavily_usage.json
+exa_usage.json
 company_lookup.json
 sec_validate.json
 *.log

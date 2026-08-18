@@ -39,18 +39,26 @@ instant no-op, so exactly **three real runs happen per day**.
    financial "tape" (东财快讯 + 新浪7x24). Fetched once per run, filtered by
    each ticker's Chinese names/subsidiaries — this is where the alpha breaks
    first, before search engines even index it
-5. **Baidu News** — best-effort Chinese news search (off by default: Baidu
+5. **EXA (neural search)** — *semantic* search: finds pages ABOUT the
+   concept, not just containing the keywords. Used three ways: per-ticker
+   **big/impact news** (a story about "the Shenzhen-based insurer" is caught
+   for Huize), the **macro tier** (semantic — "助贷的生死时刻" style coverage,
+   no regex needed), and **subsidiary discovery** (finds related entities
+   keyword search never surfaces, e.g. 陆金申华 for LU). Free ~1,000
+   searches/month, hard-budgeted (max 32/day, 980/month), skipped for a
+   ticker when free sources already covered it
+6. **Baidu News** — best-effort Chinese news search (off by default: Baidu
    serves a CAPTCHA to server IPs, so it rarely returns anything — you can
    re-enable it via `sources.baidu`)
-6. **Tavily** — agent-grade news search (free plan: 1,000 credits/month;
+7. **Tavily** — agent-grade news search (free plan: 1,000 credits/month;
    budgeted hard: max 15/day, max 850/month, and skipped entirely for a
    ticker when the free sources already found enough items that run)
-7. **Google News EN** — kept as a low-priority backup, but now also searches
+8. **Google News EN** — kept as a low-priority backup, but now also searches
    the company's English brand names (e.g. Fenqile, Temu)
-8. **Google News `site:`** — searches the company's OWN discovered websites
+9. **Google News `site:`** — searches the company's OWN discovered websites
    (official site, news page, subsidiary sites) so official announcements and
    press releases are caught even when no news outlet covers them
-9. **Company RSS / press-release feeds** (optional, per-ticker)
+10. **Company RSS / press-release feeds** (optional, per-ticker)
 
 All new items are stored in `news.db`, translated + summarized + scored by AI
 (one batched call per ticker to keep token usage tiny), then the **top-N by
@@ -64,9 +72,11 @@ with each item. Everything else stays in the DB — browse it from the panel
 
 Huge policy / market news — **rate cuts (降息/降准/LPR), stimulus (万亿/特别国债),
 assisted-loan regulation (助贷/消费金融/利率上限), 金融监管总局 actions, 中概股
-moves, tariffs/sanctions** — is caught in real time from the 7x24 wires plus a
-macro Google News query and pushed in its **own digest section at the top**,
-always (never floor-capped), capped at `macro_max_per_run` (default 3).
+moves, tariffs/sanctions** — is caught in real time from the 7x24 wires, a
+macro Google News query, **and EXA's semantic macro search (finds
+differently-worded big news the regex can't)**, and pushed in its **own digest
+section at the top**, always (never floor-capped), capped at
+`macro_max_per_run` (default 3).
 
 **Cost:** the gate is a **free regex** — no AI is spent filtering. Only the
 few matched items (typically 0–3 per run) get ONE tiny batched AI call that

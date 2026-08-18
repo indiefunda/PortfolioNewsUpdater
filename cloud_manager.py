@@ -76,6 +76,11 @@ DEFAULT_CONFIG = {
     "macro_max_per_run": 3,
     "macro_translate": True,
     "macro_keywords": [],
+    # EXA neural search: semantic recall for big/impact news + subsidiary
+    # discovery (free plan ~1,000/month, hard-budgeted like Tavily).
+    "exa_max_daily_searches": 32,
+    "exa_max_monthly_searches": 980,
+    "exa_min_free_items": 6,
     "sources": {
         "sec": True,
         "google_news_zh": True,
@@ -84,6 +89,8 @@ DEFAULT_CONFIG = {
         "eastmoney": True,
         "eastmoney_724": True,  # Eastmoney 7x24 fast-news wire (real-time tape)
         "sina_724": True,  # Sina 7x24 fast-news wire
+        "exa": True,  # EXA neural per-ticker impact search
+        "exa_macro": True,  # EXA neural macro search (semantic, no regex)
         "baidu": False,  # captcha-blocked from server IPs - off by default
         "tavily": True,
         "google_news_en": True,
@@ -101,6 +108,7 @@ DEFAULT_SECRETS = {
     "telegram_chat_id": "",
     "ai_api_key": "",
     "tavily_api_key": "",
+    "exa_api_key": "",
 }
 
 
@@ -401,6 +409,8 @@ HTML = """<!DOCTYPE html>
     <input id="aikey" type="password" placeholder="paste your key">
     <label>Tavily API key (free: 1,000 news searches/month)</label>
     <input id="tavilyKey" type="password" placeholder="paste your free Tavily key (optional)">
+    <label>EXA AI key (free: ~1,000 semantic searches/month)</label>
+    <input id="exaKey" type="password" placeholder="paste your free EXA key (optional)">
     <div class="row">
       <div class="status" id="tavilyUsage" style="flex:1;margin-bottom:0">Tavily usage: —</div>
       <button class="btn-ghost" onclick="loadUsage()" style="margin-top:0">↻ Check</button>
@@ -535,6 +545,7 @@ async function load(){
   $('chatid').value = d.secrets.telegram_chat_id || '';
   $('aikey').value = d.secrets.ai_api_key || '';
   $('tavilyKey').value = d.secrets.tavily_api_key || '';
+  $('exaKey').value = d.secrets.exa_api_key || '';
   $('tickerMeta').value = JSON.stringify(d.config.ticker_meta || {}, null, 2);
   $('pushMode').value = d.config.push_mode || 'all';
   $('pushMinScore').value = d.config.push_min_score || 7;
@@ -581,6 +592,7 @@ async function uploadConfig(){
     ai_base_url: $('aiBase').value.trim(),
     telegram_bot_token: $('token').value.trim(), telegram_chat_id: $('chatid').value.trim(),
     ai_api_key: $('aikey').value.trim(), tavily_api_key: $('tavilyKey').value.trim(),
+    exa_api_key: $('exaKey').value.trim(),
     ticker_meta: tickerMeta,
     push_mode: $('pushMode').value, push_min_score: parseInt($('pushMinScore').value)||7,
     push_min_importance: parseInt($('pushMinImportance').value)||4,
@@ -597,10 +609,12 @@ async function uploadConfig(){
 
 async function loadUsage(){
   const d = await api('/api/tavily');
-  if(!d.ok){ $('tavilyUsage').textContent = 'Tavily usage: ❌ '+(d.error||'?'); return; }
+  if(!d.ok){ $('tavilyUsage').textContent = 'Usage: ❌ '+(d.error||'?'); return; }
   const u = d.usage || {};
-  const daily = $('tavilyDaily').value || 15, monthly = $('tavilyMonthly').value || 850;
-  $('tavilyUsage').textContent = 'Tavily usage: '+(u.count||0)+'/'+daily+' today · '+(u.month_count||0)+'/'+monthly+' this month';
+  const tv = u.tavily || {}, ex = u.exa || {};
+  const td = $('tavilyDaily').value || 15, tm = $('tavilyMonthly').value || 850;
+  const ed = 32, em = 980; // EXA free-plan caps
+  $('tavilyUsage').textContent = 'Tavily: '+(tv.count||0)+'/'+td+' today · '+(tv.month_count||0)+'/'+tm+' mo | EXA: '+(ex.count||0)+'/'+ed+' today · '+(ex.month_count||0)+'/'+em+' mo';
 }
 
 async function loadNews(){
@@ -883,7 +897,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "Could not parse company lookup from the server."})
 
     def _handle_tavily_usage(self):
-        """Fetch the Tavily usage tracker from the VM (--dump-usage)."""
+        """Fetch the Tavily + EXA usage trackers from the VM (--dump-usage)."""
         zone = find_vm_zone()
         if not zone:
             self._send_json({"ok": False, "error": "VM not found. Create the server first."})
@@ -898,9 +912,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             data = json.loads(out)
-            self._send_json({"ok": True, "usage": data if isinstance(data, dict) else {}})
+            if "tavily" in data and "exa" in data:
+                self._send_json({"ok": True, "usage": data})
+            else:
+                # Old layout (single dict) -> wrap it
+                self._send_json({"ok": True, "usage": {"tavily": data, "exa": {}}})
         except Exception:
-            self._send_json({"ok": False, "error": "Could not parse Tavily usage from the server."})
+            self._send_json({"ok": False, "error": "Could not parse usage from the server."})
 
     def _handle_rediscover(self):
         """Force a full company re-discovery on the VM (--rediscover)."""
@@ -981,6 +999,7 @@ class Handler(BaseHTTPRequestHandler):
             secrets["telegram_chat_id"] = data.get("telegram_chat_id", "")
             secrets["ai_api_key"] = data.get("ai_api_key", "")
             secrets["tavily_api_key"] = data.get("tavily_api_key", "")
+            secrets["exa_api_key"] = data.get("exa_api_key", "")
             save_config(cfg); save_secrets(secrets)
             project = get_project()
             if not project:
