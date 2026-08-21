@@ -10,7 +10,7 @@ Run it with:   python cloud_manager.py
 Then open:     http://localhost:8001
 
 This can share the same free VM as the price monitor - it just deploys the
-news files and adds a separate 2x-daily cron job.
+news files and adds a separate 3x-daily cron job.
 """
 
 import json
@@ -412,7 +412,7 @@ HTML = """<!DOCTYPE html>
     <label>EXA AI key (free: ~1,000 semantic searches/month)</label>
     <input id="exaKey" type="password" placeholder="paste your free EXA key (optional)">
     <div class="row">
-      <div class="status" id="tavilyUsage" style="flex:1;margin-bottom:0">Tavily usage: —</div>
+      <div class="status" id="tavilyUsage" style="flex:1;margin-bottom:0">Search budget — Tavily | EXA: —</div>
       <button class="btn-ghost" onclick="loadUsage()" style="margin-top:0">↻ Check</button>
     </div>
     <label>Chinese names — ticker_meta (this is where the Chinese edge comes from)</label>
@@ -558,9 +558,9 @@ async function load(){
   $('retentionDays').value = d.config.news_retention_days || 21;
   $('tavilyDaily').value = d.config.tavily_max_daily_searches || 15;
   $('tavilyMonthly').value = d.config.tavily_max_monthly_searches || 850;
-  $('tavilyMinFree').value = d.config.tavily_min_free_items || 4;
+  $('tavilyMinFree').value = d.config.tavily_min_free_items || 4; window._exaDaily = d.config.exa_max_daily_searches || 32; window._exaMonthly = d.config.exa_max_monthly_searches || 980;
   renderChips();
-  refreshStatus(); loadCron(); loadLogs();
+  refreshStatus(); loadCron(); loadLogs(); loadUsage();
 }
 
 async function refreshStatus(){
@@ -617,8 +617,8 @@ async function loadUsage(){
   const u = d.usage || {};
   const tv = u.tavily || {}, ex = u.exa || {};
   const td = $('tavilyDaily').value || 15, tm = $('tavilyMonthly').value || 850;
-  const ed = 32, em = 980; // EXA free-plan caps
-  $('tavilyUsage').textContent = 'Tavily: '+(tv.count||0)+'/'+td+' today · '+(tv.month_count||0)+'/'+tm+' mo | EXA: '+(ex.count||0)+'/'+ed+' today · '+(ex.month_count||0)+'/'+em+' mo';
+  const ed = window._exaDaily || 32, em = window._exaMonthly || 980; // EXA caps (from your config)
+  $('tavilyUsage').textContent = 'Tavily: '+(tv.count||0)+'/'+td+' today · '+(tv.month_count||0)+'/'+tm+' mo ('+(tm?Math.round(100*(tv.month_count||0)/tm):0)+'% used) | EXA: '+(ex.count||0)+'/'+ed+' today · '+(ex.month_count||0)+'/'+em+' mo ('+(em?Math.round(100*(ex.month_count||0)/em):0)+'% used)';
 }
 
 async function loadNews(){
@@ -679,7 +679,7 @@ async function loadCron(){
   if(!c){ el.innerHTML='<span class="dot gray"></span><b>Could not reach server.</b>'; return; }
   const daemon = String(c.cron_daemon_active||'').trim();
   if(c.active === 'active'){
-    el.innerHTML = '<span class="dot green"></span><b>Schedule armed (2x daily, US market time).</b> Runs at 9:15 ET &amp; 16:45 ET, auto-adjusts for DST. cron: '+
+    el.innerHTML = '<span class="dot green"></span><b>Schedule armed (3x daily, US market time).</b> Runs at 9:15 / 16:45 / 23:00 ET, auto-adjusts for DST. cron: '+
       (daemon==='active'?'running':'NOT running')+'<br><span style="color:var(--muted)">'+escapeHtml(c.cron_line||'')+'</span>';
   } else {
     el.innerHTML = '<span class="dot red"></span><b>Schedule not installed.</b> Upload config (Step 3) to install it. cron: '+(daemon==='active'?'running':'NOT running');

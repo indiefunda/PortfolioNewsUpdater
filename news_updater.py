@@ -81,6 +81,12 @@ RUN_HISTORY_FILE = os.path.join(BASE_DIR, "news_run_history.json")
 TAVILY_USAGE_FILE = os.path.join(BASE_DIR, "tavily_usage.json")
 
 EASTERN = ZoneInfo("America/New_York")
+# Wall-clock zone for the Chinese sources (Eastmoney search / 7x24 wire, Sina
+# 7x24): their naive date strings are BEIJING time, not Eastern. Parsing them
+# as Eastern made items look ~12h older than they are, so the delta filter
+# (pub_dt < since_dt) could drop brand-new wire items inside the lookback
+# window. Chinese fetchers normalize their dates via _zh_date_to_et().
+BEIJING = ZoneInfo("Asia/Shanghai")
 
 HEADERS = {
     "User-Agent": "PortfolioNewsUpdater/2.0 (personal stock news monitor)",
@@ -336,6 +342,16 @@ def item_hash(source, item_id, title=None):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _hash_of(item):
+    """
+    Hash for an item DICT. Rescued orphan rows carry their original hash in
+    '_hash' (the raw item id behind it is not reconstructible from the DB),
+    everything else hashes from source + id as usual.
+    """
+    h = item.get("_hash")
+    return h if h else item_hash(item["source"], item["id"], item.get("title", ""))
+
+
 def is_new(conn, ticker, source, item_id, title):
     """Return True if this item has not been seen before."""
     h = item_hash(source, item_id, title)
@@ -364,7 +380,7 @@ def insert_news(conn, item):
     if NO_WRITE:
         return
     now = datetime.now(EASTERN).strftime("%Y-%m-%d %H:%M:%S")
-    h = item_hash(item["source"], item["id"], item.get("title", ""))
+    h = _hash_of(item)
     conn.execute(
         "INSERT OR IGNORE INTO news (ticker, source, lang, item_hash, title_raw, "
         "url, snippet, published_at, first_seen) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -379,7 +395,7 @@ def update_news_ai(conn, item):
     """Write the AI-enriched fields (translation, summary, score, ...) back."""
     if NO_WRITE:
         return
-    h = item_hash(item["source"], item["id"], item.get("title", ""))
+    h = _hash_of(item)
     conn.execute(
         "UPDATE news SET title_en=?, summary=?, category=?, importance=?, "
         "sentiment=?, reason=?, impact=? WHERE ticker=? AND source=? AND item_hash=?",
@@ -396,7 +412,7 @@ def mark_pushed(conn, item, pushed):
     """Set the pushed flag (1 = went to the Telegram digest)."""
     if NO_WRITE:
         return
-    h = item_hash(item["source"], item["id"], item.get("title", ""))
+    h = _hash_of(item)
     conn.execute(
         "UPDATE news SET pushed=? WHERE ticker=? AND source=? AND item_hash=?",
         (1 if pushed else 0, item["ticker"], item["source"], h),
@@ -465,6 +481,64 @@ def prune_db(conn):
 
 
 # ---------------------------------------------------------------------------
+# Orphan rescue: recover items a crashed run stored but never pushed
+# ---------------------------------------------------------------------------
+def rescue_orphans(conn, config):
+    """
+    Recovery pass for the mark-seen-before-push gap: items are marked seen and
+    stored in `news` during the fetch loop, but only AI-analyzed and pushed
+    LATER in the run. A run that dies in between (crash, OOM on the small VM,
+    AI outage at the wrong moment) leaves rows with importance IS NULL that
+    are ALREADY in the seen ledger - no later run picks them up (is_new()
+    says no) and they silently never reach a digest.
+
+    This runs BEFORE the fetch loop, so everything it finds was stored by a
+    PREVIOUS run. Re-queued items go through the normal pipeline: AI analysis,
+    importance floor, AI veto, per-ticker caps - nothing is pushed blindly.
+    Rows the previous run deliberately stored-only (importance set, pushed=0)
+    are NOT touched. Bounded by max_items_per_run, newest first, limited to
+    the retention window.
+    """
+    if NO_WRITE or conn is None:
+        return []
+    cutoff = (datetime.now(EASTERN)
+              - timedelta(days=NEWS_RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    limit = _cfg_int(config, "max_items_per_run", 40)
+    try:
+        rows = conn.execute(
+            "SELECT ticker, source, item_hash, title_raw, url, snippet, lang, "
+            "published_at, first_seen FROM news "
+            "WHERE importance IS NULL AND pushed=0 AND first_seen >= ? "
+            "ORDER BY first_seen DESC LIMIT ?",
+            (cutoff, limit),
+        ).fetchall()
+    except Exception as exc:
+        print(f"  [warn] orphan-rescue query failed: {exc}", file=sys.stderr)
+        return []
+    items = []
+    for (ticker, source, h, title, url, snippet, lang, published_at,
+         first_seen) in rows:
+        items.append({
+            "source": source,
+            "ticker": ticker,
+            # The original raw item id is gone (only its hash is stored), so
+            # '_hash' carries the DB hash - update_news_ai / mark_pushed use
+            # it to hit the right row. 'id' is just a placeholder.
+            "id": h,
+            "_hash": h,
+            "title": title or "",
+            "url": url or "",
+            "date": published_at or "",
+            "published_at": published_at or "",
+            "first_seen": first_seen,
+            "lang": lang or "en",
+            "snippet": snippet or "",
+            "rescued": True,
+        })
+    return items
+
+
+# ---------------------------------------------------------------------------
 # Text helpers
 # ---------------------------------------------------------------------------
 def is_chinese(text):
@@ -499,7 +573,7 @@ def strip_tags(text):
     return html.unescape(re.sub(r"<[^>]+>", "", text or "")).strip()
 
 
-def _parse_pub(s):
+def _parse_pub(s, naive_tz=EASTERN):
     """
     Parse a publish-date string to an aware datetime (Eastern), or None.
     Handles the formats the sources actually emit:
@@ -507,7 +581,8 @@ def _parse_pub(s):
         (Tavily: 2026-08-15T10:22:33.123Z)
       - 'YYYY-MM-DD HH:MM:SS' / 'YYYY-MM-DD' / 'YYYY/MM/DD ...'
       - RFC 822 / RFC 1123 (Google News RSS: 'Sat, 15 Aug 2026 05:00:00 GMT')
-    Naive dates are assumed to be Eastern (matches the old behavior).
+    Naive dates are assumed to be 'naive_tz' (Eastern by default; Chinese
+    sources pass Asia/Shanghai - see _zh_date_to_et).
     """
     if not s:
         return None
@@ -515,7 +590,7 @@ def _parse_pub(s):
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=EASTERN)
+            dt = dt.replace(tzinfo=naive_tz)
         return dt.astimezone(EASTERN)
     except Exception:
         pass
@@ -526,17 +601,28 @@ def _parse_pub(s):
         try:
             dt = datetime.strptime(s, fmt)
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=EASTERN)
+                dt = dt.replace(tzinfo=naive_tz)
             return dt.astimezone(EASTERN)
         except Exception:
             continue
     return None
 
 
-def _normalize_pub(s):
+def _normalize_pub(s, naive_tz=EASTERN):
     """ISO-ish string for the DB, or ''."""
-    dt = _parse_pub(s)
+    dt = _parse_pub(s, naive_tz=naive_tz)
     return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else ""
+
+
+def _zh_date_to_et(s):
+    """
+    Normalize a Chinese-source date string (Beijing wall-clock: Eastmoney
+    search dates, Eastmoney 7x24 showTime, Sina 7x24 create_time) to an
+    Eastern-time 'YYYY-MM-DD HH:MM:SS' string ('' if unparseable). Doing this
+    at the fetcher boundary means every downstream consumer - the delta
+    filters, published_at storage, digest ordering - sees consistent ET.
+    """
+    return _normalize_pub(s, naive_tz=BEIJING)
 
 
 # ---------------------------------------------------------------------------
@@ -1217,7 +1303,8 @@ def fetch_eastmoney_search(query, since_dt=None, limit=10, terms=None):
                 continue
             url = a.get("url", "") or ""
             content = strip_tags(a.get("content", ""))
-            date = a.get("date", "") or ""
+            # Eastmoney dates are Beijing wall-clock - normalize to ET.
+            date = _zh_date_to_et(a.get("date", ""))
             pub_dt = _parse_pub(date)
             if since_dt is not None and pub_dt and pub_dt < since_dt:
                 continue
@@ -1570,7 +1657,8 @@ def fetch_eastmoney_724(limit=50):
                 "id": str(it.get("code") or title),
                 "title": title,
                 "url": it.get("url") or "",
-                "date": it.get("showTime") or "",
+                # showTime is Beijing wall-clock - normalize to ET.
+                "date": _zh_date_to_et(it.get("showTime") or ""),
                 "lang": "zh",
                 "snippet": strip_tags(it.get("summary") or "")[:300],
             })
@@ -1606,7 +1694,8 @@ def fetch_sina_724(limit=100):
                 "id": str(it.get("id") or title),
                 "title": title[:200],
                 "url": "",
-                "date": it.get("create_time") or "",
+                # create_time is Beijing wall-clock - normalize to ET.
+                "date": _zh_date_to_et(it.get("create_time") or ""),
                 "lang": "zh",
                 "snippet": title[:300],
             })
@@ -1757,7 +1846,13 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None):
         # Folded semantic dedup: show what has already been seen for this
         # ticker so the model can flag recycled/same-event stories
         # (known_event) - this replaces the old separate dedup AI call.
-        history = get_recent_seen_titles(conn, ticker, before=run_start) if conn else []
+        # The batch's own titles are excluded: items are marked seen at fetch
+        # time, so a rescued orphan (or any current item) must not be flagged
+        # known_event against itself.
+        history = (get_recent_seen_titles(
+                       conn, ticker, before=run_start,
+                       exclude={it.get("title", "") for it in ticker_items})
+                   if conn else [])
         hist_lines = [f"- {t}" for t in history]
         if ticker == "MACRO":
             # China macro: framed around impact on the user's fintech names.
@@ -1877,7 +1972,8 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None):
 SEMANTIC_DEDUP_HISTORY = 20
 
 
-def get_recent_seen_titles(conn, ticker, limit=SEMANTIC_DEDUP_HISTORY, before=None):
+def get_recent_seen_titles(conn, ticker, limit=SEMANTIC_DEDUP_HISTORY, before=None,
+                           exclude=None):
     """
     Return recent already-seen titles for a ticker (from the `seen` ledger),
     newest first. This history is folded into the per-ticker AI-analysis
@@ -1887,6 +1983,12 @@ def get_recent_seen_titles(conn, ticker, limit=SEMANTIC_DEDUP_HISTORY, before=No
     'before' excludes the current run's items (marked 'seen' during the fetch
     loop) so two distinct new events in the same batch are never deduped
     against each other before either is pushed.
+
+    'exclude' drops specific titles from the history - used by ai_analyze to
+    remove the CURRENT BATCH's own titles, which are already in the ledger
+    (items are marked seen at fetch time). Without this, a rescued orphan
+    could be flagged known_event against ITS OWN earlier title and never
+    pushed.
     """
     if before:
         cur = conn.execute(
@@ -1900,6 +2002,9 @@ def get_recent_seen_titles(conn, ticker, limit=SEMANTIC_DEDUP_HISTORY, before=No
             "ORDER BY first_seen DESC LIMIT ?",
             (ticker, limit),
         )
+    if exclude:
+        ex = set(exclude)
+        return [r[0] for r in cur.fetchall() if r[0] and r[0] not in ex]
     return [r[0] for r in cur.fetchall() if r[0]]
 
 
@@ -2369,6 +2474,18 @@ def main():
         print("  [db] VACUUM ran (DB file shrank).")
 
     all_new = []
+
+    # Recovery pass FIRST (before any fetching): re-queue rows that a previous
+    # run stored but never analyzed/pushed (crash between the fetch loop and
+    # the AI/push stage - the mark-seen-before-push gap). They flow through
+    # the normal AI analysis, floor, veto and caps below like fresh items.
+    rescued = rescue_orphans(conn, config)
+    if rescued:
+        all_new.extend(rescued)
+        record["rescued_items"] = len(rescued)
+        print(f"  [recovery] re-queued {len(rescued)} unanalyzed item(s) from "
+              f"a previous interrupted run.")
+
     record["tickers_checked"] = len(tickers)
 
     initial_hours = _cfg_int(config, "initial_lookback_hours", 24)

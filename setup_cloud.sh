@@ -8,17 +8,17 @@
 #
 # What it does:
 #   1. Installs Python deps (requests, feedparser, edgartools)
-#   2. Installs TWO DST-aware cron jobs that run news_updater.py
-#      twice a day, pinned to US market time (9:15 ET and 16:45 ET)
-#   3. Runs news_updater.py once to confirm it works
+#   2. Installs SIX DST-aware cron jobs that run news_updater.py
+#      three times a day, pinned to US market time (9:15 / 16:45 / 23:00 ET)
+#   3. Runs news_updater.py once (--force --dry-run) to confirm it works
 #
-# Why TWO cron jobs? US Eastern time shifts by 1 hour between DST
+# Why a cron job per season? US Eastern time shifts by 1 hour between DST
 # seasons, but cron fires at fixed UTC times. So we install one job
-# per season:
+# per run per season:
 #     Summer (EDT, UTC-4): 9:15 ET = 13:15 UTC, 16:45 ET = 20:45 UTC
 #     Winter (EST, UTC-5): 9:15 ET = 14:15 UTC, 16:45 ET = 21:45 UTC
 # news_updater.py carries a tiny DST-aware guard that makes the
-# out-of-season job an instant no-op, so exactly two real runs happen
+# out-of-season job an instant no-op, so exactly three real runs happen
 # per day. This is reliable because cron does the exact timing and the
 # correct job is always already installed - no re-setup at DST flips.
 # ============================================================
@@ -102,6 +102,9 @@ build_cron() {
 }
 SUMMER_LINES="$(build_cron summer)"
 WINTER_LINES="$(build_cron winter)"
+# NOTE: "$( ... )" strips trailing newlines, so re-terminate explicitly with
+# printf '%s\n' - cron IGNORES (or warns on) a final line without a newline,
+# which would silently drop the LAST run of each season (the 23:00 ET job).
 echo "  Summer (EDT) cron: $(printf '%s' "$SUMMER_LINES" | tr '\n' '; ')"
 echo "  Winter (EST) cron: $(printf '%s' "$WINTER_LINES" | tr '\n' '; ')"
 
@@ -114,7 +117,7 @@ GREP="$(command -v grep || echo /bin/grep)"
 # script name is the reliable way to remove all previous copies.
 TMPCRON="$("$MKTEMP")"
 "$CRONTAB" -l 2>/dev/null | "$GREP" -v 'news_updater.py' > "$TMPCRON" || true
-printf '%s%s' "$SUMMER_LINES" "$WINTER_LINES" >> "$TMPCRON"
+printf '%s\n%s\n' "$SUMMER_LINES" "$WINTER_LINES" >> "$TMPCRON"
 if "$CRONTAB" "$TMPCRON"; then
   echo "  ✅ Cron jobs installed (user crontab)."
 else
@@ -122,8 +125,8 @@ else
   # Fallback: install a system cron file (needs root). Format is the same
   # as a crontab but with the username field inserted after the schedule.
   USERNAME="$(id -un 2>/dev/null || echo root)"
-  printf '%s' "$SUMMER_LINES" | sed "s/^/$USERNAME /" > /tmp/news-summer
-  printf '%s' "$WINTER_LINES" | sed "s/^/$USERNAME /" > /tmp/news-winter
+  printf '%s\n' "$SUMMER_LINES" | sed "s/^/$USERNAME /" > /tmp/news-summer
+  printf '%s\n' "$WINTER_LINES" | sed "s/^/$USERNAME /" > /tmp/news-winter
   sudo mv /tmp/news-summer /etc/cron.d/news-summer 2>/dev/null || true
   sudo mv /tmp/news-winter /etc/cron.d/news-winter 2>/dev/null || true
   if sudo test -f /etc/cron.d/news-summer; then
@@ -145,8 +148,11 @@ for f in /etc/cron.d/news-summer /etc/cron.d/news-winter; do
 done
 
 # --- Run once to confirm it works
+# --force bypasses the schedule guard (otherwise this is an instant no-op
+# unless it happens to be within +/-5 minutes of a scheduled run time);
+# --dry-run validates the whole pipeline WITHOUT sending Telegram messages.
 echo "  Running news_updater.py once to test..."
-python3 "$MONITOR"
+python3 "$MONITOR" --force --dry-run
 
 echo ""
 echo "=============================================="

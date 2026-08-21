@@ -211,7 +211,7 @@ python3 news_updater.py --force --dry-run --no-write  # full test: no DB/lookup/
 python3 news_updater.py --dump-news       # print stored news as JSON (panel browse)
 python3 news_updater.py --dump-news=LX    # ... only for LX
 python3 news_updater.py --dump-lookup     # print the company lookup as JSON (panel)
-python3 news_updater.py --dump-usage      # print Tavily usage counters (panel meter)
+python3 news_updater.py --dump-usage      # print Tavily + EXA usage counters (panel meter)
 python3 news_updater.py --rediscover      # force re-discovery of ALL tickers now
 python3 news_updater.py --rediscover=LU   # ... only for LU
 python3 news_updater.py --purge-junk      # delete stored junk (never-pushed, importance<=2)
