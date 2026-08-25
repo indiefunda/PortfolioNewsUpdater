@@ -2,7 +2,7 @@
 
 Searches your tickers for **new** SEC filings, **Chinese** news (Google News
 zh-CN, Eastmoney, Sina/Eastmoney 7x24 wires, Tavily), English news, and RSS
-items **three times a day**. Everything found is stored in a SQLite news
+items **twice a day**. Everything found is stored in a SQLite news
 database (rolling ~3 weeks), translated to English and scored 1–10 by
 **DeepSeek AI**; only the **top items by importance** are pushed to your
 Telegram. Runs on the same **free** Google Cloud VM as your price monitor,
@@ -14,11 +14,17 @@ so it costs **$0** for VM/network/storage.
 |-----|-------------------|-----|
 | 1 | **9:15 ET** | 15 minutes before the 9:30 ET market open |
 | 2 | **16:45 ET** | just after the 16:00 ET close |
-| 3 | **23:00 ET** | **Beijing noon** — catches the Chinese **morning** news burst (alpha breaks 9:00–12:00 Beijing time; run 2 misses it entirely) |
+
+Both runs deliberately sit **outside DeepSeek's peak-pricing windows**
+(01:00–04:00 & 06:00–10:00 UTC Mon–Fri — tokens cost **double** there).
+9:15 ET ≈ 13:15/14:15 UTC and 16:45 ET ≈ 20:45/21:45 UTC are both off-peak,
+so **every AI call is billed at the half price**. The old third run
+(23:00 ET / Beijing noon) fired at 03:00–04:00 UTC — deep inside peak —
+and was removed purely for AI cost.
 
 The installer puts cron jobs on the VM for both DST seasons and a tiny
 DST-aware guard inside `news_updater.py` makes the out-of-season jobs an
-instant no-op, so exactly **three real runs happen per day**.
+instant no-op, so exactly **two real runs happen per day**.
 
 ## What it checks (per ticker, per run — only the "delta" since last time)
 
@@ -237,6 +243,7 @@ crontab -l | grep -v news_updater | crontab -
 | Problem | What to do |
 |---------|------------|
 | "Schedule not installed" | Click **Upload config to server**, then **Check schedule**. |
+| An OLD story (weeks/months old) appeared in the digest | Fixed by the freshness gates: every EXA result is now date-verified against the per-source delta window, and ANY item whose publish time is older than `max_news_age_hours` (default **96h**, set in `config_local.json`; 0 disables) is dropped at ingestion no matter which source returned it. The digest also shows each item's 📅 publish date so anything stale is visible at a glance. |
 | New stock added but no Chinese news appears | Check Step 6 (Company lookup) after the next run — the updater auto-discovers the company's Chinese names/subsidiaries and searches them. You can also add them manually in the Step 3 JSON (overrides always win). |
 | No digest arrives | Click **Run now (test)** and read the output. Check Telegram + AI keys. |
 | Tavily not used | Add your Tavily key (free tier) in the panel and re-upload; the run log shows `Tavily daily/monthly cap reached` or `skipping Tavily (saving credits)` when it's budget-skipped. |
@@ -246,10 +253,10 @@ crontab -l | grep -v news_updater | crontab -
 
 ## How the schedule stays reliable across DST
 
-- **Six cron jobs** are installed (three runs × two seasons), firing at the
-  correct UTC times for 9:15, 16:45 and 23:00 ET in summer (EDT) and winter
+- **Four cron jobs** are installed (two runs × two seasons), firing at the
+  correct UTC times for 9:15 and 16:45 ET in summer (EDT) and winter
   (EST).
 - `news_updater.py` has a **DST-aware guard** that skips the out-of-season
-  jobs instantly, so exactly **three** real runs per day.
+  jobs instantly, so exactly **two** real runs per day.
 - The installer also enables the cron daemon at boot and installs Python deps
   with `sudo` (so cron can import them).

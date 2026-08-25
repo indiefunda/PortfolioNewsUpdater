@@ -185,6 +185,13 @@ TAVILY_MAX_MONTHLY_SEARCHES = 850
 # it (budget save - Tavily is the scarce resource).
 TAVILY_MIN_FREE_ITEMS = 4
 
+# Hard freshness backstop: any item whose PUBLISH time is older than this
+# many hours is dropped at ingestion, regardless of what the source returned
+# (search APIs - EXA neural search especially - sometimes ignore their own
+# date filters and serve months-old articles as "brand-new"). 96h covers even
+# a long weekend between runs; 0 disables. Configurable: max_news_age_hours.
+MAX_NEWS_AGE_HOURS = 96
+
 # ---------------------------------------------------------------------------
 # File helpers
 # ---------------------------------------------------------------------------
@@ -623,6 +630,28 @@ def _zh_date_to_et(s):
     filters, published_at storage, digest ordering - sees consistent ET.
     """
     return _normalize_pub(s, naive_tz=BEIJING)
+
+
+def _is_stale_item(item, max_age_hours=MAX_NEWS_AGE_HOURS):
+    """
+    True if the item's publish time PARSES and is older than max_age_hours.
+    This is the hard freshness backstop: search engines/APIs (EXA neural
+    search especially) sometimes ignore their own date filters and serve
+    months-old stories as "new"; whatever a source claims, nothing older
+    than this window may enter the pipeline. Undated items return False
+    here (nothing to check) - the per-source delta filters handle those
+    where a usable date exists.
+    """
+    try:
+        hours = float(max_age_hours)
+    except Exception:
+        hours = float(MAX_NEWS_AGE_HOURS)
+    if hours <= 0:
+        return False  # backstop disabled via config (max_news_age_hours: 0)
+    dt = _parse_pub(item.get("date", "") or item.get("published_at", ""))
+    if dt is None:
+        return False
+    return dt < datetime.now(EASTERN) - timedelta(hours=hours)
 
 
 # ---------------------------------------------------------------------------
@@ -1591,12 +1620,27 @@ def fetch_exa(query, secrets, config, since_dt=None, limit=6, with_text=False,
             usage["count"] += 1
             usage["month_count"] += 1
             _write_json(EXA_USAGE_FILE, usage)
+        # DELTA ENFORCEMENT: startPublishedDate above is only a HINT - EXA's
+        # neural search regularly ignores it and serves months-old pages
+        # (recycled stories that would then be AI-scored and PUSHED as "new").
+        # Verify the returned publishedDate ourselves, like Tavily/the wires:
+        #   - dated result older than since_dt -> dropped;
+        #   - news-category result with NO parsable date -> also dropped
+        #     (its freshness cannot be proven). Discovery/company searches
+        #     (category="company") are exempt - profile pages aren't news.
+        enforce_delta = category == "news" and since_dt is not None
         items = []
+        dropped = 0
         for r in data.get("results", []) or []:
             title = (r.get("title") or "").strip()
             url = r.get("url") or ""
             if not title:
                 continue
+            if enforce_delta:
+                pub_dt = _parse_pub(r.get("publishedDate") or "")
+                if pub_dt is None or pub_dt < since_dt:
+                    dropped += 1
+                    continue
             items.append({
                 "source": "Exa",
                 "ticker": "",
@@ -1607,6 +1651,9 @@ def fetch_exa(query, secrets, config, since_dt=None, limit=6, with_text=False,
                 "lang": "zh" if is_chinese(title) else "en",
                 "snippet": (r.get("text") or "")[:300],
             })
+        if dropped:
+            print(f"  [exa] dropped {dropped} stale/undated result(s) "
+                  f"(delta window starts {since_dt.strftime('%Y-%m-%d %H:%M')}).")
         return items
     except Exception as exc:
         print(f"  [error] EXA search '{query[:50]}': {exc}", file=sys.stderr)
@@ -1839,6 +1886,9 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None):
                 "lang": it.get("lang", "en"),
                 "title": it.get("title", ""),
                 "url": it.get("url", ""),
+                # Original publish date (ET, '' if undated) - lets the model
+                # recognize RECYCLED old stories and veto them (known_event).
+                "published": it.get("published_at") or _normalize_pub(it.get("date", "")),
             }
             if it.get("snippet"):
                 entry["snippet"] = it["snippet"][:200]
@@ -1889,7 +1939,11 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None):
             f"(e.g. {subs}) is especially valuable - weigh it heavily; it often "
             f"contains information English media misses.\n"
             "Below are NEW items found today. Each has a number, source, "
-            "language, title, and a short snippet.\n"
+            "language, title, publish date, and a short snippet.\n"
+            "FRESHNESS RULE: if an item's 'published' date is days or more in "
+            "the past relative to today, it is a recycled OLD story, not "
+            "breaking news - set known_event=true and push=false for it "
+            "unless something genuinely new happened.\n"
             "For EACH item return one JSON object with keys:\n"
             "  number (the item's number), title_en (concise English "
             "translation; keep as-is if already English), summary (one English "
@@ -2018,7 +2072,8 @@ def is_macro(text, extra=None):
 
 
 def collect_macro_items(conn, config, secrets, wire_cache, src_on,
-                        initial_hours, run_start, now_utc_str):
+                        initial_hours, run_start, now_utc_str,
+                        max_age_hours=MAX_NEWS_AGE_HOURS):
     """
     The 'China macro' tier: huge policy/market news the user MUST know about
     (rate cuts, stimulus, assisted-loan regulation, ...). Gated FREE by
@@ -2077,6 +2132,10 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
     seen_keys = set()
     new_items = []
     for it in raw_items:
+        # Same hard freshness backstop as the per-ticker path: a macro wire/
+        # search hit with an ancient publish time is a recycled story.
+        if _is_stale_item(it, max_age_hours):
+            continue
         key = (it["source"], it["id"])
         if key in seen_keys:
             continue
@@ -2130,7 +2189,9 @@ def format_macro(items):
     for it in items:
         title = it.get("title_en") or it.get("title", "")
         tag = macro_tag(f"{it.get('title', '')} {it.get('snippet', '')}")
-        lines.append(f"• [{tag}] {title}")
+        pub = (it.get("published_at")
+               or _normalize_pub(it.get("date", "")) or "")
+        lines.append(f"• [{tag}] {title}" + (f" 📅{pub[:10]}" if pub else ""))
         if it.get("impact"):
             lines.append(f"    → {it['impact']}")
         if it.get("url"):
@@ -2237,6 +2298,12 @@ def format_digest(filtered, ticker_count, stored_count=0):
             header += f"  ({category})"
         if importance:
             header += f" ⭐{importance}"
+        # Show the item's own publish date so anything stale is visible at a
+        # glance (defense-in-depth against recycled old stories).
+        pub = (item.get("published_at")
+               or _normalize_pub(item.get("date", "")) or "")
+        if pub:
+            header += f" 📅{pub[:10]}"
         lines.append(header)
         if reason:
             lines.append(f"    {reason}")
@@ -2317,11 +2384,14 @@ def select_push_items(enriched, config):
 # ---------------------------------------------------------------------------
 # Schedule guard
 # ---------------------------------------------------------------------------
-# Three runs a day, pinned to US market time. The third run (23:00 ET =
-# 12:00 Beijing noon) catches the Chinese MORNING news burst - the alpha
-# breaks 9:00-12:00 Beijing time, long before US media picks it up, and the
-# 16:45 ET run misses it entirely.
-SCHEDULE_RUN_TIMES = (dtime(9, 15), dtime(16, 45), dtime(23, 0))
+# Two runs a day, pinned to US market time. Both are deliberately placed
+# OUTSIDE DeepSeek's peak-pricing windows (01:00-04:00 / 06:00-10:00 UTC
+# Mon-Fri, when API tokens cost DOUBLE): 9:15 ET = ~14:15 UTC and 16:45 ET =
+# ~20:45/21:45 UTC are both off-peak (half price). The old third run at
+# 23:00 ET (= 03:00/04:00 UTC, deep inside the peak window) was removed
+# purely for AI cost; re-add dtime(23, 0) here AND the matching cron jobs
+# in setup_cloud.sh if you ever want the Beijing-noon burst back.
+SCHEDULE_RUN_TIMES = (dtime(9, 15), dtime(16, 45))
 SCHEDULE_TOLERANCE_MIN = 5
 
 
@@ -2336,7 +2406,7 @@ def _schedule_guard(now_et):
         if delta <= SCHEDULE_TOLERANCE_MIN * 60:
             return
     print(f"[{now_et.strftime('%Y-%m-%d %H:%M %Z')}] "
-          f"Outside scheduled times (9:15 / 16:45 / 23:00 ET) - skipping.")
+          f"Outside scheduled times (9:15 / 16:45 ET) - skipping.")
     sys.exit(0)
 
 
@@ -2489,6 +2559,11 @@ def main():
     record["tickers_checked"] = len(tickers)
 
     initial_hours = _cfg_int(config, "initial_lookback_hours", 24)
+    # Hard freshness backstop window (see MAX_NEWS_AGE_HOURS): any ingested
+    # item whose publish time is older than this many hours is dropped no
+    # matter what its source claimed. Configurable via config_local.json
+    # ("max_news_age_hours"); 0 disables the backstop entirely.
+    max_news_age_hours = _cfg_int(config, "max_news_age_hours", MAX_NEWS_AGE_HOURS)
     # ET wall-clock string used for the per-source last_fetched deltas.
     now_utc_str = datetime.now(EASTERN).strftime("%Y-%m-%d %H:%M:%S")
     sources_cfg = config.get("sources", {})
@@ -2551,6 +2626,16 @@ def main():
                 return
             for item in items:
                 item["ticker"] = ticker
+                # Hard freshness backstop (MAX_NEWS_AGE_HOURS): drop anything
+                # whose publish time is ancient even if its fetcher let it
+                # through - this is what keeps months-old recycled stories
+                # out of the digest no matter which source returned them.
+                if _is_stale_item(item, max_news_age_hours):
+                    print(f"  [stale] {ticker} {source}: dropped "
+                          f"'{item.get('title', '')[:60]}' (published "
+                          f"{_normalize_pub(item.get('date', '')) or 'unknown'}, "
+                          f"older than {max_news_age_hours}h).")
+                    continue
                 if is_new(conn, ticker, item["source"], item["id"], item["title"]):
                     item["published_at"] = _normalize_pub(item.get("date", ""))
                     item["first_seen"] = run_start
@@ -2580,6 +2665,8 @@ def main():
                     continue
                 pub_dt = _parse_pub(raw.get("date", ""))
                 if pub_dt and pub_dt < since_dt:
+                    continue
+                if _is_stale_item(raw, max_news_age_hours):
                     continue
                 item = dict(raw)
                 item["ticker"] = ticker
@@ -2731,7 +2818,8 @@ def main():
     # Gated FREE by regex; only matched items reach the AI (one tiny batched
     # call). Always pushed in their own digest section, never floor-capped.
     macro_items = collect_macro_items(conn, config, secrets, wire_cache, src_on,
-                                      initial_hours, run_start, now_utc_str)
+                                      initial_hours, run_start, now_utc_str,
+                                      max_age_hours=max_news_age_hours)
     macro_pushed = analyze_macro(macro_items, config, secrets, conn, run_start)
     for it in macro_items:
         mark_pushed(conn, it, it in macro_pushed)

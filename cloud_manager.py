@@ -10,7 +10,7 @@ Run it with:   python cloud_manager.py
 Then open:     http://localhost:8001
 
 This can share the same free VM as the price monitor - it just deploys the
-news files and adds a separate 3x-daily cron job.
+news files and adds a separate 2x-daily cron job.
 """
 
 import json
@@ -679,7 +679,7 @@ async function loadCron(){
   if(!c){ el.innerHTML='<span class="dot gray"></span><b>Could not reach server.</b>'; return; }
   const daemon = String(c.cron_daemon_active||'').trim();
   if(c.active === 'active'){
-    el.innerHTML = '<span class="dot green"></span><b>Schedule armed (3x daily, US market time).</b> Runs at 9:15 / 16:45 / 23:00 ET, auto-adjusts for DST. cron: '+
+    el.innerHTML = '<span class="dot green"></span><b>Schedule armed (2x daily, US market time).</b> Runs at 9:15 / 16:45 ET (both outside DeepSeek peak pricing), auto-adjusts for DST. cron: '+
       (daemon==='active'?'running':'NOT running')+'<br><span style="color:var(--muted)">'+escapeHtml(c.cron_line||'')+'</span>';
   } else {
     el.innerHTML = '<span class="dot red"></span><b>Schedule not installed.</b> Upload config (Step 3) to install it. cron: '+(daemon==='active'?'running':'NOT running');
