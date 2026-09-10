@@ -383,11 +383,21 @@ HTML = """<!DOCTYPE html>
   .badge.err { background:#7c2d12; color:#fecaca; }
   .badge.gray { background:#2a2e38; color:#cbd5e1; }
   .empty { color:var(--muted); text-align:center; padding:24px; font-size:13px; }
+  /* Links: the browser default (#0000EE) and :visited (#551A8B) are almost
+     invisible on this dark theme - always specify both. */
+  a, a:visited { color:#7db1ff; text-decoration:none; }
+  a:hover { color:#a5c8ff; text-decoration:underline; }
+  /* Per-row delete button (stored-news table) */
+  .btn-x { background:transparent; border:1px solid var(--border); color:var(--muted);
+           border-radius:6px; padding:1px 7px; font-size:13px; line-height:1.3;
+           cursor:pointer; }
+  .btn-x:hover { background:#7c2d12; border-color:#b45309; color:#fff; }
+  .btn-x[disabled] { opacity:.45; cursor:default; }
 </style>
 </head>
 <body>
   <h1>📰 PortfolioNewsUpdater — Cloud</h1>
-  <div class="sub">Searches SEC (with 6-K/8-K content), Chinese news (乐信/分期乐… via Google News zh, Eastmoney, Tavily, official websites), English news and RSS — translates &amp; scores everything with AI, pushes the top items to Telegram. Runs twice a day at 9:15 ET &amp; 16:45 ET (auto-adjusts for DST).</div>
+  <div class="sub">Searches SEC (with 6-K/8-K content), Chinese news (乐信/分期乐… via Google News zh, Eastmoney, Tavily, official websites), English news and RSS — translates &amp; scores everything with AI, pushes the top items to Telegram. Runs twice a day at 9:15 ET (pre-open) &amp; 17:00 ET (post-close), auto-adjusted for DST.</div>
   <div class="msg" id="msg"></div>
 
   <div class="card">
@@ -670,11 +680,42 @@ function renderNews(){
     const imp = n.importance!=null ? '⭐'+n.importance : '—';
     const pushed = n.pushed ? '<span class="badge ok">pushed</span>' : '<span class="badge gray">stored</span>';
     const src = (n.source||'') + (n.lang==='zh' ? ' 🇨🇳' : '');
-    html += '<tr><td>'+escapeHtml(n.first_seen||'')+'</td><td>'+escapeHtml(n.ticker||'')+'</td>'+
+    // Index into the FULL array, so deletion targets the right row even while
+    // a filter is active and the table is only showing a subset.
+    const idx = news.indexOf(n);
+    html += '<tr><td><button class="btn-x" title="Delete this item from the stored news" '+
+      'onclick="deleteNews('+idx+')">✕</button></td>'+
+      '<td>'+escapeHtml(n.first_seen||'')+'</td><td>'+escapeHtml(n.ticker||'')+'</td>'+
       '<td>'+escapeHtml(src)+'</td><td>'+escapeHtml(n.category||'')+'</td><td>'+imp+'</td>'+
-      '<td>'+pushed+'</td><td>'+(n.url?'<a href="'+escapeHtml(n.url)+'" target="_blank">'+escapeHtml(title)+'</a>':escapeHtml(title))+'</td></tr>';
+      '<td>'+pushed+'</td><td>'+(n.url?'<a href="'+escapeHtml(n.url)+'" target="_blank" rel="noopener">'+escapeHtml(title)+'</a>':escapeHtml(title))+'</td></tr>';
   }
-  $('newsTableWrap').innerHTML = '<div class="tablewrap"><table><thead><tr><th>Seen (ET)</th><th>Ticker</th><th>Source</th><th>Cat</th><th>Imp</th><th>Status</th><th>Title (EN)</th></tr></thead><tbody>'+html+'</tbody></table></div>';
+  $('newsTableWrap').innerHTML = '<div class="tablewrap"><table><thead><tr><th></th><th>Seen (ET)</th><th>Ticker</th><th>Source</th><th>Cat</th><th>Imp</th><th>Status</th><th>Title (EN)</th></tr></thead><tbody>'+html+'</tbody></table></div>';
+}
+
+async function deleteNews(idx){
+  const n = news[idx];
+  if(!n) return;
+  const title = (n.title_en || n.title_raw || '').slice(0, 90);
+  // NOTE: this panel is a Python triple-quoted string, so newline ESCAPES in
+  // it become real newlines in the served JavaScript and break the script.
+  // Use <br> instead - Chrome renders it as a line break in confirm dialogs.
+  let msg = 'Delete this stored item?<br><br>'+title+'<br><br>'+
+            (n.ticker||'')+' - '+(n.source||'')+' - '+(n.first_seen||'');
+  if(n.pushed) msg += '<br><br>It was already PUSHED to Telegram. This also clears the '+
+                      'dedup memory for it, so the same story can reach you again '+
+                      'if it is re-reported.';
+  else msg += '<br><br>It was never pushed, so this only removes it from the browser view.';
+  if(!confirm(msg)) return;
+  $('newsStatus').textContent = 'Deleting item on the server...';
+  const d = await api('/api/delete_news', {ticker:n.ticker, source:n.source,
+                                           item_hash:n.item_hash, pushed: n.pushed?1:0});
+  if(d.ok){
+    news.splice(idx, 1);          // keep the local copy in sync
+    $('newsStatus').textContent = '✅ Deleted. '+news.length+' stored item(s) left.';
+    renderNews();
+  } else {
+    $('newsStatus').textContent = '❌ '+(d.error||'delete failed');
+  }
 }
 
 async function loadLookup(){
@@ -985,8 +1026,62 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"ok": ok, "error": (err or "") if not ok else "",
                          "output": "\n".join(tail)})
 
+    def _handle_delete_news(self):
+        """
+        Delete ONE stored news row on the VM (the panel's per-row ✕ button).
+
+        Identified by (ticker, source, item_hash) exactly as --dump-news
+        returned them. Every field is sanitized before it reaches the SSH
+        command - this is user-supplied input going into a shell string.
+        """
+        zone = find_vm_zone()
+        if not zone:
+            self._send_json({"ok": False, "error": "VM not found. Create the server first."})
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except Exception:
+            self._send_json({"ok": False, "error": "Bad request body."})
+            return
+
+        def clean(value, allowed, maxlen):
+            return "".join(ch for ch in str(value or "") if ch in allowed)[:maxlen]
+
+        ticker = clean(payload.get("ticker"), set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-"), 12)
+        source = clean(payload.get("source"),
+                       set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"), 24)
+        item_hash = clean(payload.get("item_hash"), set("0123456789abcdef"), 64)
+        pushed = bool(payload.get("pushed"))
+        if not ticker or not item_hash:
+            self._send_json({"ok": False, "error": "Missing ticker or item hash."})
+            return
+        home = get_vm_home(zone)
+        mode = "--delete-news-pushed" if pushed else "--delete-news"
+        arg = f"{ticker}|{source}|{item_hash}"
+        ok, out, err = run_gcloud([
+            "compute", "ssh", "--zone", zone, VM_NAME,
+            "--command", f"cd {home} && python3 news_updater.py {mode}='{arg}' 2>&1",
+            "--quiet"], timeout=120)
+        text = (out + err).strip()
+        deleted = 0
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    deleted = json.loads(line).get("deleted", 0)
+                    break
+                except Exception:
+                    continue
+        self._send_json({"ok": ok and deleted > 0, "deleted": deleted,
+                         "error": "" if deleted else (text or "nothing deleted"),
+                         "output": text})
+
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/delete_news":
+            self._handle_delete_news()
+            return
         if parsed.path == "/api/upload":
             length = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(length).decode("utf-8"))

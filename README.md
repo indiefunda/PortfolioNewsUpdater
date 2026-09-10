@@ -65,7 +65,8 @@ hours earlier.
    - **Upload config to server**, then **Run now (test)**.
 6. Check **Step 5 (stored news)** and **Step 6 (company lookup)** — the
    updater auto-discovers each company's Chinese name, subsidiaries and
-   websites, and alerts you on Telegram when it finds new ones.
+   websites, and alerts you on Telegram when it finds new ones. In Step 5 every
+   stored row has an ✕ to delete it (with confirmation) if it is not useful.
 
 > Your personal `config_local.json` (tickers/holdings) is created by the
 > panel on first upload and is **git-ignored — never committed**. For local

@@ -290,7 +290,17 @@ python3 news_updater.py --rediscover      # force re-discovery of ALL tickers no
 python3 news_updater.py --rediscover=LU   # ... only for LU
 python3 news_updater.py --purge-junk      # delete stored junk (never-pushed, importance<=2)
 python3 news_updater.py --purge-junk=3    # ... with a custom junk bar
+python3 news_updater.py --delete-news=LX|Tavily|<hash>         # delete ONE stored row
+python3 news_updater.py --delete-news-pushed=LX|Tavily|<hash>  # ... and forget it was pushed
 ```
+
+**Deleting one item from the panel (Step 5).** Each row in the stored-news
+table has an ✕ button. It asks for confirmation, then deletes that single row on
+the server. If the row was already **pushed** to Telegram, the delete also
+clears the repeat/event-gate memory for that story — deleting your copy is an
+explicit "I don't want this", so the same story can reach you again if it is
+re-reported. For a stored-only row there is nothing to forget, so only the row
+goes. (The `item_hash` shown/used by the panel comes from `--dump-news`.)
 
 ## Important security note
 

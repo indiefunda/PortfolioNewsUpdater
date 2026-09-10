@@ -749,25 +749,85 @@ def mark_pushed(conn, item, pushed):
 
 
 def list_news(conn, ticker=None, limit=300):
-    """Return stored news (last ~3 weeks) as a list of dicts for browsing."""
+    """Return stored news (last ~3 weeks) as a list of dicts for browsing.
+
+    Includes `item_hash` so the panel can delete an individual row (the hash is
+    what identifies a row together with its ticker and source).
+    """
     cols = ["ticker", "source", "lang", "title_en", "title_raw", "summary",
             "category", "importance", "sentiment", "pushed", "url",
-            "published_at", "first_seen", "reason", "impact"]
+            "published_at", "first_seen", "reason", "impact", "item_hash"]
     if ticker:
         rows = conn.execute(
             "SELECT ticker, source, lang, title_en, title_raw, summary, category, "
-            "importance, sentiment, pushed, url, published_at, first_seen, reason, impact "
-            "FROM news WHERE ticker=? ORDER BY first_seen DESC, id DESC LIMIT ?",
+            "importance, sentiment, pushed, url, published_at, first_seen, reason, "
+            "impact, item_hash FROM news WHERE ticker=? "
+            "ORDER BY first_seen DESC, id DESC LIMIT ?",
             (ticker, limit),
         ).fetchall()
     else:
         rows = conn.execute(
             "SELECT ticker, source, lang, title_en, title_raw, summary, category, "
-            "importance, sentiment, pushed, url, published_at, first_seen, reason, impact "
-            "FROM news ORDER BY first_seen DESC, id DESC LIMIT ?",
+            "importance, sentiment, pushed, url, published_at, first_seen, reason, "
+            "impact, item_hash FROM news ORDER BY first_seen DESC, id DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return [dict(zip(cols, r)) for r in rows]
+
+
+def delete_news_item(conn, ticker, source="", item_hash="", title="", url="",
+                     keep_ledger=False):
+    """
+    Delete ONE stored news row, plus (by default) the repeat-gate memory it
+    created.
+
+    Removing the ledger entry matters: if the row was pushed, leaving it in
+    `pushed_stories` would keep suppressing that story. Deleting the user's
+    copy is an explicit "I don't want this", so it also clears the memory that
+    would block the same story from being pushed again. Pass keep_ledger=True
+    to remove the row from the browser view while keeping the dedup memory.
+
+    Identified by (ticker, source, item_hash) when available (what the panel
+    sends), else by an exact title/URL match so a hand-typed call still works.
+    Returns a dict describing what was removed.
+    """
+    result = {"deleted": 0, "ledger_removed": 0}
+    where, params = "", []
+    if item_hash:
+        where = "ticker=? AND source=? AND item_hash=?"
+        params = [ticker, source, item_hash]
+    elif url:
+        where, params = "ticker=? AND url=?", [ticker, url]
+    elif title:
+        where, params = "ticker=? AND (title_raw=? OR title_en=?)", [ticker, title, title]
+    else:
+        return result
+    rows = conn.execute(f"SELECT url, title_raw, title_en FROM news WHERE {where}",
+                        params).fetchall()
+    cur = conn.execute(f"DELETE FROM news WHERE {where}", params)
+    result["deleted"] = cur.rowcount
+    if not keep_ledger:
+        # Clear the repeat-gate / event-gate memory for the deleted stories:
+        # one key per identity the row could have been recorded under (URL or
+        # normalised headline).
+        try:
+            for (u, tr, te) in rows:
+                keys = set()
+                if u:
+                    keys.add(story_key({"ticker": ticker, "url": u, "title": ""}))
+                if tr:
+                    keys.add(story_key({"ticker": ticker, "url": "", "title": tr}))
+                if te:
+                    keys.add(story_key({"ticker": ticker, "url": "", "title": te}))
+                for sk in keys:
+                    c2 = conn.execute(
+                        "DELETE FROM pushed_stories WHERE ticker=? AND story_key=?",
+                        (ticker, sk))
+                    result["ledger_removed"] += c2.rowcount
+        except Exception as exc:
+            print(f"  [warn] could not clear push ledger: {exc}", file=sys.stderr)
+    conn.commit()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3551,7 +3611,10 @@ def main():
     NO_WRITE = "--no-write" in sys.argv
 
     # ---- CLI modes first (never blocked by the schedule guard) ----
-    if "--purge-junk" in sys.argv:
+    # Match the PREFIX for modes that can carry a value (--purge-junk=3,
+    # --rediscover=LU): an exact `"--mode" in sys.argv` test is False for
+    # "--mode=value", which silently ran the normal pipeline instead.
+    if any(a == "--purge-junk" or a.startswith("--purge-junk=") for a in sys.argv):
         # One-time cleanup of stored trash (never-pushed items scored at or
         # below the junk bar). Run this after a filter fix to clean history.
         threshold = 2
@@ -3574,7 +3637,7 @@ def main():
               f"(pushed=0, importance <= {threshold}).")
         sys.exit(0)
 
-    if "--rediscover" in sys.argv:
+    if any(a == "--rediscover" or a.startswith("--rediscover=") for a in sys.argv):
         ticker_arg = None
         for a in sys.argv:
             if a.startswith("--rediscover"):
@@ -3612,6 +3675,45 @@ def main():
         print(json.dumps(list_news(conn, ticker=ticker_arg), ensure_ascii=False))
         conn.close()
         sys.exit(0)
+
+    # ---- delete stored news (panel's per-row ✕ button) ----
+    #   --delete-news=TICKER|SOURCE|ITEM_HASH          delete one stored row
+    #   --delete-news-pushed=TICKER|SOURCE|ITEM_HASH   ... and forget it was
+    #                                                  ever pushed
+    # The `-pushed` form also clears the repeat/event ledger entry, so a story
+    # the user deliberately removed can reach them again if it is re-reported.
+    # The plain form keeps the dedup memory (delete from the browser view only).
+    # NOTE: these modes are always passed WITH a value (--delete-news=A|B|C), so
+    # match the prefix, not the bare flag: `"--delete-news" in sys.argv` is
+    # False for `--delete-news=...` and the mode would silently fall through to
+    # the schedule guard.
+    if any(a == "--delete-news" or a.startswith("--delete-news=")
+           or a.startswith("--delete-news-pushed=") for a in sys.argv):
+        arg, keep_ledger = "", True
+        for a in sys.argv:
+            if a.startswith("--delete-news-pushed="):
+                arg, keep_ledger = a.split("=", 1)[1], False
+            elif a.startswith("--delete-news="):
+                arg = a.split("=", 1)[1]
+        parts = (arg or "").split("|")
+        if len(parts) != 3 or not parts[0].strip() or not parts[2].strip():
+            print(json.dumps({"ok": False,
+                              "error": "expected TICKER|SOURCE|ITEM_HASH"}))
+            sys.exit(1)
+        ticker, source, item_hash = (parts[0].strip().upper(), parts[1].strip(),
+                                     parts[2].strip())
+        if NO_WRITE:
+            print(json.dumps({"ok": False, "error": "--no-write set"}))
+            sys.exit(1)
+        conn = _db()
+        res = delete_news_item(conn, ticker, source=source, item_hash=item_hash,
+                               keep_ledger=keep_ledger)
+        conn.close()
+        print(json.dumps({"ok": res["deleted"] > 0, "ticker": ticker,
+                          "source": source, "deleted": res["deleted"],
+                          "ledger_removed": res["ledger_removed"]},
+                         ensure_ascii=False))
+        sys.exit(0 if res["deleted"] else 1)
 
     dry_run = "--dry-run" in sys.argv
     snapshot = "--snapshot" in sys.argv  # manual run: always deliver (current picture)
