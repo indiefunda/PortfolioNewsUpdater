@@ -193,6 +193,109 @@ TAVILY_MIN_FREE_ITEMS = 4
 MAX_NEWS_AGE_HOURS = 96
 
 # ---------------------------------------------------------------------------
+# News-quality gates (the "is this actually about MY company, and is it NEW?"
+# layer). These exist because relevance and repetition - not the scoring -
+# are what makes a digest feel like noise.
+# ---------------------------------------------------------------------------
+# Any item whose publish time is older than this is stored but NEVER pushed,
+# no matter what the AI scored it. This is the code-level guard against
+# recycled coverage of an event the user already has (e.g. earnings results
+# re-reported days later by another outlet). Regulatory force-pushes are
+# exempt (a penalty is news whenever it surfaces). Configurable:
+# push_max_age_hours; 0 disables.
+PUSH_MAX_AGE_HOURS = 72
+# A stored item that has never been analysed (trimmed out of a busy run) is
+# re-queued by rescue_orphans. Cap that recovery batch generously so the tail
+# always drains instead of starving behind the newest items.
+ORPHAN_RESCUE_LIMIT = 120
+# Consecutive failures before a rescued orphan is left alone (never loops).
+ORPHAN_MAX_RESCUES = 3
+# Optional "sector watch" tier: semantically-relevant SECTOR news that does
+# not mention the company itself (e.g. Chinese insurance-sector regulation for
+# HUIZ/YB). Off by default - the user's complaint was exactly this class of
+# item - but when enabled it is labelled and capped separately instead of
+# being mixed into the per-ticker digest. Configurable: sector_watch.
+SECTOR_WATCH_DEFAULT = False
+SECTOR_WATCH_MAX_PER_RUN = 2
+# Global-markets tier: genuinely systemic US/global items (Fed decisions, CPI,
+# payrolls) that move Chinese ADRs. Kept SEPARATE from 📢 CHINA MACRO - which
+# stays reserved for China policy - and capped hard. Off by default because a
+# daily "Nasdaq Golden Dragon index closed down X%" is not actionable news.
+# Configurable: global_markets.
+GLOBAL_MARKETS_DEFAULT = False
+GLOBAL_MARKETS_MAX_PER_RUN = 2
+# Near-duplicate detection: two items for the same ticker whose titles share
+# this much of their token sets are the SAME story from different outlets.
+STORY_JACCARD_MIN = 0.6
+STORY_CONTAINMENT_MIN = 0.82
+# How many of a ticker's already-pushed titles the mechanical repeat gate
+# compares a new candidate against.
+PUSH_REPEAT_HISTORY = 160
+PUSH_REPEAT_JACCARD = 0.62
+# Event-level guard window: a corporate event (an earnings release for a given
+# fiscal period, an EGM, a dividend) is pushed ONCE, and every later article
+# about that same event is suppressed for this many days. 0 disables the event
+# guard (the per-story repeat gate still applies). Configurable:
+# event_repeat_window_days.
+EVENT_REPEAT_WINDOW_DAYS = 7
+# Local-time anchor for a date-only publish date (see _is_date_only).
+NOON_HOUR = 12
+
+
+def _is_date_only(s):
+    """True for 'YYYY-MM-DD' / 'YYYY/MM/DD' (no time component) strings.
+
+    Search APIs (EXA, Tavily) often return a date with no time. Parsing that
+    as midnight invents an exact time that the source never gave - which then
+    drives the freshness gates and the 📅 date in the digest. We anchor
+    date-only values at noon of that local day instead: still honest to the
+    day, and never 'yesterday' because of a timezone shift.
+    """
+    s = str(s or "").strip()
+    return bool(re.fullmatch(r"\d{4}[-/]\d{2}[-/]\d{2}", s))
+
+
+def _parse_pub(s, naive_tz=EASTERN):
+    """
+    Parse a publish-date string to an aware datetime (Eastern), or None.
+    Handles the formats the sources actually emit:
+      - ISO 8601 with or without fractional seconds, 'Z' or offsets
+        (Tavily: 2026-08-15T10:22:33.123Z)
+      - 'YYYY-MM-DD HH:MM:SS' / 'YYYY-MM-DD' / 'YYYY/MM/DD ...'
+      - RFC 822 / RFC 1123 (Google News RSS: 'Sat, 15 Aug 2026 05:00:00 GMT')
+    Naive dates are assumed to be 'naive_tz' (Eastern by default; Chinese
+    sources pass Asia/Shanghai - see _zh_date_to_et). A DATE-ONLY value is
+    anchored at 12:00 local rather than midnight (see _is_date_only).
+    """
+    if not s:
+        return None
+    s = str(s).strip()
+    date_only = _is_date_only(s)
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=naive_tz)
+            if date_only:
+                dt = dt.replace(hour=NOON_HOUR, minute=0, second=0, microsecond=0)
+        return dt.astimezone(EASTERN)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S",
+                "%a, %d %b %Y %H:%M:%S %Z", "%a, %d %b %Y %H:%M:%S %z",
+                "%a, %d %b %Y %H:%M:%S", "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=naive_tz)
+                if date_only:
+                    dt = dt.replace(hour=NOON_HOUR, minute=0, second=0)
+            return dt.astimezone(EASTERN)
+        except Exception:
+            continue
+    return None
+
+# ---------------------------------------------------------------------------
 # File helpers
 # ---------------------------------------------------------------------------
 def _read_json(path, default):
@@ -313,9 +416,227 @@ def _db():
         conn.execute("ALTER TABLE news ADD COLUMN impact TEXT")
     except Exception:
         pass
+    # Migration: how many times an unanalyzed row was re-queued by
+    # rescue_orphans (stops a permanently unanalyzable row from looping).
+    try:
+        conn.execute("ALTER TABLE news ADD COLUMN rescues INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    # The repeat gate's memory: one row per story actually PUSHED per ticker,
+    # so a re-report of the same event (new URL, different outlet, days later)
+    # cannot be pushed twice even when the AI does not spot it. This is the
+    # mechanical backstop for "I already read this".
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS pushed_stories (
+            ticker TEXT NOT NULL,
+            story_key TEXT NOT NULL,
+            title TEXT,
+            pushed_at TEXT NOT NULL,
+            event_key TEXT,
+            PRIMARY KEY (ticker, story_key)
+        )"""
+    )
+    # Migration: the event-level key (ticker + category + fiscal period), so
+    # one earnings release can only ever be pushed once.
+    try:
+        conn.execute("ALTER TABLE pushed_stories ADD COLUMN event_key TEXT")
+    except Exception:
+        pass
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pushed_event "
+                 "ON pushed_stories (ticker, event_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_news_first_seen ON news (first_seen)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_news_ticker ON news (ticker)")
     return conn
+
+
+# Event-level guard: a corporate EVENT (an earnings release for a given fiscal
+# period, a shareholder vote, a convertible-note extension) is news ONCE. Every
+# later article about it - a different outlet, a translated headline, an
+# analyst write-up - is coverage, not news, and is what made the digest feel
+# like it was repeating itself for days.
+#
+# The period is taken from the title when stated (explicitly or as a period-end
+# date), never guessed from the clock, so last quarter's report cannot block
+# this quarter's.
+_CN_NUM = {"一": "1", "二": "2", "三": "3", "四": "4"}
+_ORD_Q = {"first": "1", "second": "2", "third": "3", "fourth": "4"}
+
+
+def _norm_cn_num(s):
+    """'二' -> '2' so Chinese and English phrasings of a quarter agree."""
+    return _CN_NUM.get(str(s), str(s))
+
+
+_EVENT_PERIOD_PATTERNS = [
+    # Q2 2026 / 2Q26 / 2026 Q2 / 2026年第二季度 / 第二季度
+    (r"\b(?:Q|q)([1-4])\s*(?:FY)?\s*(20\d{2})\b",
+     lambda m: f"{m.group(2)}Q{m.group(1)}"),
+    (r"\b(20\d{2})\s*(?:FY)?\s*(?:Q|q)([1-4])\b",
+     lambda m: f"{m.group(1)}Q{m.group(2)}"),
+    (r"(20\d{2})\s*年\s*第\s*([一二三四1-4])\s*季度",
+     lambda m: f"{m.group(1)}Q{_norm_cn_num(m.group(2))}"),
+    (r"第\s*([一二三四1-4])\s*季度",
+     lambda m: f"Q{_norm_cn_num(m.group(1))}"),
+    # English ordinals: 'Second Quarter 2026' / 'Second-Quarter 2026'
+    (r"\b(second|third|fourth|first)[\s-]*quarter\b.{0,24}?(20\d{2})",
+     lambda m: f"{m.group(2)}Q{_ORD_Q[m.group(1).lower()]}"),
+    (r"\b(20\d{2})\b.{0,24}?\b(second|third|fourth|first)[\s-]*quarter\b",
+     lambda m: f"{m.group(1)}Q{_ORD_Q[m.group(2).lower()]}"),
+    # H1 2026 / 上半年 / 2026年上半年
+    (r"\bH([12])\s*(20\d{2})\b", lambda m: f"{m.group(2)}H{m.group(1)}"),
+    (r"(20\d{2})\s*年\s*上半年", lambda m: f"{m.group(1)}H1"),
+    (r"上半年", lambda m: "H1"),
+    # FY2026 / 全年 / 年度
+    (r"\bFY\s*(20\d{2})\b", lambda m: f"{m.group(1)}FY"),
+    (r"(20\d{2})\s*年\s*全年度?", lambda m: f"{m.group(1)}FY"),
+    (r"全年度|全年业绩|年度业绩", lambda m: "FY"),
+    # A period END date is an explicit, unambiguous fiscal marker
+    # (2026-06-30 == Q2 2026 for a calendar-year filer). Both the numeric and
+    # the month-name form are handled - "for the quarter ended June 30, 2026"
+    # is the single most common earnings-release phrasing there is.
+    (r"20(\d{2})[-/年]\s*0?6[-/月]\s*30", lambda m: f"20{m.group(1)}Q2"),
+    (r"20(\d{2})[-/年]\s*0?3[-/月]\s*31", lambda m: f"20{m.group(1)}Q1"),
+    (r"20(\d{2})[-/年]\s*0?9[-/月]\s*30", lambda m: f"20{m.group(1)}Q3"),
+    (r"20(\d{2})[-/年]\s*12[-/月]\s*31", lambda m: f"20{m.group(1)}Q4"),
+    (r"\b(june|jun)\s*30,?\s*(20\d{2})",
+     lambda m: f"{m.group(2)}Q2"),
+    (r"\b(march|mar)\s*31,?\s*(20\d{2})",
+     lambda m: f"{m.group(2)}Q1"),
+    (r"\b(september|sept|sep)\s*30,?\s*(20\d{2})",
+     lambda m: f"{m.group(2)}Q3"),
+    (r"\b(december|dec)\s*31,?\s*(20\d{2})",
+     lambda m: f"{m.group(2)}Q4"),
+]
+_ORD_Q = {"first": "1", "second": "2", "third": "3", "fourth": "4"}
+# ORDER MATTERS: the first matching pattern names the event, so a specific
+# event must come before a general one ("...EGM to Extend Convertible Notes"
+# is a convertible-note event, not a generic EGM).
+_EVENT_NAME_PATTERNS = [
+    (r"earnings call|earnings results|financial results|quarter(?:ly)? ended|"
+     r"results for the (?:quarter|year|period)|full[- ]year results|"
+     r"季度业绩|业绩电话会议|业绩发布|财报|年度业绩|业绩公告|业绩说明会|"
+     r"中期业绩|业绩报告", "earnings"),
+    (r"converts?ible (?:notes?|bond)|可转换(?:债券|票据)", "connote"),
+    (r"share (?:issuance|placement)|配股|增发|供股", "shareissue"),
+    (r"dividend|分红|派息", "dividend"),
+    (r"share repurchase|buyback|回购", "buyback"),
+    (r"extraordinary general meeting|EGM|临时股东大会|股东特别大会", "egm"),
+]
+
+
+def _event_period(title):
+    """('2026Q2' | 'H1' | 'FY' | None) - the fiscal period stated in a title."""
+    # Chinese sources mix full-width （）／， with ASCII (a Chinese headline can
+    # carry "（Lufax Holding Ltd. 2026 Q2 Results）"). Fold the full-width forms
+    # to ASCII first, or the period patterns silently miss.
+    title = (title or "").translate(str.maketrans("（）［］，／：", "()[],/:"))
+    for pat, fmt in _EVENT_PERIOD_PATTERNS:
+        m = re.search(pat, title, re.IGNORECASE)
+        if m:
+            return fmt(m)
+    return None
+
+
+def event_key(item):
+    """
+    A stable key for the corporate EVENT behind an item, or None.
+
+    Combines the category (earnings / egm / dividend ...) with the fiscal
+    period when the title states one. None means "this item is not a recurring
+    corporate event", so the event guard steps aside and only the per-story
+    repeat gate applies.
+    """
+    hay = " ".join(str(item.get(k) or "") for k in ("title", "title_en"))
+    for pat, name in _EVENT_NAME_PATTERNS:
+        if re.search(pat, hay, re.IGNORECASE):
+            period = _event_period(hay)
+            return f"{name}:{period}" if period else name
+    return None
+
+
+def story_key(item):
+    """
+    Stable key for the repeat gate. Prefers the URL when the item has one
+    (the same URL is literally the same page); otherwise a hash of the
+    normalised title, so a re-published story under a new URL still matches
+    by headline.
+    """
+    url = str(item.get("url") or "").strip()
+    if url:
+        return "u:" + hashlib.sha256(url.strip().lower().encode("utf-8")).hexdigest()[:32]
+    return "t:" + hashlib.sha256(_clean_title(item.get("title", ""))
+                                 .encode("utf-8")).hexdigest()[:32]
+
+
+def record_pushed_stories(conn, items, now=None):
+    """Remember the stories just pushed (the repeat AND event gates' memory)."""
+    if NO_WRITE or conn is None or not items:
+        return
+    stamp = (now or datetime.now(EASTERN)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        for it in items:
+            # Store the ORIGINAL headline: the repeat gate compares tokens
+            # against it next run, and the AI's English translation of a
+            # Chinese headline carries far fewer comparable tokens.
+            conn.execute(
+                "INSERT OR REPLACE INTO pushed_stories "
+                "(ticker, story_key, title, pushed_at, event_key) VALUES (?,?,?,?,?)",
+                (it.get("ticker", ""), story_key(it),
+                 (it.get("title") or it.get("title_en") or "")[:300], stamp,
+                 event_key(it)))
+        conn.commit()
+    except Exception as exc:
+        print(f"  [warn] could not record pushed stories: {exc}", file=sys.stderr)
+
+
+def _story_already_pushed(conn, item, now, event_window_days=None):
+    """
+    Has this story - or the corporate EVENT behind it - already gone out for
+    this ticker?
+
+    Three checks, cheapest first:
+      1. the exact story key (same URL, or same normalised headline);
+      2. the EVENT key: one earnings release / EGM / dividend for a given
+         fiscal period is pushed ONCE, however many outlets later write it up
+         under their own URL and wording;
+      3. token overlap against recent pushed headlines (near-identical
+         re-writes in the same language).
+    """
+    ticker = item.get("ticker", "")
+    try:
+        row = conn.execute("SELECT 1 FROM pushed_stories WHERE ticker=? AND story_key=?",
+                           (ticker, story_key(item))).fetchone()
+        if row:
+            return True
+        # (2) Event-level guard.
+        if event_window_days is None:
+            event_window_days = EVENT_REPEAT_WINDOW_DAYS
+        ev = event_key(item)
+        if ev and event_window_days > 0:
+            ev_cutoff = (now - timedelta(days=event_window_days)) \
+                .strftime("%Y-%m-%d %H:%M:%S")
+            row = conn.execute(
+                "SELECT 1 FROM pushed_stories WHERE ticker=? AND event_key=? "
+                "AND pushed_at >= ?", (ticker, ev, ev_cutoff)).fetchone()
+            if row:
+                item["_event_repeat"] = ev
+                return True
+        # (3) Headline-similarity fallback.
+        cutoff = (now - timedelta(days=NEWS_RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+        rows = conn.execute(
+            "SELECT title FROM pushed_stories WHERE ticker=? AND pushed_at >= ? "
+            "ORDER BY pushed_at DESC LIMIT ?",
+            (ticker, cutoff, PUSH_REPEAT_HISTORY)).fetchall()
+    except Exception:
+        return False
+    tok_new = item.get("_story_tokens") or story_tokens(item.get("title", ""))
+    if not tok_new:
+        return False
+    for (title,) in rows:
+        known = story_tokens(title or "")
+        if known and _jaccard(tok_new, known) >= PUSH_REPEAT_JACCARD:
+            return True
+    return False
 
 
 def get_last_fetched(conn, ticker, source):
@@ -497,27 +818,36 @@ def rescue_orphans(conn, config):
     LATER in the run. A run that dies in between (crash, OOM on the small VM,
     AI outage at the wrong moment) leaves rows with importance IS NULL that
     are ALREADY in the seen ledger - no later run picks them up (is_new()
-    says no) and they silently never reach a digest.
+    says no) and they silently never reach a digest. Items that a busy run
+    deferred at the trim step land in the same state.
 
     This runs BEFORE the fetch loop, so everything it finds was stored by a
     PREVIOUS run. Re-queued items go through the normal pipeline: AI analysis,
     importance floor, AI veto, per-ticker caps - nothing is pushed blindly.
     Rows the previous run deliberately stored-only (importance set, pushed=0)
-    are NOT touched. Bounded by max_items_per_run, newest first, limited to
-    the retention window.
+    are NOT touched.
+
+    Two hard-won details:
+      - the batch is bounded generously (ORPHAN_RESCUE_LIMIT, not
+        max_items_per_run) so a backlog always drains instead of starving
+        behind the newest items;
+      - every attempt increments `rescues` and rows that keep failing are left
+        alone after ORPHAN_MAX_RESCUES, so a permanently unanalyzable row can
+        never loop forever.
     """
     if NO_WRITE or conn is None:
         return []
     cutoff = (datetime.now(EASTERN)
               - timedelta(days=NEWS_RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
-    limit = _cfg_int(config, "max_items_per_run", 40)
+    limit = ORPHAN_RESCUE_LIMIT
     try:
         rows = conn.execute(
             "SELECT ticker, source, item_hash, title_raw, url, snippet, lang, "
             "published_at, first_seen FROM news "
             "WHERE importance IS NULL AND pushed=0 AND first_seen >= ? "
+            "AND COALESCE(rescues, 0) < ? "
             "ORDER BY first_seen DESC LIMIT ?",
-            (cutoff, limit),
+            (cutoff, ORPHAN_MAX_RESCUES, limit),
         ).fetchall()
     except Exception as exc:
         print(f"  [warn] orphan-rescue query failed: {exc}", file=sys.stderr)
@@ -542,6 +872,17 @@ def rescue_orphans(conn, config):
             "snippet": snippet or "",
             "rescued": True,
         })
+    if items and not NO_WRITE:
+        # Count the attempt now: if this run dies again before analysis, the
+        # next run still sees progress instead of retrying the same row forever.
+        try:
+            for it in items:
+                conn.execute("UPDATE news SET rescues = COALESCE(rescues, 0) + 1 "
+                             "WHERE ticker=? AND source=? AND item_hash=?",
+                             (it["ticker"], it["source"], it["_hash"]))
+            conn.commit()
+        except Exception as exc:
+            print(f"  [warn] orphan-rescue bookkeeping failed: {exc}", file=sys.stderr)
     return items
 
 
@@ -578,41 +919,6 @@ def _term_in_text(term, text):
 
 def strip_tags(text):
     return html.unescape(re.sub(r"<[^>]+>", "", text or "")).strip()
-
-
-def _parse_pub(s, naive_tz=EASTERN):
-    """
-    Parse a publish-date string to an aware datetime (Eastern), or None.
-    Handles the formats the sources actually emit:
-      - ISO 8601 with or without fractional seconds, 'Z' or offsets
-        (Tavily: 2026-08-15T10:22:33.123Z)
-      - 'YYYY-MM-DD HH:MM:SS' / 'YYYY-MM-DD' / 'YYYY/MM/DD ...'
-      - RFC 822 / RFC 1123 (Google News RSS: 'Sat, 15 Aug 2026 05:00:00 GMT')
-    Naive dates are assumed to be 'naive_tz' (Eastern by default; Chinese
-    sources pass Asia/Shanghai - see _zh_date_to_et).
-    """
-    if not s:
-        return None
-    s = str(s).strip()
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=naive_tz)
-        return dt.astimezone(EASTERN)
-    except Exception:
-        pass
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S",
-                "%a, %d %b %Y %H:%M:%S %Z", "%a, %d %b %Y %H:%M:%S %z",
-                "%a, %d %b %Y %H:%M:%S", "%Y-%m-%dT%H:%M:%S%z",
-                "%Y-%m-%dT%H:%M:%SZ"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=naive_tz)
-            return dt.astimezone(EASTERN)
-        except Exception:
-            continue
-    return None
 
 
 def _normalize_pub(s, naive_tz=EASTERN):
@@ -652,6 +958,379 @@ def _is_stale_item(item, max_age_hours=MAX_NEWS_AGE_HOURS):
     if dt is None:
         return False
     return dt < datetime.now(EASTERN) - timedelta(hours=hours)
+
+
+def _item_age_hours(item):
+    """Age in hours from the item's publish time to now, or None if undated."""
+    dt = _parse_pub(item.get("published_at") or item.get("date") or "")
+    if dt is None:
+        return None
+    return (datetime.now(EASTERN) - dt).total_seconds() / 3600.0
+
+
+# ---------------------------------------------------------------------------
+# Relevance + duplicate detection (the "why is this in my digest?" layer)
+# ---------------------------------------------------------------------------
+# Titles carry a lot of machine noise that must not count as "content" when
+# comparing two headlines: Google News appends " - Publisher", most items end
+# with the outlet name after a dash/pipe, and HUIZ's own name keeps appearing
+# inside story titles.
+_TITLE_NOISE_RE = re.compile(
+    r"(?i)\b(h1|q[1-4]|fy\s?\d{2}|20\d{2})\b|谷歌新闻|新浪财经|网易订阅|"
+    r"东方财富|腾讯新闻|搜狐|百度|今日头条|- ?[^-]{2,28}$|\| ?[^|]{2,28}$")
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
+    "at", "by", "as", "is", "are", "its", "it", "after", "before", "from",
+    "news", "stock", "stocks", "shares", "says", "said", "new", "will",
+    "co", "ltd", "inc", "corp", "company", "companies", "q2", "q1", "q3",
+    "q4", "results", "report", "reports", "announces", "announced",
+}
+
+
+def _clean_title(title):
+    """Lowercased title with publisher/noise suffixes stripped."""
+    t = strip_tags(str(title or "")).lower()
+    t = re.sub(r"\s+", " ", t)
+    t = _TITLE_NOISE_RE.sub(" ", t)
+    return t.strip(" -|·—–:：,，。.")
+
+
+def story_tokens(title):
+    """
+    Comparable token set for a headline: latin words + CJK bigrams.
+
+    CJK is split into overlapping bigrams because there is no word
+    segmentation here - it makes 保险行业景气度 and 保险行业景气 comparable while
+    keeping unrelated sentences apart. Returns a set (empty when the title is
+    too short to compare safely).
+    """
+    t = _clean_title(title)
+    if not t:
+        return set()
+    tokens = set()
+    for w in re.findall(r"[a-z0-9][a-z0-9.%]*", t):
+        if len(w) >= 3 and w not in _STOPWORDS:
+            tokens.add(w)
+    for run in re.findall(r"[\u4e00-\u9fff]+", t):
+        if len(run) == 1:
+            continue
+        for i in range(len(run) - 1):
+            tokens.add(run[i:i + 2])
+    return tokens
+
+
+def _jaccard(a, b):
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    if not inter:
+        return 0.0
+    return inter / float(len(a | b))
+
+
+def _containment(a, b):
+    """How much of the SMALLER token set appears in the larger one."""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / float(min(len(a), len(b)))
+
+
+def _same_story(a, b):
+    """
+    Are two token sets the same story (a re-report, a syndicated copy, a
+    different outlet's headline for one event)? Containment catches the
+    "same headline, one with extra words" case that Jaccard alone misses.
+    Very short token sets are only trusted when one fully contains the other,
+    so unrelated three-word headlines cannot collapse.
+    """
+    if not a or not b:
+        return False
+    if min(len(a), len(b)) < 3:
+        return _containment(a, b) >= 0.999
+    if _containment(a, b) >= STORY_CONTAINMENT_MIN:
+        return True
+    return _jaccard(a, b) >= STORY_JACCARD_MIN
+
+
+# Which source wins when several outlets carry the same story. The order
+# encodes SIGNAL, not volume: a Chinese-language report, a filing or the
+# company's own site beats a syndication aggregator.
+STORY_SOURCE_RANK = {
+    "SEC": 0, "RSS": 1, "GoogleNewsSite": 2, "GoogleNewsZH": 3,
+    "Eastmoney": 4, "Eastmoney724": 5, "Sina724": 6, "Tavily": 7,
+    "GoogleNews": 8, "Exa": 9, "Baidu": 10,
+}
+
+
+def _story_rank(item):
+    """Lower is better: source signal, then Chinese, then dated, then snippet."""
+    return (
+        STORY_SOURCE_RANK.get(item.get("source", ""), 50),
+        0 if item.get("lang") == "zh" else 1,
+        0 if (item.get("published_at") or item.get("date")) else 1,
+        0 if item.get("snippet") else 1,
+    )
+
+
+def dedupe_same_story(items):
+    """
+    Collapse the SAME story arriving from several sources into one primary
+    item (the per-source hash cannot see across sources, and the AI folding
+    runs too late to stop the digest filling with four copies of one earnings
+    release). Keeps the best-sourced copy per story, marks the rest
+    `_superseded` - they are still analysed and stored for browsing, but they
+    can never occupy a digest seat. Returns (kept, collapsed_count).
+    """
+    clusters = []  # list of {"tokens": set, "members": [items]}
+    for it in items:
+        tok = story_tokens(it.get("title", ""))
+        it["_story_tokens"] = tok
+        placed = False
+        if tok:
+            for cl in clusters:
+                # Only compare within a ticker: the same sector headline under
+                # two tickers is a relevance problem, not a duplicate one.
+                if cl["ticker"] != it.get("ticker"):
+                    continue
+                if _same_story(tok, cl["tokens"]):
+                    cl["members"].append(it)
+                    placed = True
+                    break
+        if not placed:
+            clusters.append({"tokens": tok, "ticker": it.get("ticker"),
+                             "members": [it]})
+    kept, collapsed = [], 0
+    for cl in clusters:
+        primary = min(cl["members"], key=_story_rank)
+        kept.append(primary)
+        for it in cl["members"]:
+            if it is not primary:
+                it["_superseded"] = True
+                collapsed += 1
+    return kept, collapsed
+
+
+def _company_name_tokens(names):
+    """
+    Normalised, abbreviated forms of the company's OWN names used for the
+    relevance check. Alphabet-only suffixes ('Inc', 'Holdings', 'Ltd') are
+    dropped so 'Yuanbao Inc.' matches a title that says 'Yuanbao'; short
+    forms are only used when they are at least 4 characters, so a bare
+    'LU'/'YB' ticker cannot make every article look relevant.
+    """
+    out = set()
+    for nm in names:
+        nm = re.sub(r"\s+", " ", str(nm or "").strip())
+        if not nm:
+            continue
+        out.add(nm.lower())
+        stripped = re.sub(r"(?i)\b(inc|corp|corporation|ltd|limited|holdings?|"
+                          r"group|company|co|technolog(y|ies)|plc|sa|nv)\b\.?", "", nm)
+        stripped = re.sub(r"\s+", " ", stripped).strip(" .,-")
+        if len(stripped) >= 4:
+            out.add(stripped.lower())
+    return out
+
+
+# Latin words that look like a company name inside a longer phrase but are not
+# a company mention on their own.
+_GENERIC_NAME_WORDS = {
+    "china", "chinese", "automotive", "insurance", "holdings", "holding",
+    "technology", "technologies", "financial", "finance", "systems", "group",
+    "global", "digital", "online", "national", "international", "bank",
+    "capital", "consumer", "credit", "loan", "loans", "technology",
+}
+
+
+def mentions_company(hay, names):
+    """
+    Does this text actually mention the company (by its own name/aliases)?
+
+    This is the gate that keeps sector news with no connection to the stock
+    out of the per-ticker digest - the 'El Niño is redrawing the insurance
+    industry's risk map' class of item. Terms are matched with _term_in_text,
+    which rejects coincidental CJK substrings, and short Latin names are only
+    accepted when they appear as a whole word in a meaningful phrase.
+    """
+    if not hay:
+        return False
+    for name in _company_name_tokens(names):
+        if is_chinese(name):
+            if _term_in_text(name, hay):
+                return True
+            continue
+        if len(name) < 4:
+            continue
+        if name in _GENERIC_NAME_WORDS:
+            continue
+        if re.search(r"(?<![a-z0-9])" + re.escape(name) + r"(?![a-z0-9])", hay):
+            return True
+    return False
+
+
+# Sector vocabularies for the optional sector_watch tier. Deliberately
+# NARROW multi-character phrases: a bare 保险 or 汽车 would match half of
+# everything and re-create the noise this tier exists to contain.
+SECTOR_VOCAB = (
+    (("保险", "insur"), ["保险业", "险企", "保险法", "保险中介", "偿付能力",
+                         "insurance industry", "insurers", "insurer",
+                         "insurance regulator"]),
+    (("汽车", "automotive", "auto"), ["汽车行业", "车企", "整车", "零部件",
+                                       "automakers", "auto parts",
+                                       "automotive industry"]),
+    (("助贷", "信贷", "消费金融", "lending", "fintech"),
+     ["助贷", "消费金融", "互联网贷款", "小额贷款", "贷款余额",
+      "loan facilitation", "consumer lending", "assisted loans"]),
+    (("房地产", "property", "real estate"), ["房地产", "房企", "地产"]),
+)
+
+
+def sector_tokens_for(meta):
+    """Sector phrases that apply to this company (see SECTOR_VOCAB)."""
+    names = [str(meta.get("name_zh") or ""), str(meta.get("name_en") or "")]
+    names += [str(x) for x in (meta.get("aliases_zh") or [])]
+    names += [str(x) for x in (meta.get("subsidiaries_zh") or [])]
+    names += [str(x) for x in (meta.get("subsidiaries_other") or [])]
+    names += [str(x) for x in (meta.get("keywords") or [])]
+    hay = " ".join(names).lower()
+    out = []
+    for triggers, tokens in SECTOR_VOCAB:
+        if any(t.lower() in hay for t in triggers):
+            for tok in tokens:
+                if tok not in out:
+                    out.append(tok)
+    return out[:6]
+
+
+def resolve_relevance(meta):
+    """
+    Build the relevance context for one ticker:
+      names    - the company's own names/aliases, the only ones that count as
+                 a real mention (subsidiaries are NOT company names)
+      domains  - its discovered websites
+      strict   - True when a source query contains ONLY company-specific names
+      strong   - True when the source is a company-lookup source at all
+      sector_tokens - narrow sector phrases for the sector_watch tier
+    """
+    names = [str(meta.get("name_zh") or ""), str(meta.get("name_en") or "")]
+    names += [str(x) for x in (meta.get("aliases_zh") or [])]
+    names = [n.strip() for n in names if n and n.strip()]
+    return {
+        "names": names,
+        # Subsidiary/brand names (分期乐, Fenqile, 奇富借条, 360数科...). News
+        # about a subsidiary IS news about the stock, so these count as a
+        # genuine mention too - they just cannot be the ONLY thing a query is
+        # built from.
+        "subsidiary_names": [
+            str(x).strip() for x in ((meta.get("subsidiaries_zh") or [])
+                                     + (meta.get("subsidiaries_other") or []))
+            if x and str(x).strip()],
+        "domains": build_site_domains(meta),
+        "ticker": str(meta.get("ticker") or ""),
+        "sector_tokens": sector_tokens_for(meta),
+        "strict": False,
+        "strong": bool(names),
+    }
+
+
+def passes_relevance(item, meta, resolved):
+    """
+    How relevant is this item to the company? Returns:
+
+      'company'   - the text mentions the company's own names/aliases, its
+                    ticker as a whole word, or one of its domains. Always kept.
+      'sector'    - a SECTOR story (the company's business area, no mention of
+                    the company). Kept only when the caller enables the
+                    separately-capped sector_watch tier, or when the query
+                    itself was company-specific; otherwise dropped. This is
+                    the 'El Niño is redrawing the insurance industry's risk
+                    map' class of item.
+      'unrelated' - nothing to do with the company or its sector. Dropped, and
+                    never sent to the AI.
+    """
+    hay = " ".join(str(item.get(k) or "") for k in ("title", "snippet")).lower()
+    if mentions_company(hay, resolved["names"]):
+        return "company"
+    # A subsidiary/brand mention (分期乐, Fenqile, 奇富借条) is a real company
+    # mention: the news is about the stock's own business, not its sector.
+    if mentions_company(hay, resolved.get("subsidiary_names") or []):
+        return "company"
+    ticker = str(item.get("ticker") or "").lower()
+    if ticker and re.search(r"(?<![a-z0-9])" + re.escape(ticker) + r"(?![a-z0-9])", hay):
+        return "company"
+    for domain in resolved["domains"]:
+        if domain and domain in hay:
+            return "company"
+    # Not about the company by name. Sector vocabularies are deliberately
+    # narrow: broad words like 金融/监管 alone would match almost everything.
+    if resolved["sector_tokens"] and any(t in hay for t in resolved["sector_tokens"]):
+        return "sector"
+    if resolved["strict"] and resolved["strong"]:
+        # The query itself was company-specific, so a result from it is at
+        # least on the company's sector. Flag it as sector, never as company.
+        return "sector"
+    return "unrelated"
+
+
+def ingest_items(conn, all_new, source, items, ticker, since_dt, max_age_hours,
+                 relevance_resolved=None, sector_watch=False, sector_items=None,
+                 run_start=None, report=None):
+    """
+    Fold one source's raw results into the DB / all_new for a ticker.
+
+    Every source goes through the SAME gate order:
+      1. delta filter (pub_dt < since_dt -> too old for this source)
+      2. story_tokens computed once, reused by relevance, dedup and the
+         repeat gate downstream
+      3. hard freshness backstop (MAX_NEWS_AGE_HOURS)
+      4. RELEVANCE: does it mention the company, or is it merely its sector?
+      5. exact per-source dedup (the source+url hash in `seen`)
+    Returns the number of items accepted into `all_new`. `report` collects drop
+    counts for the run log so it is visible WHY items disappear.
+    """
+    accepted = 0
+    rep = report if report is not None else {}
+
+    def bump(key):
+        rep[key] = rep.get(key, 0) + 1
+
+    for item in items:
+        item["ticker"] = ticker
+        pub_dt = _parse_pub(item.get("date", ""))
+        if since_dt is not None and pub_dt and pub_dt < since_dt:
+            bump("older_than_delta")
+            continue
+        if not item.get("_story_tokens"):
+            item["_story_tokens"] = story_tokens(item.get("title", ""))
+        if _is_stale_item(item, max_age_hours):
+            bump("stale")
+            continue
+        if relevance_resolved is not None:
+            verdict = passes_relevance(item, None, relevance_resolved)
+            if verdict == "unrelated":
+                bump("unrelated")
+                continue
+            if verdict == "sector":
+                if not sector_watch:
+                    bump("sector_off")
+                    continue
+                item["_sector"] = True
+        item["published_at"] = _normalize_pub(item.get("date", ""))
+        if run_start:
+            item["first_seen"] = run_start
+        if not is_new(conn, ticker, item["source"], item["id"], item["title"]):
+            bump("already_seen")
+            continue
+        mark_seen(conn, ticker, item["source"], item["id"], item["title"],
+                  item.get("url", ""))
+        insert_news(conn, item)
+        if sector_items is not None and item.get("_sector"):
+            sector_items.append(item)
+            bump("sector_kept")
+        else:
+            all_new.append(item)
+            accepted += 1
+    return accepted
 
 
 # ---------------------------------------------------------------------------
@@ -1520,6 +2199,11 @@ MACRO_KEYWORDS = [
     # Monetary policy
     r"降息", r"加息", r"降准", r"LPR", r"贷款市场报价利率", r"中期借贷便利|MLF",
     r"逆回购", r"存款准备金", r"货币政策", r"利率下调|下调利率|降低利率",
+    # China-policy anchors. These are what let a China headline read as macro:
+    # the gate needs a strong anchor or TWO distinct hits (see is_macro), so a
+    # US Fed headline that merely contains 加息 no longer qualifies.
+    r"央行", r"利率体系", r"六大行|国有大行", r"公开市场操作",
+    r"财政部", r"证监会", r"国家发改委|发改委", r"中国人民银行",
     # Fiscal / stimulus
     r"刺激(经济|消费|内需|市场)", r"万亿", r"特别国债", r"专项债",
     r"财政(刺激|政策)", r"扩大内需", r"消费券", r"国常会", r"政治局会议",
@@ -1824,7 +2508,8 @@ def _parse_json_array(content):
 # ---------------------------------------------------------------------------
 # AI analysis: one batched call per ticker (translate + summarize + score)
 # ---------------------------------------------------------------------------
-def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None):
+def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
+               prompt_mode=None, prompt_extra=""):
     """
     For each ticker, ONE batched AI call that:
       - translates titles to English,
@@ -1896,39 +2581,83 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None):
         # Folded semantic dedup: show what has already been seen for this
         # ticker so the model can flag recycled/same-event stories
         # (known_event) - this replaces the old separate dedup AI call.
-        # The batch's own titles are excluded: items are marked seen at fetch
-        # time, so a rescued orphan (or any current item) must not be flagged
-        # known_event against itself.
-        history = (get_recent_seen_titles(
-                       conn, ticker, before=run_start,
-                       exclude={it.get("title", "") for it in ticker_items})
+        #
+        # The two blocks are labelled differently on purpose. "ALREADY SEEN
+        # BEFORE THIS RUN" is the ledger up to run_start (so an item is never
+        # compared against itself), while the ITEMS block is the current batch,
+        # which the prompt tells the model to compare against ITSELF - that is
+        # how cross-source copies of one event (different outlet, different
+        # URL) get collapsed instead of filling the digest with duplicates.
+        history = (get_recent_seen_titles(conn, ticker, before=run_start)
                    if conn else [])
         hist_lines = [f"- {t}" for t in history]
-        if ticker == "MACRO":
-            # China macro: framed around impact on the user's fintech names.
+        mode = prompt_mode or ("macro" if ticker == "MACRO"
+                               else "global" if ticker == "GLOBAL"
+                               else "sector" if ticker.endswith("~SECTOR")
+                               else "ticker")
+        if mode in ("macro", "global"):
+            # Macro tiers: framed around impact on the user's fintech names.
+            analyst = ("You are a China macro analyst. Below are major China "
+                       "policy / market news items found today (already gated "
+                       "as macro-relevant).\n"
+                       if mode == "macro" else
+                       "You are a global-markets analyst. Below are US/global "
+                       "market news items that could move Chinese ADRs.\n")
+            impact_scope = (
+                "what this means for US-listed Chinese fintech/consumer-lending "
+                "companies like 奇富科技 QFIN, 乐信 LX, 陆金所 LU - e.g. 'cheaper "
+                "funding for 分期乐's lending' or 'tighter assisted-loan rules "
+                "pressure origination volume'; empty string if not applicable"
+                if mode == "macro" else
+                "what this means for US-listed Chinese ADRs, especially "
+                "consumer-lending fintechs (奇富科技 QFIN, 乐信 LX, 陆金所 LU); "
+                "empty string if not applicable")
             prompt = (
-                "You are a China macro analyst. Below are major China policy / "
-                "market news items found today (already gated as macro-relevant).\n"
-                "For EACH item return one JSON object with keys:\n"
+                analyst
+                + prompt_extra
+                + "For EACH item return one JSON object with keys:\n"
                 "  number, title_en (concise English translation), summary (one "
                 "English sentence), category (one of monetary, fiscal, "
                 "regulatory, fintech_reg, market, geopolitical, other), "
-                "importance (integer 1-10: 8-10 = will move Chinese stocks or "
-                "directly affects consumer-lending fintechs like QFIN/LX/LU; "
-                "6-7 = significant market news; <6 = minor), sentiment "
+                "importance (integer 1-10), sentiment "
                 "(positive/negative/neutral), push (true if the user must know "
                 "about it NOW), duplicate_of (number of an earlier item that is "
                 "the same event, else null), known_event (true if same as an "
                 "ALREADY SEEN headline), reason (one short English sentence why "
-                "it matters), impact (one short English sentence: what this "
-                "means for US-listed Chinese fintech/consumer-lending companies "
-                "like 奇富科技 QFIN, 乐信 LX, 陆金所 LU - e.g. 'cheaper funding "
-                "for 分期乐's lending' or 'tighter assisted-loan rules pressure "
-                "origination volume'; empty string if not applicable).\n"
+                "it matters), impact (one short English sentence: "
+                + impact_scope + ").\n"
                 "Return ONLY a JSON array of these objects, same order as the items.\n\n"
-                "ALREADY SEEN (last few weeks):\n"
+                "ALREADY SEEN BEFORE THIS RUN:\n"
                 + ("\n".join(hist_lines) if hist_lines else "(none)")
-                + "\n\nITEMS:\n" + json.dumps(lines, ensure_ascii=False)
+                + "\n\nITEMS (all from THIS run - compare THESE against each other):\n"
+                + json.dumps(lines, ensure_ascii=False)
+            )
+        elif mode == "sector":
+            # Sector tier: industry news that never mentions the company. The
+            # prompt is explicit that this is CONTEXT, not a company event.
+            prompt = (
+            f"The items below are INDUSTRY/sector news relevant to the business "
+            f"area of the stock {ticker}"
+            f"{(' (' + name_zh + ')') if name_zh and name_zh != ticker else ''}. "
+            f"They do NOT mention the company itself - they are context.\n"
+            + prompt_extra +
+            "For EACH item return one JSON object with keys:\n"
+            "  number, title_en (concise English translation), summary (one "
+            "English sentence), category (one of regulatory, market, "
+            "press_release, other), importance (integer 1-10), sentiment "
+            "(positive/negative/neutral), push (true only if this sector "
+            "development is material for the company's business), "
+            "duplicate_of (number of an earlier item that is the same event, "
+            "else null), known_event (true if same as an ALREADY SEEN headline), "
+            f"reason (one short English sentence why the sector context matters "
+            f"for {ticker}), impact (one short English sentence: what this "
+            f"means for {ticker}'s business or stock; empty string if not "
+            "applicable).\n"
+            "Return ONLY a JSON array of these objects, same order as the items.\n\n"
+            "ALREADY SEEN BEFORE THIS RUN:\n"
+            + ("\n".join(hist_lines) if hist_lines else "(none)")
+            + "\n\nITEMS (all from THIS run - compare THESE against each other):\n"
+            + json.dumps(lines, ensure_ascii=False)
             )
         else:
             prompt = (
@@ -1938,12 +2667,23 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None):
             f"Chinese-language news about this company or its subsidiaries "
             f"(e.g. {subs}) is especially valuable - weigh it heavily; it often "
             f"contains information English media misses.\n"
-            "Below are NEW items found today. Each has a number, source, "
+            + prompt_extra
+            + "Below are NEW items found today. Each has a number, source, "
             "language, title, publish date, and a short snippet.\n"
             "FRESHNESS RULE: if an item's 'published' date is days or more in "
             "the past relative to today, it is a recycled OLD story, not "
             "breaking news - set known_event=true and push=false for it "
             "unless something genuinely new happened.\n"
+            "SAME STORY RULE: the items below come from MANY outlets, so "
+            "several of them are usually the SAME story reported by different "
+            "sources (e.g. one earnings release covered by four outlets). "
+            "Exactly ONE item per story may be pushed. Pick the single best "
+            "one (prefer the Chinese-language original or the most specific "
+            "report) and mark every other copy duplicate_of that item's "
+            "number. Two items are the same story when they describe the same "
+            "event - even if the wording, the outlet and the URL differ. An "
+            "item that is merely about the same INDUSTRY or the same broad "
+            "topic is NOT a duplicate; it is a separate story.\n"
             "For EACH item return one JSON object with keys:\n"
             "  number (the item's number), title_en (concise English "
             "translation; keep as-is if already English), summary (one English "
@@ -1968,9 +2708,11 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None):
             "quarter's loan volume'; empty string '' if routine or not "
             "applicable).\n"
             "Return ONLY a JSON array of these objects, same order as the items.\n\n"
-            "ALREADY SEEN (last few weeks):\n"
+            "ALREADY SEEN BEFORE THIS RUN (do NOT use these to compare the "
+            "items below against each other):\n"
             + ("\n".join(hist_lines) if hist_lines else "(none)")
-            + "\n\nITEMS:\n" + json.dumps(lines, ensure_ascii=False)
+            + "\n\nITEMS (all from THIS run - compare THESE against each other):\n"
+            + json.dumps(lines, ensure_ascii=False)
         )
         print(f"  AI analysis {ticker}: {len(ticker_items)} item(s), one batched call...")
         content = _chat(base, model, key,
@@ -2035,40 +2777,260 @@ def get_recent_seen_titles(conn, ticker, limit=SEMANTIC_DEDUP_HISTORY, before=No
     without a separate AI call.
 
     'before' excludes the current run's items (marked 'seen' during the fetch
-    loop) so two distinct new events in the same batch are never deduped
-    against each other before either is pushed.
+    loop) so the "already reported BEFORE this run" block is unambiguous.
 
     'exclude' drops specific titles from the history - used by ai_analyze to
-    remove the CURRENT BATCH's own titles, which are already in the ledger
-    (items are marked seen at fetch time). Without this, a rescued orphan
-    could be flagged known_event against ITS OWN earlier title and never
-    pushed.
+    remove the CURRENT BATCH's own titles from the "already reported" block.
+    Cross-source copies of one event arrive as separate numbered items, so the
+    prompt lists the current batch explicitly instead - that is what lets the
+    model recognise item 5 as the same story as item 1 without ever comparing
+    an item against itself.
     """
     if before:
         cur = conn.execute(
-            "SELECT title FROM seen WHERE ticker=? AND first_seen < ? "
+            "SELECT title, first_seen FROM seen WHERE ticker=? AND first_seen < ? "
             "ORDER BY first_seen DESC LIMIT ?",
             (ticker, before, limit),
         )
     else:
         cur = conn.execute(
-            "SELECT title FROM seen WHERE ticker=? "
+            "SELECT title, first_seen FROM seen WHERE ticker=? "
             "ORDER BY first_seen DESC LIMIT ?",
             (ticker, limit),
         )
+    rows = cur.fetchall()
     if exclude:
         ex = set(exclude)
-        return [r[0] for r in cur.fetchall() if r[0] and r[0] not in ex]
-    return [r[0] for r in cur.fetchall() if r[0]]
+        return [f"{r[0]}  [first seen {str(r[1])[:10]}]"
+                for r in rows if r[0] and r[0] not in ex]
+    return [f"{r[0]}  [first seen {str(r[1])[:10]}]" for r in rows if r[0]]
+
+
+# Global-markets patterns: genuinely systemic US/global news that moves
+# Chinese ADRs. Kept SEPARATE from the China-macro tier (below) so a Fed
+# headline no longer arrives labelled as "China macro".
+GLOBAL_MARKET_PATTERNS = [
+    r"美联储", r"鲍威尔", r"沃勒", r"FOMC", r"非农", r"美国CPI|CPI数据",
+    r"ADP数据|ADP就业", r"联邦基金利率", r"点阵图", r"美国通胀|美国PPI",
+    r"美国国债收益率|美债收益率", r"华尔街|标普500|纳斯达克指数|道琼斯",
+    r"美股", r"美元指数", r"人民币汇率|离岸人民币",
+    # Non-China central banks / economies: a foreign rate decision is global
+    # markets news, NOT China macro, even though the headline says 加息.
+    r"欧洲央行|欧央行|ECB", r"日本央行|日银", r"英国央行|英格兰银行",
+    r"韩国央行|澳洲联储|加拿大央行|瑞士央行",
+]
+# The subset of those patterns that unambiguously identifies a FOREIGN subject:
+# a foreign central bank or a US-economy datapoint. An item matching one of
+# these never counts as China macro unless it ALSO carries a strong China
+# anchor (see is_macro). Generic market words (美股/美债/华尔街) are NOT here:
+# they are useful for labelling the global tier but too weak to overrule a
+# China headline.
+FOREIGN_CENTRAL_BANK_PATTERNS = [
+    r"美联储", r"鲍威尔", r"沃勒", r"FOMC", r"欧央行", r"欧洲央行", r"ECB",
+    r"日本央行", r"日银", r"英国央行", r"英格兰银行", r"韩国央行",
+    r"澳洲联储", r"加拿大央行", r"瑞士央行", r"美国非农", r"美国CPI",
+]
+# US / foreign sovereign and market subjects: an item about these that carries
+# no China anchor is GLOBAL MARKETS news, not China macro. This is what keeps
+# "美国财政部8周期国库券中标利率" and "华尔街警告美国AI债务扩张" out of the
+# China section.
+FOREIGN_SUBJECT_PATTERNS = FOREIGN_CENTRAL_BANK_PATTERNS + [
+    r"美国财政部", r"美国国债", r"美债", r"华尔街", r"标普500",
+    r"纳斯达克", r"道琼斯", r"美股",
+]
+# Strong, specific CHINA-policy anchors. One of these is enough to make a
+# headline count as China macro on its own.
+#
+# NOTE: generic rate-move vocabulary (降息/加息/降准/逆回购/非农/关税) is
+# deliberately NOT here. "ECB hikes 25bp" also matches 加息 and 逆回购-like
+# wording, so treating those as anchors put a European Central Bank decision in
+# the CHINA MACRO section. Generic monetary words only count as one half of the
+# two-distinct-hits test; these anchors are the China-specific policies.
+STRONG_MACRO_PATTERNS = [
+    r"LPR", r"贷款市场报价利率", r"MLF", r"存款准备金",
+    r"特别国债", r"专项债", r"国常会", r"政治局",
+    r"中央经济工作会议", r"中央金融工作会议",
+    r"助贷", r"网络小贷", r"网络小额贷款", r"互联网小额贷款",
+    r"消费金融", r"金融监管总局", r"银保监会", r"国家金融监督管理总局",
+    r"互联网金融", r"互联网贷款", r"小额贷款", r"现金贷",
+    r"中概股", r"中国金龙", r"退市新规", r"实体清单", r"出口管制",
+    r"财政部", r"证监会", r"国家发改委",
+]
+
+
+# China-side monetary anchors. A story carrying one of these is a China story
+# even when it also mentions the Fed/ECB ("中国央行下调LPR 应对美联储加息").
+#
+# NOTE: a bare 央行 is deliberately NOT an anchor - it is a substring of
+# 欧洲央行 / 英国央行 / 日本央行, so including it made ECB and BoE headlines look
+# like China stories. Foreign bank names (美联储/欧洲央行/...) are likewise never
+# anchors.
+CHINA_ANCHOR_PATTERNS = [
+    r"中国央行", r"中国人民银行", r"人民银行", r"降息", r"降准", r"LPR",
+    r"贷款市场报价利率", r"MLF", r"逆回购", r"存款准备金",
+    # A China index is a China story even though its name contains 纳斯达克.
+    r"中国金龙", r"中概股",
+]
+
+
+def is_foreign_central_bank(text):
+    """True when the text is about a NON-China central bank / economy."""
+    return has_foreign_subject(text)
+
+
+def has_foreign_subject(text):
+    """True when the text's subject is foreign (a non-China central bank, the
+    US Treasury, US equities...). See FOREIGN_SUBJECT_PATTERNS."""
+    if not text:
+        return False
+    return any(re.search(p, text) for p in FOREIGN_SUBJECT_PATTERNS)
+
+
+def _foreign_subject_only(text):
+    """
+    The item's subject is foreign AND it carries no China anchor.
+
+    This is the single rule that keeps the two macro tiers mutually exclusive:
+    "ECB hikes 25bp" and "美国财政部回购国债" are global, while
+    "中国央行下调LPR 应对美联储加息" is China macro (it has a China anchor).
+    """
+    if not text or not has_foreign_subject(text):
+        return False
+    return not any(re.search(p, text) for p in CHINA_ANCHOR_PATTERNS)
+
+
+def macro_score(text, extra=None):
+    """(number of distinct China-macro patterns matched, pattern list)."""
+    if not text:
+        return 0, []
+    pats = MACRO_KEYWORDS + [str(p) for p in (extra or []) if str(p).strip()]
+    hits = [p for p in pats if re.search(p, text)]
+    return len(hits), hits
 
 
 def is_macro(text, extra=None):
-    """Free regex gate: does this item look like BIG China macro news?
-    'extra' = user-supplied additional keywords from config (macro_keywords)."""
+    """
+    Free regex gate: does this item look like BIG China macro news?
+
+    A single generic hit is not enough. '加息' or '关税' alone used to qualify
+    US Fed and tariff headlines as China macro, which is how the CHINA MACRO
+    section ended up carrying US non-farm payrolls, Fed commentary and even an
+    ECB rate decision. So:
+      - a foreign central bank / US economy reference alone never qualifies;
+      - one hit only counts when it is a strong, specific China-policy pattern;
+      - two distinct hits always count (a China story mentioning the Fed too
+        still qualifies).
+    """
     if not text:
         return False
-    pats = MACRO_KEYWORDS + [str(p) for p in (extra or []) if str(p).strip()]
-    return any(re.search(p, text) for p in pats)
+    # A PURE foreign central bank / US-economy reference is never China macro,
+    # however many generic 加息/逆回购-style words the headline also carries
+    # ("ECB hikes 25bp, Lagarde flags sticky inflation"). A China anchor wins:
+    # "中国央行下调LPR 应对美联储加息" is a China story.
+    if _foreign_subject_only(text):
+        return False
+    hits, matched = macro_score(text, extra)
+    if hits >= 2:
+        return True
+    if any(re.search(p, text) for p in STRONG_MACRO_PATTERNS):
+        return True
+    for p in matched:
+        if any(re.search(p, str(x)) for x in (extra or [])):
+            return True
+    return False
+
+
+def is_global_markets(text):
+    """Free regex gate for the global-markets tier (see GLOBAL_MARKET_PATTERNS)."""
+    if not text:
+        return False
+    return any(re.search(p, text) for p in GLOBAL_MARKET_PATTERNS)
+
+
+def news_tier(text):
+    """
+    Route one headline to its tier: 'macro', 'global' or 'ticker'.
+
+    Order matters and is deliberately simple:
+      1. a foreign central bank / US-economy reference WITHOUT a China anchor
+         -> 'global' (an ECB or Fed headline that also contains 加息);
+      2. a strong China-policy anchor -> 'macro';
+      3. a China monetary anchor (央行/降息/LPR/逆回购...) -> 'macro';
+      4. otherwise anything matching the global vocabulary -> 'global'.
+    """
+    if not text:
+        return "ticker"
+    if _foreign_subject_only(text):
+        return "global"
+    if any(re.search(p, text) for p in STRONG_MACRO_PATTERNS):
+        return "macro"
+    if is_macro(text):
+        return "macro"
+    if is_global_markets(text):
+        return "global"
+    return "ticker"
+
+
+def tag_global_markets(items):
+    """Label each item's news tier ('macro' / 'global' / 'ticker')."""
+    for it in items:
+        it["_tier"] = news_tier(f"{it.get('title', '')} {it.get('snippet', '')}")
+    return items
+
+
+def format_global_markets(items):
+    """
+    The 🌍 GLOBAL MARKETS section: systemic US/global items that move Chinese
+    ADRs (Fed decisions, payrolls, CPI). Capped hard and OFF by default - a
+    daily index-close recap is not actionable, but a Fed pivot is.
+    """
+    if not items:
+        return None
+    lines = ["🌍 GLOBAL MARKETS — systemic US/global items", ""]
+    for it in items:
+        title = it.get("title_en") or it.get("title", "")
+        pub = (it.get("published_at") or _normalize_pub(it.get("date", "")) or "")
+        lines.append(f"• {title}" + (f" 📅{pub[:10]}" if pub else ""))
+        if it.get("impact"):
+            lines.append(f"    → {it['impact']}")
+        if it.get("url"):
+            lines.append(f"    {it['url']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def format_sector_watch(items):
+    """
+    The 🏭 SECTOR section - optional (config sector_watch). Sector news that
+    does NOT mention the company is only useful when it is explicitly labelled
+    as sector context, so it is never mixed into the stock's own items.
+    """
+    if not items:
+        return None
+    lines = ["🏭 SECTOR CONTEXT — industry news, not company-specific", ""]
+    for it in items:
+        title = it.get("title_en") or it.get("title", "")
+        ticker = it.get("ticker", "")
+        pub = (it.get("published_at") or _normalize_pub(it.get("date", "")) or "")
+        lines.append(f"• [{ticker}] {title}" + (f" 📅{pub[:10]}" if pub else ""))
+        if it.get("summary"):
+            lines.append(f"    {it['summary']}")
+        if it.get("impact"):
+            lines.append(f"    → {it['impact']}")
+        if it.get("url"):
+            lines.append(f"    {it['url']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def select_global_markets(items, config):
+    """Top-N global-markets items by importance (default cap 2)."""
+    cap = max(1, _cfg_int(config, "global_markets_max_per_run",
+                          GLOBAL_MARKETS_MAX_PER_RUN))
+    ranked = sorted([it for it in items if not it.get("is_dup")
+                     and not it.get("is_known") and it.get("push", True)],
+                    key=lambda it: it.get("importance") or 0, reverse=True)
+    return ranked[:cap]
 
 
 def collect_macro_items(conn, config, secrets, wire_cache, src_on,
@@ -2149,7 +3111,7 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
     return new_items
 
 
-def analyze_macro(macro_items, config, secrets, conn, run_start):
+def analyze_macro(macro_items, config, secrets, conn, run_start, pseudo="MACRO"):
     """
     ONE tiny batched AI call for the macro items (translate + score + impact
     on the user's fintech names) - typically 0-3 items, so a few hundred
@@ -2159,30 +3121,56 @@ def analyze_macro(macro_items, config, secrets, conn, run_start):
     if not macro_items:
         return []
     key = secrets.get("ai_api_key", "")
+    # The global-markets tier gets its own ⭐ scale: a systemic Fed/macro item
+    # (8-10) versus an ordinary US session recap (2-4), so the cap keeps the
+    # right ones.
+    if pseudo == "GLOBAL":
+        extra = (
+            "IMPORTANCE SCALE (this is the GLOBAL MARKETS tier): 8-10 = a "
+            "systemic event that reprices global risk and Chinese ADRs "
+            "(a Fed rate decision/pivot, an inflation or payrolls surprise, a "
+            "major tariff or sanctions action); 5-7 = notable macro data or "
+            "index moves; 2-4 = a routine daily session recap (index closed "
+            "down 0.3%, premarket futures fell). Score routine recaps LOW and "
+            "set push=false for them - the user does not need a daily index "
+            "recap.\n")
+    else:
+        extra = ""
     if config.get("macro_translate", True) and key:
-        meta = {"MACRO": {"name_zh": "中国宏观", "name_en": "China Macro",
-                          "subsidiaries_zh": [], "subsidiaries_other": []}}
+        meta = {pseudo: {"name_zh": "中国宏观", "name_en": "China Macro",
+                         "subsidiaries_zh": [], "subsidiaries_other": []}}
+        if pseudo == "GLOBAL":
+            meta = {pseudo: {"name_zh": "全球宏观", "name_en": "Global Markets",
+                             "subsidiaries_zh": [], "subsidiaries_other": []}}
         analyzed = ai_analyze(macro_items, config, secrets, meta,
-                              conn=conn, run_start=run_start)
+                              conn=conn, run_start=run_start, prompt_extra=extra)
         for it in analyzed:
             update_news_ai(conn, it)
+        cap = _cfg_int(config, "macro_max_per_run", 3) if pseudo == "MACRO" \
+            else _cfg_int(config, "global_markets_max_per_run", GLOBAL_MARKETS_MAX_PER_RUN)
         ranked = sorted(
             [it for it in analyzed
              if not it.get("is_dup") and not it.get("is_known") and it.get("push", True)],
             key=lambda it: it.get("importance") or 0, reverse=True)
-        return ranked[:_cfg_int(config, "macro_max_per_run", 3)]
+        # The global tier additionally requires a real score: a recap the model
+        # scored 3 must not occupy a seat.
+        if pseudo == "GLOBAL":
+            ranked = [it for it in ranked if (it.get("importance") or 0) >= 5]
+        return ranked[:cap]
     # Zero-AI fallback: raw Chinese + English tag, always pushed (capped).
     for it in macro_items:
         it["title_en"] = it.get("title", "")
         it["impact"] = ""
-        it["importance"] = 8
+        it["importance"] = 8 if pseudo == "MACRO" else 5
         it["push"] = True
-    return macro_items[:_cfg_int(config, "macro_max_per_run", 3)]
+    cap = _cfg_int(config, "macro_max_per_run", 3) if pseudo == "MACRO" \
+        else _cfg_int(config, "global_markets_max_per_run", GLOBAL_MARKETS_MAX_PER_RUN)
+    return macro_items[:cap]
 
 
 def format_macro(items):
-    """The 'China Macro' digest section - big policy/market news, shown at the
-    top of the digest, tagged with an English label."""
+    """The 'China Macro' digest section - big China policy/market news, shown
+    at the top of the digest, tagged with an English label."""
     if not items:
         return None
     lines = ["📢 CHINA MACRO — big policy/market news", ""]
@@ -2198,6 +3186,45 @@ def format_macro(items):
             lines.append(f"    {it['url']}")
         lines.append("")
     return "\n".join(lines)
+
+
+def collect_sector_watch(sector_report, conn, config, secrets, run_start):
+    """
+    Optional 🏭 SECTOR tier (config sector_watch, default OFF).
+
+    Items that are about the company's INDUSTRY but never mention the company
+    are stored as `_sector` during ingestion. When the tier is enabled they get
+    one small batched AI call per ticker and the best few (capped globally) are
+    shown in a separate, clearly-labelled section - so sector context is
+    available without polluting the per-stock items.
+    """
+    if not config.get("sector_watch", SECTOR_WATCH_DEFAULT):
+        return []
+    pool = []
+    for ticker, items in (sector_report or {}).items():
+        if not items:
+            continue
+        reviewed = ai_analyze(items, config, secrets, {ticker: {}}, conn=conn,
+                              run_start=run_start,
+                              prompt_extra=("IMPORTANCE SCALE (this is the "
+                                            "SECTOR tier): 8-10 = a sector-wide "
+                                            "change that directly alters this "
+                                            "company's market (new regulation, "
+                                            "a big industry shock); 5-7 = "
+                                            "meaningful industry development; "
+                                            "2-4 = generic industry commentary. "
+                                            "Score generic commentary LOW and "
+                                            "set push=false for it.\n"))
+        for it in reviewed:
+            update_news_ai(conn, it)
+            if it.get("push", True) and (it.get("importance") or 0) >= 5 \
+                    and not it.get("is_dup") and not it.get("is_known"):
+                it["_sector"] = True
+                pool.append(it)
+    pool.sort(key=lambda it: it.get("importance") or 0, reverse=True)
+    cap = max(1, _cfg_int(config, "sector_watch_max_per_run",
+                          SECTOR_WATCH_MAX_PER_RUN))
+    return pool[:cap]
 
 
 def build_snapshot(conn, hours=24, limit=10):
@@ -2282,10 +3309,13 @@ def send_telegram(token, chat_id, message):
     return ok
 
 
-def format_digest(filtered, ticker_count, stored_count=0):
+def format_digest(filtered, ticker_count, stored_count=0, run_label=None):
     if not filtered:
         return None
-    lines = [f"📰 Portfolio News Digest ({ticker_count} ticker(s))", ""]
+    # Name the run so it is obvious WHICH digest this is: the 09:15 ET read
+    # (pre-open) or the 17:00 ET read (one hour after the close).
+    suffix = f" · {run_label}" if run_label and run_label != "manual" else ""
+    lines = [f"📰 Portfolio News Digest ({ticker_count} ticker(s)){suffix}", ""]
     for item in filtered:
         ticker = item.get("ticker", "")
         title = item.get("title_en") or item.get("title", "")
@@ -2317,42 +3347,83 @@ def format_digest(filtered, ticker_count, stored_count=0):
     return "\n".join(lines)
 
 
-def select_push_items(enriched, config):
+def select_push_items(enriched, config, conn=None, now=None):
     """
     Decide which enriched items go to the Telegram digest.
-      - drop same-batch duplicates (is_dup) - stored, not pushed
-      - regulatory force-push: headlines matching penalty/regulatory keywords
-        get boosted to >= 8 so they are never buried by generic scoring
-      - importance floor (push_min_importance, default 4) + AI push veto
-      - rank by importance (Chinese-language items tie-break higher)
-      - per-ticker cap (push_max_per_ticker, default 3): one ticker can't eat
-        every slot while another name has news, but the cap relaxes when it's
-        the only name with candidates (solo big-news day still delivers).
+
+    Gates, in order:
+      1. drop same-batch duplicates (is_dup) and recycled events (is_known),
+         and anything collapsed as a same-story copy from another source
+         (`_superseded`) - all still stored for browsing;
+      2. AGE GATE - an item published longer ago than push_max_age_hours is
+         never pushed, whatever the AI scored it. This is the code-level
+         version of "you already read this" (earnings results re-reported
+         days later by another outlet). Regulatory items are exempt, because
+         a penalty is news whenever it surfaces;
+      3. REPEAT GATE - a candidate whose story was already pushed for this
+         ticker inside the retention window is suppressed (`_repeat`), even
+         if the AI did not notice;
+      4. regulatory force-push: headlines matching penalty/regulatory keywords
+         get boosted to >= 8 so they are never buried by generic scoring;
+      5. importance floor (push_min_importance) + AI push veto;
+      6. rank by importance (Chinese-language items tie-break higher), then
+         allocate seats ROUND-ROBIN per ticker up to push_max_per_ticker, so
+         one busy name can never take the whole digest while another name
+         with real news gets nothing.
+
     Returns the pushed list (subset of enriched, in push order).
     """
     push_mode = config.get("push_mode", "all")  # "all" | "score"
     floor = _cfg_int(config, "push_min_importance", 4)
     min_score = _cfg_int(config, "push_min_score", 7)
     max_digest = _cfg_int(config, "max_digest_items", 10)
-    max_per_ticker = _cfg_int(config, "push_max_per_ticker", 3)
+    max_per_ticker = max(1, _cfg_int(config, "push_max_per_ticker", 2))
+    max_age = _cfg_int(config, "push_max_age_hours", PUSH_MAX_AGE_HOURS)
+    event_window = _cfg_int(config, "event_repeat_window_days",
+                            EVENT_REPEAT_WINDOW_DAYS)
+    now = now or datetime.now(EASTERN)
 
     unique = [it for it in enriched
-              if not it.get("is_dup") and not it.get("is_known")]
+              if not it.get("is_dup") and not it.get("is_known")
+              and not it.get("_superseded")]
 
     # Regulatory force-push: subsidiary penalties / regulatory action is the
     # core alpha - a code-level override so it is never buried by 1-10 scoring.
+    # Computed BEFORE the age gate because regulatory items are exempt from it.
     reg_pattern = re.compile(
         r"(处罚|罚款|立案|约谈|调查|退市|监管|违规|delist|fraud|investigat|penalt|enforcement|regulat)",
         re.IGNORECASE)
     for it in unique:
         hay = f"{it.get('title', '')} {it.get('title_en', '')}"
         if reg_pattern.search(hay):
+            it["_regulatory"] = True
             it["importance"] = max(it.get("importance") or 0, 8)
             if it.get("category") in (None, "", "other"):
                 it["category"] = "regulatory"
 
-    # Importance floor + AI veto: push=false is honored as a veto, and nothing
-    # below the floor is pushed (kills ⭐1-3 noise).
+    # (2) Age gate.
+    if max_age > 0:
+        fresh = []
+        for it in unique:
+            age = _item_age_hours(it)
+            if age is not None and age > max_age and not it.get("_regulatory"):
+                it["_too_old"] = True
+                continue
+            fresh.append(it)
+        unique = fresh
+
+    # (3) Repeat gate: has this STORY - or the corporate EVENT behind it -
+    #     already been pushed for this ticker?
+    if conn is not None:
+        for it in unique:
+            if it.get("_regulatory"):
+                continue
+            if _story_already_pushed(conn, it, now, event_window_days=event_window):
+                it["_repeat"] = True
+        unique = [it for it in unique if not it.get("_repeat")]
+
+    # (5) Importance floor + AI veto: push=false is honored as a veto, and
+    # nothing below the floor is pushed (kills low-score noise).
     if push_mode == "score":
         candidates = [it for it in unique
                       if it.get("push", True)
@@ -2366,19 +3437,53 @@ def select_push_items(enriched, config):
         key=lambda it: ((it.get("importance") or 0), 1 if it.get("lang") == "zh" else 0),
         reverse=True)
 
+    # (6) Round-robin seat allocation. Within a ticker the order stays by
+    # importance, but the digest alternates names so a single stock cannot
+    # monopolise it.
+    by_ticker = {}
+    for it in candidates:
+        by_ticker.setdefault(it.get("ticker", ""), []).append(it)
+    order = sorted(by_ticker, key=lambda t: (-(by_ticker[t][0].get("importance") or 0), t))
+
     pushed = []
     counts = {}
-    for it in candidates:
-        if len(pushed) >= max_digest:
-            break
-        t = it.get("ticker", "")
-        if counts.get(t, 0) >= max_per_ticker:
-            # Only bite the cap if some OTHER ticker can still fill this slot.
-            if any(it2.get("ticker") != t for it2 in candidates if it2 not in pushed):
+    progressed = True
+    while progressed and len(pushed) < max_digest:
+        progressed = False
+        for t in order:
+            if len(pushed) >= max_digest:
+                break
+            if counts.get(t, 0) >= max_per_ticker:
                 continue
-        pushed.append(it)
-        counts[t] = counts.get(t, 0) + 1
+            pool = by_ticker[t]
+            while pool and pool[0] in pushed:
+                pool.pop(0)
+            if not pool:
+                continue
+            pushed.append(pool.pop(0))
+            counts[t] = counts.get(t, 0) + 1
+            progressed = True
     return pushed
+
+
+def push_decision_counts(enriched):
+    """Per-reason counters for the 'why wasn't this pushed' run log."""
+    counts = {"too_old": 0, "repeat": 0, "event_repeat": 0, "same_story": 0,
+              "dup": 0, "known": 0, "vetoed": 0, "below_floor": 0}
+    for it in enriched:
+        if it.get("_too_old"):
+            counts["too_old"] += 1
+        elif it.get("_repeat"):
+            counts["event_repeat" if it.get("_event_repeat") else "repeat"] += 1
+        elif it.get("_superseded"):
+            counts["same_story"] += 1
+        elif it.get("is_dup"):
+            counts["dup"] += 1
+        elif it.get("is_known"):
+            counts["known"] += 1
+        elif not it.get("push", True):
+            counts["vetoed"] += 1
+    return {k: v for k, v in counts.items() if v}
 
 
 # ---------------------------------------------------------------------------
@@ -2386,13 +3491,38 @@ def select_push_items(enriched, config):
 # ---------------------------------------------------------------------------
 # Two runs a day, pinned to US market time. Both are deliberately placed
 # OUTSIDE DeepSeek's peak-pricing windows (01:00-04:00 / 06:00-10:00 UTC
-# Mon-Fri, when API tokens cost DOUBLE): 9:15 ET = ~14:15 UTC and 16:45 ET =
-# ~20:45/21:45 UTC are both off-peak (half price). The old third run at
-# 23:00 ET (= 03:00/04:00 UTC, deep inside the peak window) was removed
-# purely for AI cost; re-add dtime(23, 0) here AND the matching cron jobs
-# in setup_cloud.sh if you ever want the Beijing-noon burst back.
-SCHEDULE_RUN_TIMES = (dtime(9, 15), dtime(16, 45))
+# Mon-Fri, when API tokens cost DOUBLE). Verified for both DST seasons:
+#
+#   Run 1  09:15 ET (15 min before the 9:30 open) -> 13:15 UTC (EDT, summer)
+#                                                   14:15 UTC (EST, winter)
+#   Run 2  17:00 ET (one hour after the 16:00 close) -> 21:00 UTC (EDT)
+#                                                      22:00 UTC (EST)
+#
+# All four land off-peak, so every AI call is billed at half price. cron
+# fires at fixed UTC times and installs BOTH seasons' jobs (see setup_cloud.sh);
+# the guard below makes the out-of-season job an instant no-op, so exactly two
+# real runs happen per day. The old third run at 23:00 ET (= 03:00/04:00 UTC,
+# deep inside the peak window) was removed purely for AI cost.
+SCHEDULE_RUN_TIMES = (dtime(9, 15), dtime(17, 0))
 SCHEDULE_TOLERANCE_MIN = 5
+
+# Label shown in the digest header so it is obvious WHICH run delivered it:
+# the 09:15 ET run is the pre-open read, the 17:00 ET run is the post-close
+# read (one hour after the 16:00 ET close).
+SCHEDULE_LABELS = {
+    dtime(9, 15): "pre-open",
+    dtime(17, 0): "post-close",
+}
+
+
+def _run_label(now_et):
+    """'pre-open' / 'post-close' for a scheduled run time, else 'manual'."""
+    for target, label in SCHEDULE_LABELS.items():
+        delta = abs((datetime.combine(now_et.date(), now_et.time())
+                     - datetime.combine(now_et.date(), target)).total_seconds())
+        if delta <= SCHEDULE_TOLERANCE_MIN * 60:
+            return label
+    return "manual"
 
 
 def _schedule_guard(now_et):
@@ -2406,7 +3536,7 @@ def _schedule_guard(now_et):
         if delta <= SCHEDULE_TOLERANCE_MIN * 60:
             return
     print(f"[{now_et.strftime('%Y-%m-%d %H:%M %Z')}] "
-          f"Outside scheduled times (9:15 / 16:45 ET) - skipping.")
+          f"Outside scheduled times (9:15 / 17:00 ET) - skipping.")
     sys.exit(0)
 
 
@@ -2587,6 +3717,9 @@ def main():
         wire_cache["Sina724"] = fetch_sina_724()
     # Extra user keywords for the macro gate (config macro_keywords).
     macro_extra = [str(k) for k in (config.get("macro_keywords") or []) if str(k).strip()]
+    # Per-ticker sector_watch candidates + drop counters for the run log.
+    sector_report = {}
+    dropped_report = {}
 
     for ticker in tickers:
         # The lookup step: pull the company profile (Chinese name, aliases,
@@ -2611,93 +3744,65 @@ def main():
             print(f"  {ticker}: no Chinese name found - Chinese sources skipped. "
                   f"(add name_zh/aliases_zh/subsidiaries_zh to config_local.json)")
 
-        # A helper that runs one "source fetch" for a ticker and folds the
-        # results into all_new / the DB. Returns None if the fetch failed.
-        def process_source(source, fetch_fn):
+        # ---- relevance + quality context for THIS ticker ----
+        relevance_resolved = resolve_relevance(meta)
+        site_domains = relevance_resolved["domains"]
+        sector_watch = bool(config.get("sector_watch", SECTOR_WATCH_DEFAULT))
+        _sector_items = []
+        sector_report[ticker] = _sector_items
+        ingest_report = {}
+        dropped_report[ticker] = ingest_report
+
+        def src_status(key, strict=True, note=""):
+            """
+            The relevance policy for one source. 'strict' means: an item from
+            this source must really mention the company to be kept (sector
+            news is dropped, or routed to sector_watch when that tier is on).
+            Sources whose query is already company-specific are not strict.
+            """
+            return {"status": "strict" if strict else "warn", "note": note}
+
+        def fetch_source(source, fetch_fn, status):
+            """Fetch one source and fold it through the shared ingest gate."""
             last = get_last_fetched(conn, ticker, source)
-            if last:
-                since_dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=EASTERN)
-            else:
-                since_dt = datetime.now(EASTERN) - timedelta(hours=initial_hours)
+            since_dt = (datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=EASTERN)
+                        if last else datetime.now(EASTERN) - timedelta(hours=initial_hours))
             items = fetch_fn(since_dt)
             if items is None:
                 print(f"  [warn] {ticker} {source} fetch failed - NOT advancing "
                       f"delta (will retry from {since_dt.strftime('%Y-%m-%d %H:%M')}).")
-                return
+                return None
             for item in items:
-                item["ticker"] = ticker
-                # Hard freshness backstop (MAX_NEWS_AGE_HOURS): drop anything
-                # whose publish time is ancient even if its fetcher let it
-                # through - this is what keeps months-old recycled stories
-                # out of the digest no matter which source returned them.
-                if _is_stale_item(item, max_news_age_hours):
-                    print(f"  [stale] {ticker} {source}: dropped "
-                          f"'{item.get('title', '')[:60]}' (published "
-                          f"{_normalize_pub(item.get('date', '')) or 'unknown'}, "
-                          f"older than {max_news_age_hours}h).")
-                    continue
-                if is_new(conn, ticker, item["source"], item["id"], item["title"]):
-                    item["published_at"] = _normalize_pub(item.get("date", ""))
-                    item["first_seen"] = run_start
-                    all_new.append(item)
-                    mark_seen(conn, ticker, item["source"], item["id"],
-                              item["title"], item.get("url", ""))
-                    insert_news(conn, item)
+                item["_source_status"] = status
+            keeps = [it for it in items if status.get("status") != "drop"]
+            accept = ingest_items(conn, all_new, source, keeps, ticker, since_dt,
+                                  max_news_age_hours,
+                                  relevance_resolved=relevance_resolved,
+                                  sector_watch=sector_watch,
+                                  sector_items=_sector_items,
+                                  run_start=run_start, report=ingest_report)
             set_last_fetched(conn, ticker, source, now_utc_str)
+            return accept
 
-        def process_wire(source, raw_items, terms):
-            """Filter a global fast-news wire's items by this ticker's Chinese
-            terms + delta, then fold matches into all_new / the DB (same
-            semantics as process_source - None wire => delta not advanced)."""
-            if not terms:
-                return
-            last = get_last_fetched(conn, ticker, source)
-            since_dt = (datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=EASTERN)
-                        if last else datetime.now(EASTERN) - timedelta(hours=initial_hours))
-            found = 0
-            for raw in raw_items:
-                hay = f"{raw.get('title', '')} {raw.get('snippet', '')}"
-                # Macro-matched items belong to the 📢 CHINA MACRO section -
-                # skip them here so they are not pushed twice.
-                if is_macro(hay, macro_extra):
-                    continue
-                if not any(_term_in_text(t, hay) for t in terms):
-                    continue
-                pub_dt = _parse_pub(raw.get("date", ""))
-                if pub_dt and pub_dt < since_dt:
-                    continue
-                if _is_stale_item(raw, max_news_age_hours):
-                    continue
-                item = dict(raw)
-                item["ticker"] = ticker
-                item["source"] = source
-                if is_new(conn, ticker, source, item["id"], item["title"]):
-                    item["published_at"] = _normalize_pub(item.get("date", ""))
-                    item["first_seen"] = run_start
-                    all_new.append(item)
-                    mark_seen(conn, ticker, source, item["id"], item["title"],
-                              item.get("url", ""))
-                    insert_news(conn, item)
-                    found += 1
-            set_last_fetched(conn, ticker, source, now_utc_str)
-            if found:
-                print(f"  {ticker}: {found} new {source} wire item(s).")
-
-        # 1) SEC filings (English, ADR regulatory coverage).
+        # 1) SEC filings (English, ADR regulatory coverage). A filing IS about
+        #    the company by definition - no relevance filter needed.
         if src_on("sec"):
-            process_source("SEC", lambda sd: fetch_sec_filings(ticker, sd, conn=conn))
+            fetch_source("SEC", lambda sd: fetch_sec_filings(ticker, sd, conn=conn),
+                         src_status("sec", strict=False))
 
         # 2) Chinese sources (the alpha) - require Chinese search terms.
         if zh_terms:
             # Google News, Chinese edition.
             if src_on("google_news_zh"):
                 zh_query = " OR ".join(zh_terms)
-                process_source(
+                fetch_source(
                     "GoogleNewsZH",
                     lambda sd: fetch_rss(google_news_url(zh_query, "zh"), ticker, sd,
-                                         source="GoogleNewsZH", lang="zh"))
+                                         source="GoogleNewsZH", lang="zh"),
+                    src_status("google_news_zh"))
 
-            # Eastmoney search - one query per term (capped), precision-filtered.
+            # Eastmoney search - one query per term (capped), already
+            # title-filtered by the fetcher.
             if src_on("eastmoney"):
                 def _em(sd, terms=zh_terms[:EASTMONEY_MAX_QUERIES]):
                     out = []
@@ -2709,11 +3814,13 @@ def main():
                             continue
                         out.extend(res)
                     return None if failed else out
-                process_source("Eastmoney", _em)
+                fetch_source("Eastmoney", _em, src_status("eastmoney", strict=False))
 
             # Baidu news (best-effort, one query using the main name).
             if src_on("baidu"):
-                process_source("Baidu", lambda sd: fetch_baidu_news(zh_terms[0], sd, terms=zh_terms))
+                fetch_source("Baidu",
+                             lambda sd: fetch_baidu_news(zh_terms[0], sd, terms=zh_terms),
+                             src_status("baidu", strict=False))
 
             # Tavily news search - the scarce resource. Skipped when the free
             # sources (GoogleNewsZH/Eastmoney/Baidu) already covered this
@@ -2726,32 +3833,33 @@ def main():
                           f"item(s) this run - skipping Tavily (saving credits).")
                 else:
                     tav_query = " OR ".join(zh_terms[:2] + en_terms[:2])
-                    process_source(
+                    fetch_source(
                         "Tavily",
                         lambda sd: fetch_tavily(tav_query, secrets, config, sd,
-                                                terms=zh_terms + en_terms))
+                                                terms=zh_terms + en_terms),
+                        src_status("tavily", strict=False))
 
         # 2.5) Google News restricted to the company's OWN websites (site:)
         #      - catches official announcements / press releases that no news
-        #      outlet picks up. Free, no Tavily credits. Only runs when the
-        #      lookup has discovered website domains.
-        site_domains = build_site_domains(meta)
+        #      outlet picks up. Free, no Tavily credits.
         if site_domains and src_on("google_news_site"):
             site_query = " OR ".join(f"site:{d}" for d in site_domains)
             print(f"  {ticker}: official-site search -> {site_query}")
-            process_source(
+            fetch_source(
                 "GoogleNewsSite",
                 lambda sd: fetch_rss(google_news_url(site_query, "zh"), ticker, sd,
-                                     source="GoogleNewsSite", lang="zh"))
+                                     source="GoogleNewsSite", lang="zh"),
+                src_status("google_news_site", strict=False))
 
         # 3) Google News English - includes the company's EN names/brands so
         #    subsidiary news is found even when the ticker symbol isn't in it.
         if src_on("google_news_en"):
             en_query = " OR ".join([f"{ticker} stock"] + en_terms[:3])
-            process_source(
+            fetch_source(
                 "GoogleNews",
                 lambda sd: fetch_rss(google_news_url(en_query, "en"), ticker, sd,
-                                     source="GoogleNews", lang="en"))
+                                     source="GoogleNews", lang="en"),
+                src_status("google_news_en"))
 
         # 3.5) Chinese fast-news wires (the real-time tape): one global fetch
         #      per wire per run, filtered here by this ticker's Chinese
@@ -2765,12 +3873,39 @@ def main():
                 print(f"  [warn] {ticker} {wire_src} wire fetch failed - "
                       f"NOT advancing delta.")
                 continue
-            process_wire(wire_src, raw, zh_terms)
+
+            def _wire(sd, raw=raw, src=wire_src, terms=zh_terms):
+                """Filter a global wire by this ticker's Chinese terms.
+
+                Macro-matched items belong to the 📢 CHINA MACRO section, and
+                an item must really name the company (or a subsidiary) - the
+                wire is a firehose of everything, so this filter is what makes
+                it per-ticker."""
+                out = []
+                for r in raw:
+                    hay = f"{r.get('title', '')} {r.get('snippet', '')}"
+                    # Macro / global-markets items have their own sections -
+                    # keep them out of the per-ticker digest.
+                    if is_macro(hay, macro_extra) or is_global_markets(hay):
+                        continue
+                    if not any(_term_in_text(t, hay) for t in terms):
+                        continue
+                    it = dict(r)
+                    it["source"] = src
+                    out.append(it)
+                return out
+
+            # The wire query is the company's/subsidiaries' exact names, so
+            # strict=True would double-filter and lose the semantic
+            # match: the term filter above decides relevance.
+            fetch_source(wire_src, _wire, src_status(wire_key, strict=False))
 
         # 3.6) EXA neural search - semantic recall: finds big/impact news
         #      about the company that keyword sources miss ("the Shenzhen-
-        #      based insurer" instead of "Huize"). Skipped when the free
-        #      sources already covered the ticker this run (budget).
+        #      based insurer" instead of "Huize"). This is ALSO the noisiest
+        #      source: neural search happily returns the whole sector, so it
+        #      is now filtered to items that really mention the company.
+        #      Skipped when the free sources already covered the ticker.
         if src_on("exa") and secrets.get("exa_api_key"):
             free_count = sum(1 for it in all_new if it.get("ticker") == ticker)
             exa_min_free = _cfg_int(config, "exa_min_free_items", EXA_MIN_FREE_ITEMS)
@@ -2780,10 +3915,11 @@ def main():
             else:
                 exa_query = (f"{' '.join(zh_terms[:2])} {' '.join(en_terms[:2])} "
                              f"重大 监管 政策 影响 风险")
-                process_source(
+                fetch_source(
                     "Exa",
                     lambda sd: fetch_exa(exa_query, secrets, config, sd,
-                                         limit=5, category="news"))
+                                         limit=8, category="news"),
+                    src_status("exa"))
 
         # 4) Company RSS feeds (configured per ticker) - source "RSS".
         feeds = config.get("rss_feeds", {}).get(ticker, [])
@@ -2792,41 +3928,110 @@ def main():
             since_dt = (datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=EASTERN)
                         if last else datetime.now(EASTERN) - timedelta(hours=initial_hours))
             rss_ok = True
+            rss_items = []
             for feed_url in feeds:
                 feed_items = fetch_rss(feed_url, ticker, since_dt, source="RSS", lang="en")
                 if feed_items is None:
                     rss_ok = False
                     print(f"  [warn] {ticker} RSS {feed_url} failed - NOT advancing delta.")
                     continue
-                for item in feed_items:
-                    item["ticker"] = ticker
-                    if is_new(conn, ticker, item["source"], item["id"], item["title"]):
-                        item["published_at"] = _normalize_pub(item.get("date", ""))
-                        item["first_seen"] = run_start
-                        all_new.append(item)
-                        mark_seen(conn, ticker, item["source"], item["id"],
-                                  item["title"], item.get("url", ""))
-                        insert_news(conn, item)
+                rss_items.extend(feed_items)
+            if rss_items:
+                for item in rss_items:
+                    item["_source_status"] = {"status": "warn", "note": "own feed"}
+                ingest_items(conn, all_new, "RSS", rss_items, ticker, since_dt,
+                             max_news_age_hours, relevance_resolved=relevance_resolved,
+                             sector_watch=sector_watch, sector_items=_sector_items,
+                             run_start=run_start, report=ingest_report)
             if rss_ok:
                 set_last_fetched(conn, ticker, "RSS", now_utc_str)
+
+        # Visibility: the relevance gate is the difference between a useful
+        # digest and a firehose, so log exactly what it removed and why.
+        kept_here = sum(1 for it in all_new if it.get("ticker") == ticker)
+        if ingest_report:
+            why = ", ".join(f"{k}={v}" for k, v in
+                            sorted(ingest_report.items(), key=lambda kv: -kv[1]))
+            print(f"  {ticker}: {kept_here} kept, {sum(ingest_report.values())} "
+                  f"filtered out ({why}).")
+        if _sector_items:
+            print(f"  {ticker}: {len(_sector_items)} sector-watch item(s) "
+                  f"(sector_watch is ON - separately capped).")
+        if not site_domains:
+            print(f"  {ticker}: no website in the lookup - official-site (site:) "
+                  f"search skipped. Run --rediscover={ticker} to try to find it.")
 
     record["new_items"] = len(all_new)
     print(f"  {len(all_new)} new item(s) found (all stored in the news DB).")
 
-    # ---- China macro watch: the "I HAVE TO KNOW" tier ----
-    # Huge policy/market news (rate cuts, stimulus, assisted-loan regulation).
-    # Gated FREE by regex; only matched items reach the AI (one tiny batched
-    # call). Always pushed in their own digest section, never floor-capped.
+    # ---- China macro + global markets: the "I HAVE TO KNOW" tiers ----
+    # Huge China policy news (rate cuts, stimulus, assisted-loan regulation)
+    # gated FREE by regex; matched items reach one tiny batched AI call. The
+    # gate now requires a strong China-policy pattern (or two distinct hits),
+    # so US Fed/payrolls headlines are routed to the separate GLOBAL MARKETS
+    # tier instead of arriving labelled as "China macro".
     macro_items = collect_macro_items(conn, config, secrets, wire_cache, src_on,
                                       initial_hours, run_start, now_utc_str,
                                       max_age_hours=max_news_age_hours)
-    macro_pushed = analyze_macro(macro_items, config, secrets, conn, run_start)
     for it in macro_items:
+        it["_tier"] = news_tier(f"{it.get('title', '')} {it.get('snippet', '')}")
+    macro_core = [it for it in macro_items if it.get("_tier") == "macro"]
+    # Global items are stored under the "GLOBAL" pseudo-ticker.
+    global_items = []
+    for it in macro_items:
+        if it.get("_tier") == "global":
+            g = dict(it)
+            g["ticker"] = "GLOBAL"
+            global_items.append(g)
+
+    macro_pushed = analyze_macro(macro_core, config, secrets, conn, run_start,
+                                 pseudo="MACRO") if macro_core else []
+    for it in macro_core:
         mark_pushed(conn, it, it in macro_pushed)
-    if macro_items:
-        print(f"  {len(macro_items)} China macro item(s) -> {len(macro_pushed)} "
+    if macro_core:
+        print(f"  {len(macro_core)} China macro item(s) -> {len(macro_pushed)} "
               f"pushed (the 'must know' tier).")
+
+    global_pushed = []
+    if global_items and config.get("global_markets", GLOBAL_MARKETS_DEFAULT):
+        global_pushed = analyze_macro(global_items, config, secrets, conn,
+                                      run_start, pseudo="GLOBAL")
+        for it in global_items:
+            mark_pushed(conn, it, it in global_pushed)
+        print(f"  {len(global_items)} global-markets item(s) -> "
+              f"{len(global_pushed)} pushed.")
+    elif global_items:
+        for it in global_items:
+            mark_pushed(conn, it, False)
+        print(f"  {len(global_items)} global-markets item(s) stored, not pushed "
+              f"(global_markets is OFF - enable it in the panel if you want a "
+              f"GLOBAL MARKETS section).")
+
     macro_digest = format_macro(macro_pushed)
+    global_digest = format_global_markets(global_pushed)
+
+    # ---- Optional 🏭 SECTOR CONTEXT tier (sector_watch, default OFF) ----
+    sector_pushed = collect_sector_watch(sector_report, conn, config, secrets,
+                                         run_start) \
+        if any(sector_report.values()) else []
+    for items in (sector_report or {}).values():
+        for it in items:
+            mark_pushed(conn, it, it in sector_pushed)
+    if sector_pushed:
+        print(f"  {len(sector_pushed)} sector-context item(s) pushed "
+              f"(sector_watch is ON).")
+    sector_digest = format_sector_watch(sector_pushed)
+
+    # ---- collapse the same story arriving from several sources ----
+    # The per-source hash cannot see across sources, so one earnings release
+    # used to enter the pipeline 4-6 times (GoogleNewsZH + GoogleNews + Tavily
+    # + Exa) and fill the digest with copies of one event. Only the best
+    # sourced copy competes for a digest seat; the others are still analysed
+    # and stored for browsing, but can never be pushed.
+    all_new, collapsed = dedupe_same_story(all_new)
+    if collapsed:
+        print(f"  [dedup] collapsed {collapsed} same-story duplicate(s) from "
+              f"other sources (kept the best-sourced copy of each).")
 
     # Keep only the freshest items for the AI pass when there's a flood.
     # Real publish dates first; undated items (rare Tavily/Baidu hits) fall
@@ -2847,25 +4052,56 @@ def main():
         return datetime.min.replace(tzinfo=EASTERN)
     all_new.sort(key=_sort_key, reverse=True)
 
+    # Trim AFTER dedup so far fewer items are lost to the cap, and release the
+    # seen-mark of anything still trimmed: the old code left those rows in the
+    # DB and in the `seen` ledger with importance NULL forever, so no later run
+    # could ever analyze them (they were "already seen"). Released items are
+    # re-fetched by a following run and are re-queued by rescue_orphans.
     max_to_filter = _cfg_int(config, "max_items_per_run", 40)
     if len(all_new) > max_to_filter:
-        print(f"  Trimming to the {max_to_filter} most recent for AI analysis.")
+        trimmed = all_new[max_to_filter:]
         all_new = all_new[:max_to_filter]
+        released = 0
+        for it in trimmed:
+            if NO_WRITE:
+                continue
+            try:
+                conn.execute("DELETE FROM seen WHERE ticker=? AND source=? AND item_hash=?",
+                             (it.get("ticker"), it.get("source"), _hash_of(it)))
+                released += 1
+            except Exception:
+                pass
+        try:
+            conn.commit()
+        except Exception:
+            pass
+        print(f"  Trimming to the {max_to_filter} most recent for AI analysis "
+              f"({len(trimmed)} deferred, {released} re-queued for the next run).")
 
-    if not all_new and not macro_pushed:
+    if not all_new and not macro_pushed and not global_pushed and not sector_pushed:
         print("  No new items - nothing to do.")
+        extra_digests = []
         if macro_digest:
+            extra_digests.append(("CHINA MACRO", macro_digest))
+        if global_digest:
+            extra_digests.append(("GLOBAL MARKETS", global_digest))
+        if sector_digest:
+            extra_digests.append(("SECTOR CONTEXT", sector_digest))
+        if extra_digests:
             if dry_run:
-                print("\n" + "=" * 60)
-                print("DRY RUN - CHINA MACRO:")
-                print("=" * 60)
-                print(macro_digest)
-                print("=" * 60)
+                for name, msg in extra_digests:
+                    print("\n" + "=" * 60)
+                    print(f"DRY RUN - {name}:")
+                    print("=" * 60)
+                    print(msg)
+                    print("=" * 60)
             elif token and chat_id:
-                if send_telegram(token, chat_id, macro_digest):
-                    print(f"  Macro digest sent ({len(macro_pushed)} item(s)).")
-                else:
-                    record["alerts_failed"] = record.get("alerts_failed", []) + ["macro"]
+                for name, msg in extra_digests:
+                    if not send_telegram(token, chat_id, msg):
+                        record["alerts_failed"] = \
+                            record.get("alerts_failed", []) + [name.lower()]
+                    else:
+                        print(f"  {name} digest sent.")
         elif snapshot and token and chat_id and not dry_run:
             # Manual run with nothing new: deliver the current picture instead.
             snap_msg = build_snapshot(conn)
@@ -2900,48 +4136,61 @@ def main():
         # Push selection FIRST: the regulatory force-push mutates importance /
         # category in place, so it must run before update_news_ai persists the
         # boosted values (otherwise the DB would show the pre-boost score).
-        pushed = select_push_items(enriched, config)
+        pushed = select_push_items(enriched, config, conn=conn, now=start_time)
         for it in enriched:
             update_news_ai(conn, it)
         for it in enriched:
             mark_pushed(conn, it, it in pushed)
+        # Remember what actually went out - the repeat gate reads this next run.
+        record_pushed_stories(conn, pushed, now=start_time)
         record["sent_items"] = len(pushed)
         floor = _cfg_int(config, "push_min_importance", 4)
         max_digest = _cfg_int(config, "max_digest_items", 10)
-        max_per_ticker = _cfg_int(config, "push_max_per_ticker", 3)
+        max_per_ticker = max(1, _cfg_int(config, "push_max_per_ticker", 2))
         print(f"  Pushing {len(pushed)} item(s) to Telegram "
               f"(importance >= {floor}, cap {max_digest}, max {max_per_ticker}/ticker). "
               f"{len(enriched) - len(pushed)} item(s) stored for browsing.")
+        reasons = push_decision_counts(enriched)
+        if reasons:
+            print("  Not pushed: " + ", ".join(f"{k}={v}" for k, v in
+                                               sorted(reasons.items(),
+                                                      key=lambda kv: -kv[1])) + ".")
 
     digest = format_digest(pushed, len(tickers),
-                           stored_count=len(all_new) - len(pushed)) if pushed else None
-    if digest or macro_digest:
+                           stored_count=len(all_new) - len(pushed),
+                           run_label=_run_label(start_time)) if pushed else None
+    # Every section that has content: macro -> global markets -> the per-stock
+    # digest -> optional sector context (so the stock items stay the headline).
+    digests = []
+    if macro_digest:
+        digests.append(("CHINA MACRO", macro_digest))
+    if global_digest:
+        digests.append(("GLOBAL MARKETS", global_digest))
+    if digest:
+        digests.append(("DIGEST", digest))
+    if sector_digest:
+        digests.append(("SECTOR CONTEXT", sector_digest))
+
+    if digests:
         if dry_run:
-            if macro_digest:
+            for name, msg in digests:
                 print("\n" + "=" * 60)
-                print("DRY RUN - CHINA MACRO:")
+                print(f"DRY RUN - {name} (would be sent to Telegram):")
                 print("=" * 60)
-                print(macro_digest)
-                print("=" * 60)
-            if digest:
-                print("\n" + "=" * 60)
-                print("DRY RUN - digest would be sent to Telegram:")
-                print("=" * 60)
-                print(digest)
+                print(msg)
                 print("=" * 60)
         elif token and chat_id:
             sent_any = False
-            if macro_digest and send_telegram(token, chat_id, macro_digest):
-                sent_any = True
-            elif macro_digest:
-                record["alerts_failed"] = record.get("alerts_failed", []) + ["macro"]
-            if digest and send_telegram(token, chat_id, digest):
-                sent_any = True
-            elif digest:
-                record["alerts_failed"] = record.get("alerts_failed", []) + ["digest"]
+            for name, msg in digests:
+                if send_telegram(token, chat_id, msg):
+                    sent_any = True
+                else:
+                    record["alerts_failed"] = \
+                        record.get("alerts_failed", []) + [name.lower()]
             if sent_any:
-                print(f"  Digest sent (macro {len(macro_pushed)} + "
-                      f"regular {len(pushed)} item(s)).")
+                print(f"  Digest sent (macro {len(macro_pushed)} + global "
+                      f"{len(global_pushed)} + regular {len(pushed)} + sector "
+                      f"{len(sector_pushed)} item(s)).")
         else:
             print("  Digest ready but Telegram not configured.")
     elif snapshot and token and chat_id and not dry_run:

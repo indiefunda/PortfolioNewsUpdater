@@ -30,6 +30,10 @@ sec_validate.json
 _test_ai.py
 .edgar_cache/
 
+# Local audit workspace: contains a SNAPSHOT COPY of your private news.db,
+# company_lookup.json and config_local.json (tickers/holdings). Never commit.
+_audit/
+
 # OS
 Thumbs.db
 .DS_Store

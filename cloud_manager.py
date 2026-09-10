@@ -53,17 +53,39 @@ DEFAULT_CONFIG = {
     "seen_retention_days": 21,
     # "all" pushes the top-N by importance; "score" only pushes >= push_min_score.
     # Either way: nothing below push_min_importance (floor) is pushed, the AI's
-    # per-item push veto is honored, and a ticker can't take more than
-    # push_max_per_ticker slots while another name has news.
+    # per-item push veto is honored, and seats are handed out round-robin per
+    # ticker (max push_max_per_ticker each) so one busy name can't fill the
+    # digest while another name with real news gets nothing.
     "push_mode": "all",
     "push_min_score": 7,
     "push_min_importance": 4,
-    "push_max_per_ticker": 3,
+    "push_max_per_ticker": 2,
+    # Nothing published longer ago than this is ever pushed (stored only), no
+    # matter how the AI scored it - this is the "I already read this days ago"
+    # guard for recycled coverage. Regulatory items are exempt. 0 disables.
+    "push_max_age_hours": 72,
+    # Event-level guard: a corporate event (an earnings release for a given
+    # fiscal period, an EGM, a dividend) is pushed ONCE. Every later article
+    # about that same event - another outlet, a translated headline - is
+    # suppressed for this many days. 0 disables.
+    "event_repeat_window_days": 7,
+    # Optional extra sections (both OFF by default).
+    #   sector_watch   - industry news that never mentions the company, shown
+    #                    in its own 🏭 SECTOR CONTEXT section instead of being
+    #                    mixed into the per-stock items.
+    #   global_markets - systemic US/global items (Fed, CPI, payrolls) in their
+    #                    own 🌍 GLOBAL MARKETS section, kept apart from
+    #                    CHINA MACRO. A daily index recap is scored low and
+    #                    dropped.
+    "sector_watch": False,
+    "sector_watch_max_per_run": 2,
+    "global_markets": False,
+    "global_markets_max_per_run": 2,
     # Tavily free plan = 1,000 credits/month; 1 basic search = 1 credit.
-    # Daily cap 15 (~450/month worst case) + monthly hard cap 850, and a
+    # Daily cap 30 (~900/month worst case) + monthly hard cap 900, and a
     # ticker is skipped when free sources already covered it that run.
-    "tavily_max_daily_searches": 15,
-    "tavily_max_monthly_searches": 850,
+    "tavily_max_daily_searches": 30,
+    "tavily_max_monthly_searches": 900,
     "tavily_min_free_items": 4,
     # Company lookup: re-run auto-discovery for a ticker after this many days
     # (monthly default - new subsidiaries found are alerted on Telegram).
@@ -679,7 +701,7 @@ async function loadCron(){
   if(!c){ el.innerHTML='<span class="dot gray"></span><b>Could not reach server.</b>'; return; }
   const daemon = String(c.cron_daemon_active||'').trim();
   if(c.active === 'active'){
-    el.innerHTML = '<span class="dot green"></span><b>Schedule armed (2x daily, US market time).</b> Runs at 9:15 / 16:45 ET (both outside DeepSeek peak pricing), auto-adjusts for DST. cron: '+
+    el.innerHTML = '<span class="dot green"></span><b>Schedule armed (2x daily, US market time).</b> Runs at 9:15 ET (15 min before the open) and 17:00 ET (1 hour after the close). Both are outside DeepSeek peak pricing; auto-adjusts for DST. cron: '+
       (daemon==='active'?'running':'NOT running')+'<br><span style="color:var(--muted)">'+escapeHtml(c.cron_line||'')+'</span>';
   } else {
     el.innerHTML = '<span class="dot red"></span><b>Schedule not installed.</b> Upload config (Step 3) to install it. cron: '+(daemon==='active'?'running':'NOT running');

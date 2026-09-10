@@ -10,21 +10,23 @@ so it costs **$0** for VM/network/storage.
 
 ## Schedule (pinned to US market time, DST-aware)
 
-| Run | Time (US Eastern) | Why |
-|-----|-------------------|-----|
-| 1 | **9:15 ET** | 15 minutes before the 9:30 ET market open |
-| 2 | **16:45 ET** | just after the 16:00 ET close |
+| Run | Time (US Eastern) | UTC summer (EDT) | UTC winter (EST) |
+|-----|-------------------|------------------|------------------|
+| 1 | **09:15 ET** (15 min before the 09:30 open) | 13:15 | 14:15 |
+| 2 | **17:00 ET** (one hour after the 16:00 close) | 21:00 | 22:00 |
 
-Both runs deliberately sit **outside DeepSeek's peak-pricing windows**
-(01:00–04:00 & 06:00–10:00 UTC Mon–Fri — tokens cost **double** there).
-9:15 ET ≈ 13:15/14:15 UTC and 16:45 ET ≈ 20:45/21:45 UTC are both off-peak,
-so **every AI call is billed at the half price**. The old third run
-(23:00 ET / Beijing noon) fired at 03:00–04:00 UTC — deep inside peak —
-and was removed purely for AI cost.
+All four UTC times sit **outside DeepSeek's peak-pricing windows**
+(01:00–04:00 & 06:00–10:00 UTC Mon–Fri — tokens cost **double** there), so
+**every AI call is billed at the half price** in both seasons.
+
+Which run a digest came from is printed in its header
+(`📰 Portfolio News Digest (6 ticker(s)) · pre-open` / `· post-close`).
 
 The installer puts cron jobs on the VM for both DST seasons and a tiny
 DST-aware guard inside `news_updater.py` makes the out-of-season jobs an
-instant no-op, so exactly **two real runs happen per day**.
+instant no-op, so exactly **two real runs happen per day**. The old third run
+(23:00 ET / Beijing noon) fired at 03:00–04:00 UTC — deep inside peak — and was
+removed purely for AI cost.
 
 ## What it checks (per ticker, per run — only the "delta" since last time)
 
@@ -47,17 +49,19 @@ instant no-op, so exactly **two real runs happen per day**.
    first, before search engines even index it
 5. **EXA (neural search)** — *semantic* search: finds pages ABOUT the
    concept, not just containing the keywords. Used three ways: per-ticker
-   **big/impact news** (a story about "the Shenzhen-based insurer" is caught
-   for Huize), the **macro tier** (semantic — "助贷的生死时刻" style coverage,
-   no regex needed), and **subsidiary discovery** (finds related entities
-   keyword search never surfaces, e.g. 陆金申华 for LU). Free ~1,000
+   **big/impact news**, the **macro tier** (semantic — "助贷的生死时刻" style
+   coverage, no regex needed), and **subsidiary discovery** (finds related
+   entities keyword search never surfaces, e.g. 陆金申华 for LU). Free ~1,000
    searches/month, hard-budgeted (max 32/day, 980/month), skipped for a
-   ticker when free sources already covered it
+   ticker when free sources already covered it. **Neural search also returns
+   the whole sector**, so every per-ticker EXA result must now really mention
+   the company (or a subsidiary/alias) — everything else is dropped before it
+   is stored or scored.
 6. **Baidu News** — best-effort Chinese news search (off by default: Baidu
    serves a CAPTCHA to server IPs, so it rarely returns anything — you can
    re-enable it via `sources.baidu`)
 7. **Tavily** — agent-grade news search (free plan: 1,000 credits/month;
-   budgeted hard: max 15/day, max 850/month, and skipped entirely for a
+   budgeted hard: max 30/day, max 900/month, and skipped entirely for a
    ticker when the free sources already found enough items that run)
 8. **Google News EN** — kept as a low-priority backup, but now also searches
    the company's English brand names (e.g. Fenqile, Temu)
@@ -152,6 +156,67 @@ knowledge base in `company_lookup.json` (on the server):
    - **Upload config to server**, then **Run now (test)**, then check
      **Stored news (Step 5)** to see everything it found.
 
+## Relevance & duplicates — why the digest is short
+
+Every source now passes the same gates **before** anything is stored or sent
+to the AI, and each gate is visible in the run log
+(`HUIZ: 6 kept, 7 filtered out (sector_off=5, unrelated=2).`):
+
+1. **Company relevance.** An item must really mention the company — its
+   Chinese/English name, an alias, a **subsidiary or brand** (分期乐, Fenqile,
+   奇富借条), its ticker as a whole word, or one of its domains. Matched with
+   the anti-substring matcher, so 元保 inside 元保险 still does not count.
+2. **Sector news is not company news.** A story about the *insurance industry*
+   that never names HUIZ is classified `sector` and dropped (an "El Niño is
+   redrawing the insurance industry's risk map" item can no longer reach you
+   as a HUIZ alert). Turn on **`sector_watch`** if you still want that class of
+   item — it then arrives in its own, capped 🏭 SECTOR CONTEXT section instead
+   of being mixed into the stock's items.
+3. **Same-story collapse.** One earnings release used to enter the pipeline
+   4–6 times (GoogleNewsZH + GoogleNews + Tavily + EXA) and fill the digest.
+   Items whose headlines are the same story are now clustered and only the
+   best-sourced copy can compete for a seat; the Chinese original or a filing
+   beats an aggregator. The AI prompt also sees the current batch as a batch,
+   so it flags cross-outlet copies as `known_event`/`duplicate_of`.
+4. **Age gate (`push_max_age_hours`, default 72).** Nothing published longer
+   ago than this is *ever* pushed, whatever the AI scored it — the "Huize
+   results arrived today but the results were days ago" case. It stays in the
+   DB for browsing. Regulatory items are exempt (a penalty is news whenever it
+   surfaces).
+5. **Repeat gate.** Every pushed story is recorded per ticker; a re-report of
+   the same event inside the retention window (new URL, different outlet,
+   near-identical headline) is stored but not pushed again.
+6. **Event guard (`event_repeat_window_days`, default 7).** A corporate EVENT
+   is news once. The updater derives an event key from the ticker, the event
+   type and the **fiscal period** stated in the headline (`earnings:2026Q2`,
+   `dividend`, `connote` …) and pushes it once — every later article about that
+   same event is suppressed for a week, even under a different URL, from a
+   different outlet, or in another language. `Q2 2026`, `2026 Q2`,
+   `Second Quarter 2026`, `第二季度` and `financial results for the quarter ended
+   June 30, 2026` all resolve to the same event, while last quarter's report can
+   never block this quarter's. 0 disables the guard.
+7. **Fair seats.** Seats are handed out **round-robin per ticker**
+   (`push_max_per_ticker`, default 2), so one busy name can no longer take the
+   whole digest while another name with real news gets nothing.
+
+Items the pipeline defers because a run was busy are automatically re-queued
+and analysed by the next run (bounded, so nothing is stranded forever).
+
+## 📢 CHINA MACRO and 🌍 GLOBAL MARKETS are different sections
+
+* **📢 CHINA MACRO** — China policy/market news that moves your names
+  (rate cuts 降息/降准/LPR, stimulus, 助贷/消费金融 regulation, 中概股).
+  The free regex gate needs a **strong China-policy anchor** (or two distinct
+  hits), so a headline that merely says 加息 no longer qualifies.
+* **🌍 GLOBAL MARKETS** — systemic US/global news: the Fed, CPI, payrolls,
+  tariffs, **and other central banks (ECB/BoJ/BoE)**. Off by default
+  (`global_markets`) because it can be chatty; when enabled it is capped
+  (`global_markets_max_per_run`, default 2) and a routine daily index recap is
+  scored low and dropped.
+
+Both sections are sent as their own Telegram message, on top of the per-stock
+digest, so they never eat the digest's 10 seats.
+
 ## No-spam behavior
 
 - Exact dedup (SQLite hash per source+URL).
@@ -167,13 +232,16 @@ knowledge base in `company_lookup.json` (on the server):
   (`news_retention_days` / `seen_retention_days`). Inside the window a
   re-publication is recognized and not re-pushed; after the window it is
   treated as fresh again and reaches you — the behavior you asked for.
+  **Keep `seen_retention_days` equal to `news_retention_days`**: the `seen`
+  ledger is also the AI's "already reported" history, so a longer seen window
+  makes the model suppress genuinely new items as "known".
 - **Importance floor** (`push_min_importance`, default 4): nothing below it is
   pushed, even in "push everything" mode — kills ⭐1–3 noise.
 - **AI veto**: the AI's per-item `push` flag is honored — it can keep an item
   stored-only.
-- **Per-ticker cap** (`push_max_per_ticker`, default 3): one ticker can't eat
-  every digest slot while another name has news (relaxes when it's the only
-  name with news).
+- **Per-ticker cap** (`push_max_per_ticker`, default 2): seats are allocated
+  round-robin per ticker, so one ticker can't eat every digest slot while
+  another name has news.
 - **Regulatory force-push**: headlines containing subsidiary-penalty /
   regulatory keywords (处罚/罚款/立案/约谈/退市… or delisting/fraud/
   investigation) get boosted to ⭐8+ so they're never buried by generic
@@ -196,8 +264,8 @@ Every run prunes the DB:
 ## Tavily budget (free plan: 1,000 searches/month)
 
 1 basic search = 1 credit. The updater budgets hard so you can never blow it:
-- **Daily cap** `tavily_max_daily_searches` (default **15**) → at most ~450/month.
-- **Monthly cap** `tavily_max_monthly_searches` (default **850**) → insurance.
+- **Daily cap** `tavily_max_daily_searches` (default **30**) → at most ~900/month.
+- **Monthly cap** `tavily_max_monthly_searches` (default **900**) → insurance.
 - **Adaptive skip**: if GoogleNews zh + Eastmoney + Baidu already found
   `tavily_min_free_items` (default **4**) new items for a ticker in a run,
   Tavily is skipped for it entirely.
@@ -254,8 +322,8 @@ crontab -l | grep -v news_updater | crontab -
 ## How the schedule stays reliable across DST
 
 - **Four cron jobs** are installed (two runs × two seasons), firing at the
-  correct UTC times for 9:15 and 16:45 ET in summer (EDT) and winter
-  (EST).
+  correct UTC times for **09:15 and 17:00 ET** in summer (EDT) and winter
+  (EST): 13:15/21:00 UTC and 14:15/22:00 UTC.
 - `news_updater.py` has a **DST-aware guard** that skips the out-of-season
   jobs instantly, so exactly **two** real runs per day.
 - The installer also enables the cron daemon at boot and installs Python deps

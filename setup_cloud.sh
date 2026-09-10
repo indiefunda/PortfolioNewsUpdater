@@ -9,18 +9,24 @@
 # What it does:
 #   1. Installs Python deps (requests, feedparser, edgartools)
 #   2. Installs FOUR DST-aware cron jobs that run news_updater.py
-#      twice a day, pinned to US market time (9:15 / 16:45 ET)
+#      twice a day, pinned to US market time:
+#        Run 1  09:15 ET - 15 minutes before the 09:30 ET open
+#        Run 2  17:00 ET - one hour after the 16:00 ET close
 #   3. Runs news_updater.py once (--force --dry-run) to confirm it works
 #
 # Why a cron job per season? US Eastern time shifts by 1 hour between DST
 # seasons, but cron fires at fixed UTC times. So we install one job
 # per run per season:
-#     Summer (EDT, UTC-4): 9:15 ET = 13:15 UTC, 16:45 ET = 20:45 UTC
-#     Winter (EST, UTC-5): 9:15 ET = 14:15 UTC, 16:45 ET = 21:45 UTC
+#     Summer (EDT, UTC-4): 09:15 ET = 13:15 UTC, 17:00 ET = 21:00 UTC
+#     Winter (EST, UTC-5): 09:15 ET = 14:15 UTC, 17:00 ET = 22:00 UTC
 # news_updater.py carries a tiny DST-aware guard that makes the
 # out-of-season job an instant no-op, so exactly two real runs happen
 # per day. This is reliable because cron does the exact timing and the
 # correct job is always already installed - no re-setup at DST flips.
+#
+# Both runs deliberately land OUTSIDE DeepSeek's peak-priced windows
+# (01:00-04:00 / 06:00-10:00 UTC Mon-Fri, when API tokens cost DOUBLE):
+# all four UTC times above are off-peak, so every AI call is half price.
 # ============================================================
 
 set -e
@@ -61,12 +67,8 @@ sudo rm -f /etc/cron.d/news-summer /etc/cron.d/news-winter 2>/dev/null || true
 
 # Compute both seasons' UTC firing times from the SAME source of truth as
 # news_updater.py (America/New_York DST rules). This keeps the schedule
-# correct for every year automatically. Runs (ET): 9:15 (15 min before the
-# 9:30 open) and 16:45 (just after the 16:00 close). Both deliberately land
-# OUTSIDE DeepSeek's peak-pricing windows (01:00-04:00 / 06:00-10:00 UTC
-# Mon-Fri, when API tokens cost DOUBLE): ~14:15 UTC and ~20:45/21:45 UTC are
-# both off-peak (half price). The old 23:00 ET run fired at 03:00/04:00 UTC
-# - deep inside peak - so it was removed to halve the AI bill.
+# correct for every year automatically. Runs (ET): 09:15 (15 min before the
+# 09:30 open) and 17:00 (one hour after the 16:00 close).
 SCHEDULE_JSON="$("$PYTHON" - <<'PYEOF'
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -84,7 +86,7 @@ def cron_fields(month, day, hour, minute):
     return u.strftime("%M"), u.strftime("%H")
 # July 1 = EDT (summer), Jan 1 = EST (winter). Each run gets its OWN line
 # because the minutes differ between runs.
-RUNS = [(9, 15), (16, 45)]
+RUNS = [(9, 15), (17, 0)]
 for season, month, day in (("summer", 7, 1), ("winter", 1, 1)):
     for i, (h, m) in enumerate(RUNS):
         mn, hr = cron_fields(month, day, h, m)
@@ -94,11 +96,15 @@ PYEOF
 )"
 
 # Build the cron lines for a season (one per run; minute/hour from the JSON).
+# NOTE: the loop bound is derived from the RUNS list length (2 runs -> i in
+# 0 1). A hardcoded "0 1 2" silently emitted a THIRD line with empty
+# minute/hour fields, i.e. a malformed cron entry, on every install.
 build_cron() {
   local season="$1" lines="" mn hr
-  for i in 0 1 2; do
+  for i in $(seq 0 $(($(printf '%s\n' "$SCHEDULE_JSON" | grep -c "^${season}_[0-9]*_min=") - 1))); do
     mn="$(printf '%s\n' "$SCHEDULE_JSON" | grep "^${season}_${i}_min=" | cut -d= -f2)"
     hr="$(printf '%s\n' "$SCHEDULE_JSON" | grep "^${season}_${i}_hour=" | cut -d= -f2)"
+    [ -n "$mn" ] && [ -n "$hr" ] || continue
     lines+="$mn $hr * * 1-5 cd $PROJECT_DIR && $PYTHON $MONITOR >> $LOG 2>&1"$'\n'
   done
   printf '%s' "$lines"
@@ -107,7 +113,7 @@ SUMMER_LINES="$(build_cron summer)"
 WINTER_LINES="$(build_cron winter)"
 # NOTE: "$( ... )" strips trailing newlines, so re-terminate explicitly with
 # printf '%s\n' - cron IGNORES (or warns on) a final line without a newline,
-# which would silently drop the LAST run of each season (the 16:45 ET job).
+# which would silently drop the LAST run of each season (the 17:00 ET job).
 echo "  Summer (EDT) cron: $(printf '%s' "$SUMMER_LINES" | tr '\n' '; ')"
 echo "  Winter (EST) cron: $(printf '%s' "$WINTER_LINES" | tr '\n' '; ')"
 
@@ -160,8 +166,8 @@ python3 "$MONITOR" --force --dry-run
 echo ""
 echo "=============================================="
 echo " DONE! The news updater runs twice a day, pinned to US market time:"
-echo "   Run 1: 9:15 ET (15 min before the 9:30 ET open)"
-echo "   Run 2: 16:45 ET (just after the 16:00 ET close)"
+echo "   Run 1: 09:15 ET (15 min before the 09:30 ET open)"
+echo "   Run 2: 17:00 ET (one hour after the 16:00 ET close)"
 echo " Both runs sit outside DeepSeek's peak-priced hours (half-price AI)."
 echo " It auto-adjusts for summer (EDT) and winter (EST)."
 echo ""

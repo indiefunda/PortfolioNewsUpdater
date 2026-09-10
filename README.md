@@ -5,11 +5,18 @@ A personal stock-news monitor that actually finds the news that matters for
 (Google News zh-CN, 东方财富/Eastmoney, the **Eastmoney + Sina 7x24
 real-time news wires**, **EXA neural search**, Tavily) using each company's
 **Chinese name and its subsidiaries** (e.g. LX → 乐信/分期乐/Fenqile, plus
-their official websites), stores everything in a small database, translates +
-scores it with AI (with a "what this means" impact sentence), and pushes only
-the most important items to Telegram — **twice a day**, pinned to US market
-time (DST-aware), with both runs deliberately placed **outside DeepSeek's
-peak-priced hours** so every AI call costs half price.
+their official websites), stores everything in a small database, translates + scores it with AI (with a
+"what this means" impact sentence), and pushes only the most important items
+to Telegram — **twice a day**, pinned to US market time (DST-aware): **09:15 ET**
+before the open and **17:00 ET** an hour after the close, both deliberately
+placed **outside DeepSeek's peak-priced hours** so every AI call costs half
+price.
+
+**Relevance first:** an item must really mention the company (name, alias,
+subsidiary or brand) — sector news that never names it, recycled coverage of
+an event you already have, and cross-outlet copies of the same story are
+dropped or collapsed before they can reach you. A story about the insurance
+industry is not a HUIZ alert.
 
 **The edge:** a penalty to 分期乐, a HK subsidiary's license news, an
 official-site announcement, a flash item on the Chinese wire, a **semantic
@@ -19,8 +26,10 @@ move (rate cuts, stimulus, assisted-loan regulation) pushed in a dedicated
 hours earlier.
 
 - Everything runs on a **free** Google Cloud e2-micro VM ($0).
-- Cost is **$0/month** (see below). No spam: importance floors, per-ticker
-  caps, AI dedup of recycled news, regulatory news force-pushed.
+- Cost is **$0/month** (see below). No spam: company-relevance gate, age gate,
+  same-story collapse, a per-event guard (one earnings release reaches you
+  once, however many outlets cover it), importance floors, per-ticker seat
+  allocation, and regulatory news force-pushed.
 
 ---
 
@@ -31,7 +40,7 @@ hours earlier.
 | Google account + Google Cloud free tier | **$0** | console.cloud.google.com — accept terms, enable billing (free tier never charges; new accounts get $300 trial credit too) |
 | Google Cloud CLI (on the Windows PC) | **$0** | https://cloud.google.com/sdk/docs/install |
 | Telegram bot token + chat id | **$0** | @BotFather creates the bot; @userinfobot gives your chat id |
-| Tavily API key | **$0** | tavily.com free plan = 1,000 searches/month (the app budgets itself: max 15/day, 850/month) |
+| Tavily API key | **$0** | tavily.com free plan = 1,000 searches/month (the app budgets itself: max 30/day, 900/month) |
 | EXA AI key | **$0** | exa.ai free plan ≈ 1,000 semantic searches/month (the app budgets itself: max 32/day, 980/month) |
 | AI key — **DeepSeek (only paid item) OR Gemini free tier** | **$0–$2** | DeepSeek: platform.deepseek.com (tiny top-up, lasts months). **Gemini: aistudio.google.com/apikey → free tier is enough.** Pick it in the panel — AI provider → Gemini |
 
