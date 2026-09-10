@@ -23,6 +23,8 @@ tavily_usage.json
 exa_usage.json
 company_lookup.json
 sec_validate.json
+panel_url.txt
+news_updater.lock
 *.log
 *.tmp
 

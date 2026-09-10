@@ -15,9 +15,12 @@ news files and adds a separate 2x-daily cron job.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -26,6 +29,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config_local.json")
 SECRETS_FILE = os.path.join(BASE_DIR, "secrets_local.json")
 PORT = 8001
+# Written at startup with the URL the panel actually bound to, so the launcher
+# opens THIS panel rather than whatever else is listening on the default port.
+PANEL_URL_FILE = "panel_url.txt"
 
 # VM defaults (reuse the same free VM as the price monitor)
 VM_NAME = "stock-monitor"
@@ -132,6 +138,19 @@ DEFAULT_SECRETS = {
     "tavily_api_key": "",
     "exa_api_key": "",
 }
+# The secret fields the panel round-trips. Placeholder sent to the browser
+# instead of the real value; if an upload echoes it back, the stored key is kept.
+SECRET_KEYS = tuple(DEFAULT_SECRETS.keys())
+SECRET_MASK = "__KEEP__"
+
+# Endpoints that CHANGE something. They are POST-only and Origin-checked so a
+# random web page you visit cannot trigger them with <img src="..."> or a form.
+POST_ONLY_API = ("/api/upload", "/api/delete_news", "/api/auth_code")
+# Endpoints kept for backwards compatibility with older panel builds that issue
+# them as GET; they are refused unless the request is same-origin (see
+# _origin_ok), which is what actually blocks the CSRF/DNS-rebinding vector.
+MUTATING_API = ("/api/auth", "/api/create_vm", "/api/run_now", "/api/purge_junk",
+                "/api/rediscover")
 
 
 def _read_json(path, default):
@@ -144,13 +163,38 @@ def _read_json(path, default):
     return default
 
 
+# Serialises read-modify-write of config/secrets. ThreadingHTTPServer serves
+# each request in its own thread, so two Upload clicks could interleave.
+CONFIG_LOCK = threading.Lock()
+
+
 def _write_json(path, data):
-    """Atomic write (tmp + os.replace) - a crash mid-write must never corrupt
-    config_local.json / secrets_local.json into silently-wiped defaults."""
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+    """
+    Atomic write: a uniquely-named temp file in the SAME directory, then
+    os.replace.
+
+    The old version used a fixed `path + ".tmp"`: two concurrent writers opened
+    and truncated the same file, so one could publish the other's half-written
+    JSON, and the loser raised FileNotFoundError on replace. Because _read_json
+    swallows parse errors and returns the defaults, that corruption showed up as
+    a silently EMPTY panel - which the next upload then pushed to the VM.
+    """
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)) or ".",
+                                   prefix=os.path.basename(path) + ".", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def load_config():
@@ -199,7 +243,15 @@ def gcloud_available():
     return _find_gcloud() is not None
 
 
-def run_gcloud(args, timeout=120):
+def run_gcloud(args, timeout=120, stdin_devnull=False):
+    """
+    Run gcloud and capture its output.
+
+    `stdin_devnull` detaches stdin (DEVNULL). Commands that would otherwise stop
+    and wait for interactive input - `gcloud auth login` asking for a
+    verification code - then fail fast with a clear message instead of hanging
+    until the timeout with no output for the user to act on.
+    """
     gcloud = _find_gcloud()
     if not gcloud:
         return False, "", "gcloud not found. Install the Google Cloud CLI."
@@ -212,12 +264,26 @@ def run_gcloud(args, timeout=120):
         proc = subprocess.run(
             cmd, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=timeout,
+            stdin=subprocess.DEVNULL if stdin_devnull else None,
         )
         return proc.returncode == 0, proc.stdout or "", proc.stderr or ""
     except FileNotFoundError:
         return False, "", "gcloud not found. Install the Google Cloud CLI."
-    except subprocess.TimeoutExpired:
-        return False, "", "Command timed out."
+    except subprocess.TimeoutExpired as exc:
+        # Return whatever gcloud managed to print before it blocked. This is
+        # how the `gcloud auth login` URL is captured: gcloud prints it and
+        # then waits for a verification code that only the browser knows.
+        partial_out = exc.stdout or ""
+        partial_err = exc.stderr or ""
+        if isinstance(partial_out, bytes):
+            partial_out = partial_out.decode("utf-8", "replace")
+        if isinstance(partial_err, bytes):
+            partial_err = partial_err.decode("utf-8", "replace")
+        return False, partial_out, (partial_err
+                                    or "Command timed out (still waiting?).")
+    except OSError as exc:
+        # e.g. the interpreter could not spawn the process at all
+        return False, "", f"Could not run gcloud: {exc}"
 
 
 def get_project():
@@ -269,6 +335,38 @@ def vm_status():
     return None
 
 
+def ensure_vm_running(zone):
+    """
+    Make sure the VM is RUNNING before we try to SSH into it.
+
+    A stopped instance reports TERMINATED; every SSH then fails with a raw
+    gcloud error, which reads as a broken panel instead of "your server is
+    switched off". Starting it takes ~20s and is a no-op when it is already up.
+    Returns (ok, message).
+    """
+    status = (vm_status() or "").upper()
+    if not status:
+        return False, "Could not determine the server status."
+    if status == "RUNNING":
+        return True, ""
+    if status in ("TERMINATED", "STOPPED", "SUSPENDED"):
+        print(f"  server is {status} - starting it...")
+        ok, out, err = run_gcloud(
+            ["compute", "instances", "start", VM_NAME, "--zone", zone, "--quiet"],
+            timeout=180)
+        if not ok:
+            return False, ("The server is %s and could not be started: %s"
+                           % (status, (err or out).strip()[:300]))
+        status = (vm_status() or "").upper()
+        if status != "RUNNING":
+            return False, ("The server was started but is still %s - try again in a "
+                           "minute." % status)
+        return True, ""
+    if status in ("STAGING", "PROVISIONING", "REPAIRING"):
+        return False, ("The server is %s - give it a minute and try again." % status)
+    return True, ""
+
+
 def get_vm_home(zone):
     ok, home, _ = run_gcloud([
         "compute", "ssh", "--zone", zone, VM_NAME,
@@ -280,24 +378,34 @@ def get_vm_home(zone):
 
 
 def fetch_vm_run_history():
+    """Return (logs, error). A missing list and an unreachable VM are NOT the
+    same thing, and the old version collapsed both into an empty list, so the UI
+    could not tell "never ran" from "cannot reach the server"."""
     zone = find_vm_zone()
     if not zone:
-        return []
+        return [], "No server found."
     home = get_vm_home(zone)
     ok, out, err = run_gcloud([
         "compute", "ssh", "--zone", zone, VM_NAME,
         "--command", f"cat {home}/news_run_history.json 2>/dev/null || echo '[]'",
         "--quiet"], timeout=60)
     if not ok:
-        return []
+        return [], (err or out or "Could not read the run history.").strip()[:300]
     try:
         data = json.loads(out)
-        return data if isinstance(data, list) else []
+        return (data if isinstance(data, list) else []), ""
     except Exception:
-        return []
+        return [], "The run history on the server is not valid JSON."
 
 
 def fetch_vm_cron_status():
+    """
+    Report what is actually scheduled.
+
+    Two things the old version got wrong: it only inspected the USER crontab
+    (so a working /etc/cron.d install read as "not installed"), and it treated
+    the mere presence of a line as "armed" even when the cron daemon was dead.
+    """
     zone = find_vm_zone()
     if not zone:
         return None
@@ -308,12 +416,17 @@ def fetch_vm_cron_status():
     cron_active = active.strip() if ok_active else "unknown"
     ok, out, _ = run_gcloud([
         "compute", "ssh", "--zone", zone, VM_NAME,
-        "--command", "crontab -l 2>/dev/null | grep 'news_updater.py' || true",
+        "--command", ("crontab -l 2>/dev/null | grep -F news_updater; "
+                      "sudo cat /etc/cron.d/news-summer /etc/cron.d/news-winter "
+                      "2>/dev/null | grep -F news_updater; true"),
         "--quiet"], timeout=60)
     cron_line = out.strip() if ok else ""
     installed = bool(cron_line)
+    daemon_ok = cron_active == "active"
     return {
-        "active": "active" if installed else "inactive",
+        # "active" only when jobs exist AND the daemon can run them.
+        "active": "active" if (installed and daemon_ok) else "inactive",
+        "installed": installed,
         "cron_daemon_active": cron_active,
         "cron_line": cron_line,
     }
@@ -404,7 +517,15 @@ HTML = """<!DOCTYPE html>
     <h2>1. Connect to Google</h2>
     <div class="status" id="authStatus">Checking...</div>
     <button class="btn-ghost" onclick="authGoogle()">🔑 Authenticate to Google</button>
-    <div class="hint">Opens Google's login page in your browser. If nothing opens, copy the printed URL.</div>
+    <div id="authFlow" style="display:none;margin-top:10px">
+      <div class="hint">1. Open this URL if your browser did not open it:</div>
+      <input id="authUrl" readonly style="width:100%;font-size:11px;font-family:monospace">
+      <div class="row" style="margin-top:8px">
+        <input id="authCode" placeholder="2. Paste the verification code Google shows you" style="flex:1">
+        <button class="btn-ok" onclick="submitAuthCode()">✔ Finish login</button>
+      </div>
+    </div>
+    <div class="hint">Google asks you to copy a code back here. Nothing to type if the browser opened it and you already authorized.</div>
   </div>
 
   <div class="card">
@@ -577,22 +698,51 @@ async function load(){
   $('aiModel').value = d.config.ai_model || 'deepseek-v4-flash';
   $('aiBase').value = d.config.ai_base_url || 'https://api.deepseek.com';
   $('enabledToggle').checked = !!d.config.enabled;
-  $('token').value = d.secrets.telegram_bot_token || '';
-  $('chatid').value = d.secrets.telegram_chat_id || '';
-  $('aikey').value = d.secrets.ai_api_key || '';
-  $('tavilyKey').value = d.secrets.tavily_api_key || '';
-  $('exaKey').value = d.secrets.exa_api_key || '';
+  // The server never sends real secrets any more - only a "configured" mask.
+  // If the field is left untouched we send the mask back, which tells the
+  // server to KEEP the stored key; typing a value replaces it.
+  fillSecret('token', d.secrets.telegram_bot_token);
+  fillSecret('chatid', d.secrets.telegram_chat_id);
+  fillSecret('aikey', d.secrets.ai_api_key);
+  fillSecret('tavilyKey', d.secrets.tavily_api_key);
+  fillSecret('exaKey', d.secrets.exa_api_key);
   $('tickerMeta').value = JSON.stringify(d.config.ticker_meta || {}, null, 2);
   $('pushMode').value = d.config.push_mode || 'all';
-  $('pushMinScore').value = d.config.push_min_score || 7;
-  $('pushMinImportance').value = d.config.push_min_importance || 4;
-  $('pushMaxPerTicker').value = d.config.push_max_per_ticker || 3;
-  $('retentionDays').value = d.config.news_retention_days || 21;
-  $('tavilyDaily').value = d.config.tavily_max_daily_searches || 15;
-  $('tavilyMonthly').value = d.config.tavily_max_monthly_searches || 850;
-  $('tavilyMinFree').value = d.config.tavily_min_free_items || 4; window._exaDaily = d.config.exa_max_daily_searches || 32; window._exaMonthly = d.config.exa_max_monthly_searches || 980;
+  // Defaults come from the server's DEFAULT_CONFIG, so the three places that
+  // used to disagree (2 vs 3, 30 vs 15, 900 vs 850) can no longer drift.
+  const dflt = d.defaults || {};
+  $('pushMinScore').value = d.config.push_min_score || dflt.push_min_score || 7;
+  $('pushMinImportance').value = d.config.push_min_importance || dflt.push_min_importance || 4;
+  $('pushMaxPerTicker').value = d.config.push_max_per_ticker || dflt.push_max_per_ticker || 2;
+  $('retentionDays').value = d.config.news_retention_days || dflt.news_retention_days || 21;
+  $('tavilyDaily').value = d.config.tavily_max_daily_searches || dflt.tavily_max_daily_searches || 30;
+  $('tavilyMonthly').value = d.config.tavily_max_monthly_searches || dflt.tavily_max_monthly_searches || 900;
+  $('tavilyMinFree').value = d.config.tavily_min_free_items || dflt.tavily_min_free_items || 4;
+  window._exaDaily = d.config.exa_max_daily_searches || dflt.exa_max_daily_searches || 32;
+  window._exaMonthly = d.config.exa_max_monthly_searches || dflt.exa_max_monthly_searches || 980;
+  // These have no input in the form, but they are real settings: carry the
+  // current values through the upload so they are not silently reset.
+  window._lookback = d.config.initial_lookback_hours || dflt.initial_lookback_hours || 24;
+  window._maxItems = d.config.max_items_per_run || dflt.max_items_per_run || 40;
+  window._maxDigest = d.config.max_digest_items || dflt.max_digest_items || 10;
   renderChips();
   refreshStatus(); loadCron(); loadLogs(); loadUsage();
+}
+
+// A secret input: show a placeholder when one is stored, and mark it so save()
+// knows the user did not replace it.
+const SECRET_MASK = '__KEEP__';
+function fillSecret(id, value){
+  const el = $(id);
+  el.value = (value === SECRET_MASK) ? '' : (value || '');
+  el.placeholder = (value === SECRET_MASK) ? '•••••••• (saved - type to replace)' : '';
+  el.dataset.saved = (value === SECRET_MASK) ? '1' : '';
+}
+function secretValue(id){
+  const el = $(id);
+  const v = el.value.trim();
+  if(!v && el.dataset.saved) return SECRET_MASK;   // untouched -> keep stored key
+  return v;                                        // typed, or deliberately cleared
 }
 
 async function refreshStatus(){
@@ -606,13 +756,33 @@ async function refreshStatus(){
   else { v.innerHTML = '<span class="dot '+(d.vm==='RUNNING'?'green':'gray')+'"></span><b>Server status:</b> '+d.vm; }
 }
 
-async function authGoogle(){ showMsg('Opening Google login in your browser...','ok');
-  const d = await api('/api/auth'); showMsg(d.ok ? '✅ Connected to Google!' : '❌ '+d.error, d.ok?'ok':'err');
-  refreshStatus(); }
+async function authGoogle(){
+  showMsg('Starting Google login...','ok');
+  $('authFlow').style.display = 'none';
+  const d = await api('/api/auth', {});
+  if(d.authed){ showMsg('✅ Already connected'+(d.account?' as '+d.account:''),'ok'); refreshStatus(); return; }
+  if(d.url){
+    $('authUrl').value = d.url;
+    $('authFlow').style.display = 'block';
+    showMsg('Open the URL below, then paste the code Google gives you.','ok');
+  } else {
+    showMsg('❌ Could not start the login'+(d.output?': '+d.output.slice(0,160):''),'err');
+  }
+}
+
+async function submitAuthCode(){
+  const code = ($('authCode').value || '').trim();
+  if(!code){ showMsg('Paste the verification code first.','err'); return; }
+  showMsg('Finishing login...','ok');
+  const d = await api('/api/auth_code', {code});
+  if(d.ok){ showMsg('✅ Connected'+(d.account?' as '+d.account:''),'ok'); $('authFlow').style.display='none'; }
+  else { showMsg('❌ '+(d.error||'login failed'),'err'); }
+  refreshStatus();
+}
 
 async function createVM(){
   showMsg('Creating/updating your free server...','ok');
-  const d = await api('/api/create_vm');
+  const d = await api('/api/create_vm', {});
   $('log').textContent = d.output || '';
   showMsg(d.ok ? '✅ Server ready!' : '❌ '+d.error, d.ok?'ok':'err');
   refreshStatus(); }
@@ -626,17 +796,20 @@ async function uploadConfig(){
     tickers, enabled: $('enabledToggle').checked,
     ai_provider: $('aiProvider').value, ai_model: $('aiModel').value.trim(),
     ai_base_url: $('aiBase').value.trim(),
-    telegram_bot_token: $('token').value.trim(), telegram_chat_id: $('chatid').value.trim(),
-    ai_api_key: $('aikey').value.trim(), tavily_api_key: $('tavilyKey').value.trim(),
-    exa_api_key: $('exaKey').value.trim(),
+    telegram_bot_token: secretValue('token'), telegram_chat_id: secretValue('chatid'),
+    ai_api_key: secretValue('aikey'), tavily_api_key: secretValue('tavilyKey'),
+    exa_api_key: secretValue('exaKey'),
     ticker_meta: tickerMeta,
     push_mode: $('pushMode').value, push_min_score: parseInt($('pushMinScore').value)||7,
     push_min_importance: parseInt($('pushMinImportance').value)||4,
-    push_max_per_ticker: parseInt($('pushMaxPerTicker').value)||3,
+    push_max_per_ticker: parseInt($('pushMaxPerTicker').value)||2,
     news_retention_days: parseInt($('retentionDays').value)||21,
-    tavily_max_daily_searches: parseInt($('tavilyDaily').value)||15,
-    tavily_max_monthly_searches: parseInt($('tavilyMonthly').value)||850,
+    tavily_max_daily_searches: parseInt($('tavilyDaily').value)||30,
+    tavily_max_monthly_searches: parseInt($('tavilyMonthly').value)||900,
     tavily_min_free_items: parseInt($('tavilyMinFree').value)||4,
+    initial_lookback_hours: window._lookback || undefined,
+    max_items_per_run: window._maxItems || undefined,
+    max_digest_items: window._maxDigest || undefined,
     lookup_refresh_days: 30,
   });
   $('log').textContent = d.output || '';
@@ -665,7 +838,7 @@ async function loadNews(){
 async function purgeJunk(){
   if(!confirm('Delete all STORED (never-pushed) items scored <= 2? This cleans out old filter-gap junk (Heineken for LX, etc.). Pushed items and higher-scored stored items are kept.')) return;
   $('newsStatus').textContent = '🧹 Purging junk on the server...';
-  const d = await api('/api/purge_junk');
+  const d = await api('/api/purge_junk', {});
   $('newsStatus').textContent = d.ok ? '✅ '+d.output : '❌ '+(d.error||'failed');
   loadNews();
 }
@@ -730,7 +903,7 @@ async function loadLookup(){
 async function rediscover(){
   if(!confirm('Force a re-discovery of all tickers now? (~1-2 Tavily searches + 1 AI call per ticker; new subsidiaries will be alerted on Telegram)')) return;
   $('lookupStatus').textContent = '🔍 Re-discovering subsidiaries on the server...';
-  const d = await api('/api/rediscover');
+  const d = await api('/api/rediscover', {});
   $('lookupStatus').textContent = d.ok ? '✅ Discovery done: '+d.output : '❌ '+(d.error||'failed');
   loadLookup();
 }
@@ -742,16 +915,18 @@ async function loadCron(){
   if(!c){ el.innerHTML='<span class="dot gray"></span><b>Could not reach server.</b>'; return; }
   const daemon = String(c.cron_daemon_active||'').trim();
   if(c.active === 'active'){
-    el.innerHTML = '<span class="dot green"></span><b>Schedule armed (2x daily, US market time).</b> Runs at 9:15 ET (15 min before the open) and 17:00 ET (1 hour after the close). Both are outside DeepSeek peak pricing; auto-adjusts for DST. cron: '+
-      (daemon==='active'?'running':'NOT running')+'<br><span style="color:var(--muted)">'+escapeHtml(c.cron_line||'')+'</span>';
+    el.innerHTML = '<span class="dot green"></span><b>Schedule armed (2x daily, US market time).</b> Runs at 9:15 ET (15 min before the open) and 17:00 ET (1 hour after the close). Both are outside DeepSeek peak pricing; auto-adjusts for DST.<br><span style="color:var(--muted)">'+escapeHtml(c.cron_line||'')+'</span>';
+  } else if(c.installed && daemon !== 'active'){
+    // Jobs exist but cron cannot run them - say so instead of "not installed".
+    el.innerHTML = '<span class="dot red"></span><b>Schedule installed but the cron daemon is '+escapeHtml(daemon||'not running')+'.</b> Fix on the server: <code>sudo systemctl enable --now cron</code><br><span style="color:var(--muted)">'+escapeHtml(c.cron_line||'')+'</span>';
   } else {
-    el.innerHTML = '<span class="dot red"></span><b>Schedule not installed.</b> Upload config (Step 3) to install it. cron: '+(daemon==='active'?'running':'NOT running');
+    el.innerHTML = '<span class="dot red"></span><b>Schedule not installed.</b> Upload config (Step 3) to install it. cron: '+escapeHtml(daemon||'unknown');
   }
 }
 
 async function runNow(withSnapshot){
   showMsg('Running the real updater on the server now...','ok');
-  const d = await api('/api/run_now' + (withSnapshot ? '?snapshot=1' : ''));
+  const d = await api('/api/run_now' + (withSnapshot ? '?snapshot=1' : ''), {snapshot: withSnapshot?1:0});
   $('log').textContent = d.output || '';
   // Reflect what actually happened instead of a generic "test works" message.
   const out = d.output || '';
@@ -767,6 +942,8 @@ async function loadLogs(){
   const d = await api('/api/logs');
   const logs = d.logs || [];
   const wrap = $('logTableWrap');
+  // "No runs yet" and "cannot reach the server" used to look identical.
+  if(d.error){ $('logStatus').textContent = '❌ '+d.error; wrap.innerHTML='<div class="empty">'+escapeHtml(d.error)+'</div>'; return; }
   if(!logs.length){ $('logStatus').textContent='No runs recorded yet.'; wrap.innerHTML='<div class="empty">No run history yet.</div>'; return; }
   $('logStatus').textContent = logs.length + ' run(s) recorded.';
   let rows='';
@@ -798,24 +975,106 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass   # the browser navigated away mid-response; not an error
 
     def _send_html(self, html):
         body = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _origin_ok(self):
+        """
+        Reject requests that did not come from the panel itself.
+
+        Binding to 127.0.0.1 does NOT protect a local server from the browser:
+        a page on evil.com can point its own hostname at 127.0.0.1
+        (DNS rebinding), at which point it is same-origin and can both read
+        /api/* and POST to it. So every request must present a loopback Host
+        header, and any Origin/Referer that IS present must be the panel's own
+        origin. A plain `fetch` from the panel sends no Origin for same-origin
+        GETs but does send it for POSTs; a cross-site page always sends one.
+        """
+        def host_of(value):
+            try:
+                return (urlparse(value).hostname or "").lower()
+            except Exception:
+                return ""
+
+        host = str(self.headers.get("Host") or "")
+        host = host.split(":")[0].strip().lower()
+        if host not in ("127.0.0.1", "localhost", "[::1]", "::1"):
+            self._send_json({"ok": False, "error":
+                             "Refused: this endpoint only answers requests addressed "
+                             "to localhost."}, 403)
+            return False
+        for header in ("Origin", "Referer"):
+            value = self.headers.get(header)
+            if value and host_of(value) not in ("127.0.0.1", "localhost", "::1", ""):
+                self._send_json({"ok": False, "error":
+                                 "Refused: cross-site request blocked (Origin %s)."
+                                 % host_of(value)}, 403)
+                return False
+        return True
+
+    def _read_json_body(self):
+        """Read+parse a JSON body, returning (data, error_message)."""
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            return None, "Bad Content-Length header."
+        if length < 0 or length > 8 * 1024 * 1024:
+            return None, "Request body missing or too large."
+        try:
+            raw = self.rfile.read(length).decode("utf-8") if length else ""
+            return (json.loads(raw) if raw.strip() else {}), None
+        except Exception as exc:
+            return None, "Could not parse the request body as JSON (%s)." % exc
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if not self._origin_ok():
+            return
+        if parsed.path in POST_ONLY_API:
+            # Mutating endpoints must not be reachable by a plain GET/<img>.
+            self._send_json({"ok": False, "error":
+                             "This endpoint requires POST."}, 405)
+            return
+        if parsed.path in MUTATING_API and self.headers.get("Origin"):
+            # Keep old panel builds working, but never from a foreign origin.
+            self._send_json({"ok": False, "error":
+                             "Cross-origin request blocked. Reload the panel."}, 403)
+            return
         if parsed.path in ("/", "/index.html"):
             self._send_html(HTML)
         elif parsed.path == "/api/config":
-            self._send_json({"config": load_config(), "secrets": load_secrets()})
+            # NEVER return the real secrets. This endpoint is readable by any
+            # page that can reach the panel (DNS rebinding makes 127.0.0.1
+            # reachable from a remote origin), so the response only says WHICH
+            # keys are set. The form shows them masked; /api/upload keeps a key
+            # that the request omits or echoes back as the mask.
+            secrets = load_secrets()
+            masked = {}
+            for key in SECRET_KEYS:
+                value = str(secrets.get(key) or "")
+                masked[key] = SECRET_MASK if value else ""
+            self._send_json({"config": load_config(), "secrets": masked,
+                             "secrets_masked": True,
+                             # Single source of truth for the form's fallbacks.
+                             "defaults": DEFAULT_CONFIG})
         elif parsed.path == "/api/status":
             self._send_json({
                 "gcloud": gcloud_available(),
@@ -823,29 +1082,83 @@ class Handler(BaseHTTPRequestHandler):
                 "vm": vm_status(),
             })
         elif parsed.path == "/api/logs":
-            self._send_json({"ok": True, "logs": fetch_vm_run_history()})
+            logs, logs_error = fetch_vm_run_history()
+            self._send_json({"ok": not logs_error, "logs": logs,
+                             "error": logs_error})
         elif parsed.path == "/api/cron":
             self._send_json({"ok": True, "cron": fetch_vm_cron_status()})
-        elif parsed.path == "/api/auth":
-            ok, out, err = run_gcloud(["auth", "login", "--no-launch-browser",
-                                       "--brief"], timeout=300)
-            self._send_json({"ok": ok, "error": err or ("" if ok else out), "output": out + err})
-        elif parsed.path == "/api/create_vm":
-            self._handle_create_vm()
-        elif parsed.path == "/api/run_now":
-            self._handle_run_now(snapshot="snapshot=1" in parsed.query)
         elif parsed.path == "/api/news":
             self._handle_news()
         elif parsed.path == "/api/lookup":
             self._handle_lookup()
         elif parsed.path == "/api/tavily":
             self._handle_tavily_usage()
-        elif parsed.path == "/api/purge_junk":
-            self._handle_purge_junk()
-        elif parsed.path == "/api/rediscover":
-            self._handle_rediscover()
         else:
             self._send_json({"error": "not found"}, 404)
+
+    def _handle_auth(self):
+        """
+        Start `gcloud auth login` and return the URL to the PANEL.
+
+        The old flow used `--no-launch-browser --brief` and captured the URL
+        into a pipe while rendering only ok/error, so the URL was never shown:
+        clicking Authenticate opened nothing, printed nothing, and blocked until
+        the 300s timeout with no way forward.
+
+        Now the URL comes back to the browser (and we try to open it too), and
+        the panel posts the verification code to /api/auth_code, which is what
+        actually completes the login. gcloud is expected to block waiting for
+        stdin, so `run_gcloud` returns the output it printed before timing out.
+        """
+        url = None
+        ok, out, err = run_gcloud(
+            ["auth", "login", "--no-launch-browser", "--brief"], timeout=25)
+        text = ((out or "") + "\n" + (err or "")).strip()
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("https://"):
+                url = line
+                break
+        if url:
+            try:
+                if os.name == "nt":
+                    os.startfile(url)                       # noqa: S606
+                else:
+                    subprocess.Popen(["xdg-open", url],
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+            except Exception:
+                pass   # the URL is shown in the panel either way
+        auto = auth_status()
+        self._send_json({"ok": True, "url": url,
+                         "authed": bool(auto.get("authed")),
+                         "account": auto.get("account"),
+                         "output": text[-800:]})
+
+    def _handle_auth_code(self):
+        """Finish `gcloud auth login` with the code the browser displayed."""
+        data, error = self._read_json_body()
+        if error:
+            self._send_json({"ok": False, "error": error}, 400)
+            return
+        code = str((data or {}).get("code") or "").strip()
+        if not code:
+            self._send_json({"ok": False, "error": "No verification code given."}, 400)
+            return
+        # A code is a short opaque token. Validate it here because it becomes a
+        # process argument (never passed through a shell).
+        if not re.fullmatch(r"[A-Za-z0-9_/+\-=]{4,256}", code):
+            self._send_json({"ok": False, "error":
+                             "That does not look like a verification code."}, 400)
+            return
+        ok, out, err = run_gcloud(
+            ["auth", "login", "--no-launch-browser", "--brief", code],
+            timeout=120, stdin_devnull=True)
+        status = auth_status()
+        self._send_json({"ok": bool(ok and status.get("authed")),
+                         "account": status.get("account"),
+                         "error": "" if ok else ((err or out).strip()[-400:]),
+                         "output": ((out or "") + (err or "")).strip()[-400:]})
 
     def _handle_create_vm(self):
         project = get_project()
@@ -898,6 +1211,9 @@ class Handler(BaseHTTPRequestHandler):
         zone = find_vm_zone()
         if not zone:
             return False, "", "VM not found."
+        running, why = ensure_vm_running(zone)
+        if not running:
+            return False, "", why
         home = get_vm_home(zone)
         out, err = "", ""
         files = ["news_updater.py", "requirements.txt", "setup_cloud.sh",
@@ -907,13 +1223,18 @@ class Handler(BaseHTTPRequestHandler):
             if os.path.exists(src):
                 ok, o, e = run_gcloud([
                     "compute", "scp", "--zone", zone, src,
-                    f"{VM_NAME}:{home}/", "--quiet"], timeout=120)
+                    f"{VM_NAME}:{home}/", "--quiet"], timeout=180)
                 out += o; err += e
                 if not ok:
-                    return False, out, err
+                    return False, out, (err + "\n" +
+                                        "Upload failed while copying %s." % f)
+        # This runs `apt-get update` + a pip install of edgartools + the cron
+        # install, which on an e2-micro routinely exceeds 5 minutes; the old
+        # 300s limit killed the LOCAL gcloud while the remote work continued,
+        # so the retry then failed on a dpkg lock that looked unrelated.
         ok, o, e = run_gcloud([
             "compute", "ssh", "--zone", zone, VM_NAME,
-            "--command", "cd ~ && bash setup_cloud.sh", "--quiet"], timeout=300)
+            "--command", "cd ~ && bash setup_cloud.sh", "--quiet"], timeout=900)
         out += o; err += e
         return ok, out, err
 
@@ -922,12 +1243,19 @@ class Handler(BaseHTTPRequestHandler):
         if not zone:
             self._send_json({"ok": False, "error": "VM not found. Create the server first."})
             return
+        running, why = ensure_vm_running(zone)
+        if not running:
+            self._send_json({"ok": False, "error": why})
+            return
         home = get_vm_home(zone)
         extra = " --snapshot" if snapshot else ""
+        # A real run takes ~5-15 minutes on an e2-micro (the run history shows
+        # up to ~18 min on busy days), so allow a generous margin instead of the
+        # old 600s, which could cut a run off mid-flight.
         ok, out, err = run_gcloud([
             "compute", "ssh", "--zone", zone, VM_NAME,
             "--command", f"cd {home} && python3 news_updater.py --force{extra} 2>&1",
-            "--quiet"], timeout=600)
+            "--quiet"], timeout=1800)
         self._send_json({"ok": ok, "error": (err or "") if not ok else "", "output": out + err})
 
     def _handle_news(self):
@@ -1038,11 +1366,9 @@ class Handler(BaseHTTPRequestHandler):
         if not zone:
             self._send_json({"ok": False, "error": "VM not found. Create the server first."})
             return
-        length = int(self.headers.get("Content-Length", 0))
-        try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-        except Exception:
-            self._send_json({"ok": False, "error": "Bad request body."})
+        payload, error = self._read_json_body()
+        if error:
+            self._send_json({"ok": False, "error": error}, 400)
             return
 
         def clean(value, allowed, maxlen):
@@ -1079,12 +1405,53 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if not self._origin_ok():
+            return
+        # Mutating routes are POST-only: a foreign page can still make a simple
+        # POST, but it cannot do so with a JSON content type without a CORS
+        # preflight it will fail, and _origin_ok has already rejected it.
+        if parsed.path == "/api/run_now":
+            self._handle_run_now(snapshot="snapshot=1" in parsed.query)
+            return
+        if parsed.path == "/api/create_vm":
+            self._handle_create_vm()
+            return
+        if parsed.path == "/api/purge_junk":
+            self._handle_purge_junk()
+            return
+        if parsed.path == "/api/rediscover":
+            self._handle_rediscover()
+            return
+        if parsed.path == "/api/auth":
+            self._handle_auth()
+            return
+        if parsed.path == "/api/auth_code":
+            self._handle_auth_code()
+            return
         if parsed.path == "/api/delete_news":
             self._handle_delete_news()
             return
         if parsed.path == "/api/upload":
-            length = int(self.headers.get("Content-Length", 0))
-            data = json.loads(self.rfile.read(length).decode("utf-8"))
+            data, error = self._read_json_body()
+            if error:
+                self._send_json({"ok": False, "error": error}, 400)
+                return
+            # One upload at a time: the read-modify-write below must not
+            # interleave with a second click, and the deploy that follows is
+            # heavy (scp + ssh) so a duplicate is almost certainly accidental.
+            if not CONFIG_LOCK.acquire(blocking=False):
+                self._send_json({"ok": False, "error":
+                                 "Another upload is already running - wait for it "
+                                 "to finish."}, 409)
+                return
+            try:
+                self._handle_upload(data)
+            finally:
+                CONFIG_LOCK.release()
+            return
+        self._send_json({"error": "not found"}, 404)
+
+    def _handle_upload(self, data):
             cfg = load_config(); secrets = load_secrets()
             # Sanitize tickers (A-Z 0-9 . -) - also blocks HTML/JS injection.
             cfg["tickers"] = [
@@ -1114,33 +1481,53 @@ class Handler(BaseHTTPRequestHandler):
             cfg["ticker_meta"] = data.get("ticker_meta", cfg.get("ticker_meta", {})) or {}
             cfg["push_mode"] = data.get("push_mode", cfg.get("push_mode", "all"))
             for key, default in (("push_min_score", 7), ("push_min_importance", 4),
-                                 ("push_max_per_ticker", 3), ("news_retention_days", 21),
-                                 ("tavily_max_daily_searches", 15),
-                                 ("tavily_max_monthly_searches", 850),
+                                 ("push_max_per_ticker", DEFAULT_CONFIG["push_max_per_ticker"]),
+                                 ("news_retention_days", 21),
+                                 ("tavily_max_daily_searches",
+                                  DEFAULT_CONFIG["tavily_max_daily_searches"]),
+                                 ("tavily_max_monthly_searches",
+                                  DEFAULT_CONFIG["tavily_max_monthly_searches"]),
                                  ("tavily_min_free_items", 4)):
                 if key in data:
                     try:
                         cfg[key] = int(data[key])
                     except (TypeError, ValueError):
                         pass
-            secrets["telegram_bot_token"] = data.get("telegram_bot_token", "")
-            secrets["telegram_chat_id"] = data.get("telegram_chat_id", "")
-            secrets["ai_api_key"] = data.get("ai_api_key", "")
-            secrets["tavily_api_key"] = data.get("tavily_api_key", "")
-            secrets["exa_api_key"] = data.get("exa_api_key", "")
+            # Secrets: ONLY overwrite a key the request actually carries.
+            # `data.get(key, "")` used to erase any field the browser did not
+            # send - and since the panel fills these inputs from /api/config, a
+            # single failed config load left them empty and one "Upload config"
+            # click wiped the Telegram token and all three API keys, locally and
+            # on the VM. An empty string still means "clear this key" (the user
+            # deliberately emptied the box), but a MISSING key means "keep it".
+            # The mask sentinel means "the field still shows the saved value".
+            for key in SECRET_KEYS:
+                if key not in data:
+                    continue                      # omitted -> keep stored value
+                value = str(data[key] or "").strip()
+                if value == SECRET_MASK:
+                    continue                      # untouched masked field
+                secrets[key] = value
             save_config(cfg); save_secrets(secrets)
             project = get_project()
             if not project:
-                self._send_json({"ok": False, "error":
-                                 "No Google Cloud project found. First open "
+                self._send_json({"ok": False, "saved_locally": True, "error":
+                                 "Config saved on this PC, but no Google Cloud project was "
+                                 "found so nothing was uploaded. First open "
                                  "https://console.cloud.google.com once, accept the terms and "
                                  "enable billing (the Always-Free tier stays free), then click "
                                  "Authenticate again."})
                 return
             ok, out, err = self._deploy_to_vm(project)
-            self._send_json({"ok": ok, "error": err or ("" if ok else out), "output": out + err})
-        else:
-            self._send_json({"error": "not found"}, 404)
+            # Make the two states explicit: local config is written BEFORE the
+            # deploy, so a failed upload must not read as a total failure (the
+            # user's edits were in fact saved).
+            msg = err or ("" if ok else out)
+            if not ok:
+                msg = ("Config saved on this PC, but uploading to the server FAILED. "
+                       "The server is still running the previous configuration.\n\n" + msg)
+            self._send_json({"ok": ok, "saved_locally": True, "error": msg,
+                             "output": out + err})
 
 
 def main():
@@ -1150,18 +1537,43 @@ def main():
         print(" Install it: https://cloud.google.com/sdk/docs/install")
         print("=" * 50)
         return
-    port = PORT
-    # Bind only to loopback so the panel (which serves API keys) is never
-    # reachable from other machines on the network.
+    # Bind only to loopback so the panel is not reachable from other machines.
+    # (Note: loopback alone does NOT stop a browser from reaching it - see
+    # _origin_ok, which validates Host/Origin on every request.)
     HOST = "127.0.0.1"
+    server = None
+    port = PORT
+    for candidate in (PORT, 8002, 8003):
+        try:
+            server = ThreadingHTTPServer((HOST, candidate), Handler)
+            port = candidate
+            break
+        except OSError as exc:
+            print(f"  port {candidate} unavailable ({exc}); trying the next one...")
+    if server is None:
+        print("=" * 50)
+        print(" Could not start: ports 8001-8003 are all in use.")
+        print(" Close whatever is using them and run this again.")
+        print("=" * 50)
+        return
+    if port != PORT:
+        print(f"  NOTE: using port {port} instead of {PORT}.")
+    url = f"http://localhost:{port}"
+    # Record the REAL url so start_cloud.bat opens this panel and not whatever
+    # else happens to be listening on the default port.
     try:
-        server = ThreadingHTTPServer((HOST, port), Handler)
+        with open(os.path.join(BASE_DIR, PANEL_URL_FILE), "w", encoding="utf-8") as f:
+            f.write(url)
     except OSError:
-        port = 8002
-        server = ThreadingHTTPServer((HOST, port), Handler)
-    print(f"PortfolioNewsUpdater panel: http://localhost:{port}")
+        pass
+    print(f"PortfolioNewsUpdater panel: {url}")
     print("Press Ctrl+C to stop.")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

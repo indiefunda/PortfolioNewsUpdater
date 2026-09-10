@@ -40,6 +40,7 @@ Reads config_local.json and secrets_local.json (both git-ignored), plus the
 auto-grown company_lookup.json and tavily_usage.json (also git-ignored).
 """
 
+import base64
 import hashlib
 import html
 import json
@@ -79,6 +80,8 @@ SECRETS_FILE = os.path.join(BASE_DIR, "secrets_local.json")
 DB_FILE = os.path.join(BASE_DIR, "news.db")
 RUN_HISTORY_FILE = os.path.join(BASE_DIR, "news_run_history.json")
 TAVILY_USAGE_FILE = os.path.join(BASE_DIR, "tavily_usage.json")
+# Exclusive-run marker (flock); see acquire_run_lock().
+RUN_LOCK_FILE = "news_updater.lock"
 
 EASTERN = ZoneInfo("America/New_York")
 # Wall-clock zone for the Chinese sources (Eastmoney search / 7x24 wire, Sina
@@ -154,6 +157,12 @@ EXA_MAX_MONTHLY_SEARCHES = 980
 # big news).
 EXA_MIN_FREE_ITEMS = 6
 EXA_USAGE_FILE = os.path.join(BASE_DIR, "exa_usage.json")
+# Per-ticker EXA neural search. OFF by default: measured over 616 stored Exa
+# rows, 610 never mentioned the company (the neural query's sector tail returned
+# the whole industry), and 5-8 of every 8 results were discarded as undated, so a
+# paid credit per ticker per run bought almost nothing. The EXA allowance is far
+# better spent on the macro tier. Turn on with config "exa_per_ticker": true.
+EXA_PER_TICKER_DEFAULT = False
 # Semantic macro query - one EXA news search per run for BIG China news
 # (monetary, fiscal, fintech regulation, market risk) without relying on the
 # exact keywords.
@@ -554,18 +563,64 @@ def event_key(item):
     return None
 
 
-def story_key(item):
+def canonical_url(item):
     """
-    Stable key for the repeat gate. Prefers the URL when the item has one
-    (the same URL is literally the same page); otherwise a hash of the
-    normalised title, so a re-published story under a new URL still matches
-    by headline.
+    The real article URL behind a Google News RSS link, when recoverable.
+
+    Google News wraps links as news.google.com/rss/articles/CBMi<opaque>. The
+    LEGACY format embedded the target URL in that base64 protobuf, and this
+    decodes it. The CURRENT format is an opaque id (verified: 0 of 40 sampled
+    payloads contained an http(s) URL), whose target is only obtainable by
+    calling news.google.com - so there we fall back to ''.
     """
     url = str(item.get("url") or "").strip()
+    if "news.google.com" not in url or "/articles/" not in url:
+        return ""
+    try:
+        seg = url.split("/articles/", 1)[1].split("?", 1)[0].split("/", 1)[0]
+        seg += "=" * (-len(seg) % 4)
+        raw = base64.urlsafe_b64decode(seg)
+    except Exception:
+        return ""
+    found = re.findall(rb"https?://[^\s\"'<>\x00-\x1f]{6,600}", raw)
+    if not found:
+        return ""
+    return max(found, key=len).decode("utf-8", "replace").rstrip("\\\x01\x02\x03 ")
+
+
+def story_key(item):
+    """
+    Stable key for the repeat gate.
+
+    Preference order:
+      1. the canonical URL when the real target is recoverable (identical page);
+      2. domain + normalised title when the feed told us the origin outlet -
+         this is what lets a Google News link and the outlet's own article
+         resolve to the same key even though their URLs share nothing;
+      3. the raw URL;
+      4. a hash of the normalised title, so a re-published story under a new URL
+         still matches by headline.
+    """
+    canon = canonical_url(item)
+    if canon:
+        return "c:" + hashlib.sha256(canon.lower().encode("utf-8")).hexdigest()[:32]
+    title = _clean_title(item.get("title", ""))
+    domain = _domain_of(item.get("origin") or "")
+    if domain and title:
+        return "d:" + hashlib.sha256(
+            (domain + "|" + title).encode("utf-8")).hexdigest()[:32]
+    url = str(item.get("url") or "").strip()
     if url:
-        return "u:" + hashlib.sha256(url.strip().lower().encode("utf-8")).hexdigest()[:32]
-    return "t:" + hashlib.sha256(_clean_title(item.get("title", ""))
-                                 .encode("utf-8")).hexdigest()[:32]
+        return "u:" + hashlib.sha256(url.lower().encode("utf-8")).hexdigest()[:32]
+    return "t:" + hashlib.sha256(title.encode("utf-8")).hexdigest()[:32]
+
+
+def _domain_of(url):
+    """Lower-cased host of a URL ('' when there is none)."""
+    m = re.match(r"https?://([^/]+)", str(url or "").strip(), re.IGNORECASE)
+    if not m:
+        return ""
+    return m.group(1).lower().removeprefix("www.")
 
 
 def record_pushed_stories(conn, items, now=None):
@@ -807,9 +862,19 @@ def delete_news_item(conn, ticker, source="", item_hash="", title="", url="",
     cur = conn.execute(f"DELETE FROM news WHERE {where}", params)
     result["deleted"] = cur.rowcount
     if not keep_ledger:
-        # Clear the repeat-gate / event-gate memory for the deleted stories:
-        # one key per identity the row could have been recorded under (URL or
-        # normalised headline).
+        # Clear the repeat-gate / EVENT-gate memory for the deleted stories.
+        #
+        # Clearing only the per-story key is not enough: the event guard matches
+        # on `event_key` ("earnings:2026Q2"), so deleting one article about an
+        # earnings release left the event suppressed and every other article
+        # about it stayed blocked - the user deletes the item and the story
+        # simply never comes back. Deleting the row is an explicit "I don't want
+        # this", so the event memory for that exact event goes with it, letting
+        # a genuine re-report reach them again.
+        #
+        # One key per identity the row could have been recorded under (URL,
+        # normalised headline, event), plus an event-key fallback on the stored
+        # title so seeded/legacy rows are covered too.
         try:
             for (u, tr, te) in rows:
                 keys = set()
@@ -824,10 +889,59 @@ def delete_news_item(conn, ticker, source="", item_hash="", title="", url="",
                         "DELETE FROM pushed_stories WHERE ticker=? AND story_key=?",
                         (ticker, sk))
                     result["ledger_removed"] += c2.rowcount
+                # Event-level memory (any row for this event, however stored).
+                ev = event_key({"title": tr or te or "", "title_en": te or ""})
+                if ev:
+                    c3 = conn.execute(
+                        "DELETE FROM pushed_stories WHERE ticker=? AND event_key=?",
+                        (ticker, ev))
+                    result["ledger_removed"] += c3.rowcount
+                    result["event_cleared"] = ev
         except Exception as exc:
             print(f"  [warn] could not clear push ledger: {exc}", file=sys.stderr)
     conn.commit()
     return result
+
+
+def acquire_run_lock():
+    """
+    Take an exclusive lock so two updater processes cannot run at once.
+
+    cron fires twice a day, but the panel's "Run now" can start a second run
+    while the first is still going. Both would write news.db (WAL + a 30s busy
+    timeout mostly hides it) and, worse, BOTH could send a Telegram digest -
+    a duplicate message with no way to tell which run produced it.
+
+    Returns (state, handle):
+      ('acquired', file)  - this process owns the run; keep the handle open
+      ('busy', None)      - another run holds it; the caller should exit quietly
+      ('unavailable', None) - no locking here (e.g. no fcntl, or --no-write);
+                            carry on, the old behaviour
+    """
+    if NO_WRITE:
+        return "unavailable", None
+    try:
+        import fcntl  # POSIX only; the updater runs on the Linux VM
+    except Exception:
+        return "unavailable", None
+    try:
+        fh = open(os.path.join(BASE_DIR, RUN_LOCK_FILE), "w")
+    except Exception:
+        return "unavailable", None
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return "busy", None
+    except Exception:
+        fh.close()
+        return "unavailable", None
+    try:
+        fh.write(str(os.getpid()))
+        fh.flush()
+    except Exception:
+        pass
+    return "acquired", fh
 
 
 # ---------------------------------------------------------------------------
@@ -841,6 +955,12 @@ def prune_db(conn):
       - DELETE seen hashes older than SEEN_RETENTION_DAYS (default 21, same as
         news) so a recycled re-publication is treated as fresh again after the
         window (the `seen` ledger also powers the semantic-dedup history).
+      - DELETE pushed_stories entries older than EVENT_REPEAT_WINDOW_DAYS * 3.
+        That table is the repeat/event gate's memory and was NEVER pruned: rows
+        accumulate forever (~55 pushes / 10 days = ~2,000 rows/year), because a
+        new URL for the same event inserts a new row. Keeping a few multiples of
+        the event window preserves the gate's behaviour exactly (an event only
+        suppresses within event_repeat_window_days) while bounding growth.
       - VACUUM when the file exceeds DB_SIZE_LIMIT_BYTES (deletes alone don't
         physically shrink a SQLite file).
     Returns (rows_deleted, vacuumed) for logging.
@@ -854,9 +974,15 @@ def prune_db(conn):
             .strftime("%Y-%m-%d %H:%M:%S")
         cutoff_seen = (datetime.now(EASTERN) - timedelta(days=SEEN_RETENTION_DAYS)) \
             .strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_pushed = (datetime.now(EASTERN)
+                         - timedelta(days=max(1, EVENT_REPEAT_WINDOW_DAYS) * 3)) \
+            .strftime("%Y-%m-%d %H:%M:%S")
         cur = conn.execute("DELETE FROM news WHERE first_seen < ?", (cutoff_news,))
         rows_deleted += cur.rowcount
         cur = conn.execute("DELETE FROM seen WHERE first_seen < ?", (cutoff_seen,))
+        rows_deleted += cur.rowcount
+        cur = conn.execute("DELETE FROM pushed_stories WHERE pushed_at < ?",
+                           (cutoff_pushed,))
         rows_deleted += cur.rowcount
         conn.commit()
 
@@ -1960,6 +2086,17 @@ def fetch_rss(url, ticker, since_dt=None, source="RSS", lang="en"):
             link = entry.get("link", "") or url
             if not title:
                 continue
+            # Google News wraps every article in an opaque
+            # news.google.com/rss/articles/CBMi... link, but the feed names the
+            # ORIGIN outlet in <source url="https://www.reuters.com">. Keeping
+            # that domain gives the story layer a real signal for cross-source
+            # duplicate detection (the Google link is only an opaque id).
+            origin = ""
+            src = entry.get("source")
+            if isinstance(src, dict):
+                origin = str(src.get("href") or "").strip()
+            elif src:
+                origin = str(getattr(src, "href", "") or "").strip()
             # Normalize the publish time from the parsed struct_time (UTC ->
             # Eastern, 'YYYY-MM-DD HH:MM:SS') so sorting/display work; keep
             # the raw string as a fallback.
@@ -1979,6 +2116,8 @@ def fetch_rss(url, ticker, since_dt=None, source="RSS", lang="en"):
                 "url": link,
                 "date": date,
                 "feed": url,
+                # Origin domain (from <source url>), or ''.
+                "origin": origin,
                 # Detect the language per item (a zh feed can carry EN titles
                 # and vice versa); the caller's 'lang' is only a hint.
                 "lang": "zh" if is_chinese(title) else "en",
@@ -2648,7 +2787,7 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
         # which the prompt tells the model to compare against ITSELF - that is
         # how cross-source copies of one event (different outlet, different
         # URL) get collapsed instead of filling the digest with duplicates.
-        history = (get_recent_seen_titles(conn, ticker, before=run_start)
+        history = (get_recent_pushed_titles(conn, ticker, limit=SEMANTIC_DEDUP_HISTORY)
                    if conn else [])
         hist_lines = [f"- {t}" for t in history]
         mode = prompt_mode or ("macro" if ticker == "MACRO"
@@ -2826,6 +2965,31 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
 # Seen-history for the folded AI dedup
 # ---------------------------------------------------------------------------
 SEMANTIC_DEDUP_HISTORY = 20
+
+
+def get_recent_pushed_titles(conn, ticker, limit=SEMANTIC_DEDUP_HISTORY):
+    """
+    The "ALREADY REPORTED TO THE USER" history for one ticker, newest first.
+
+    This reads `pushed_stories` - the ledger of what actually went out - rather
+    than the `seen` ledger, which holds EVERY item ever fetched. Feeding the
+    model the fetch log meant ~91% of its "already seen" list was junk that was
+    never sent: price-ticker pages ("HUIZ|Huize Holding Ltd|Price:1.480|
+    Chg%:-0.010"), product FAQ pages, and duplicate spam. The model was being
+    told those were news the user had already received, which is one route by
+    which genuinely new items got marked known_event and suppressed.
+
+    "Already seen" should mean "already delivered", so it now does.
+    """
+    if conn is None:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT title, pushed_at FROM pushed_stories WHERE ticker=? "
+            "ORDER BY pushed_at DESC LIMIT ?", (ticker, limit)).fetchall()
+    except Exception:
+        return []
+    return [f"{r[0]}  [sent {str(r[1])[:10]}]" for r in rows if r[0]]
 
 
 def get_recent_seen_titles(conn, ticker, limit=SEMANTIC_DEDUP_HISTORY, before=None,
@@ -3007,7 +3171,7 @@ def is_global_markets(text):
     return any(re.search(p, text) for p in GLOBAL_MARKET_PATTERNS)
 
 
-def news_tier(text):
+def news_tier(text, extra=None):
     """
     Route one headline to its tier: 'macro', 'global' or 'ticker'.
 
@@ -3017,6 +3181,9 @@ def news_tier(text):
       2. a strong China-policy anchor -> 'macro';
       3. a China monetary anchor (央行/降息/LPR/逆回购...) -> 'macro';
       4. otherwise anything matching the global vocabulary -> 'global'.
+
+    'extra' are the user's own macro_keywords (config), so a custom watchword
+    routes exactly like the built-in ones.
     """
     if not text:
         return "ticker"
@@ -3024,7 +3191,7 @@ def news_tier(text):
         return "global"
     if any(re.search(p, text) for p in STRONG_MACRO_PATTERNS):
         return "macro"
-    if is_macro(text):
+    if is_macro(text, extra):
         return "macro"
     if is_global_markets(text):
         return "global"
@@ -3097,15 +3264,28 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
                         initial_hours, run_start, now_utc_str,
                         max_age_hours=MAX_NEWS_AGE_HOURS):
     """
-    The 'China macro' tier: huge policy/market news the user MUST know about
-    (rate cuts, stimulus, assisted-loan regulation, ...). Gated FREE by
-    regex (no AI cost to filter). Sources: the two 7x24 wires (already
-    fetched once per run) + one Google News macro query. New items are
-    stored under the pseudo-ticker "MACRO" and returned.
+    Collect the "must know" tiers from the wires + one Google News macro query.
+
+    This gathers BOTH the China-macro items and the global-markets items, and
+    the caller splits them with news_tier(). It only ever kept is_macro() items
+    before, which made the 🌍 GLOBAL MARKETS tier unreachable: a Fed, CPI or
+    payrolls headline is global but NOT China macro, so it was discarded here -
+    before the tier split that would have routed it to "GLOBAL". Six of seven
+    real global headlines could never be collected.
+
+    Everything is stored under the "MACRO" pseudo-ticker for the delta bookkeeping
+    (one last_fetched record per source); the caller re-labels the global ones.
     """
     if not config.get("macro_enabled", True):
         return []
     extra = [str(k) for k in (config.get("macro_keywords") or []) if str(k).strip()]
+
+    def wanted(text):
+        """Would the China-macro OR the global-markets tier want this item?
+        (The caller splits the result with news_tier().) Being generous here is
+        cheap: the gate is a free regex and the per-run caps still apply."""
+        return news_tier(text) != "ticker"
+
     raw_items = []
     for wire_src in ("Eastmoney724", "Sina724"):
         raw = wire_cache.get(wire_src)
@@ -3115,7 +3295,7 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
         if raw:
             set_last_fetched(conn, "MACRO", wire_src, now_utc_str)
         for it in raw:
-            if is_macro(f"{it.get('title', '')} {it.get('snippet', '')}", extra):
+            if wanted(f"{it.get('title', '')} {it.get('snippet', '')}"):
                 item = dict(it)
                 item["ticker"] = "MACRO"
                 item["source"] = wire_src
@@ -3130,7 +3310,7 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
             print("  [warn] macro: Google News macro query failed - NOT advancing delta.")
         else:
             for it in res:
-                if is_macro(f"{it.get('title', '')} {it.get('snippet', '')}", extra):
+                if wanted(f"{it.get('title', '')} {it.get('snippet', '')}"):
                     raw_items.append(it)
             set_last_fetched(conn, "MACRO", "GoogleNewsMacro", now_utc_str)
 
@@ -3248,7 +3428,8 @@ def format_macro(items):
     return "\n".join(lines)
 
 
-def collect_sector_watch(sector_report, conn, config, secrets, run_start):
+def collect_sector_watch(sector_report, conn, config, secrets, run_start,
+                         meta_map=None):
     """
     Optional 🏭 SECTOR tier (config sector_watch, default OFF).
 
@@ -3257,15 +3438,22 @@ def collect_sector_watch(sector_report, conn, config, secrets, run_start):
     one small batched AI call per ticker and the best few (capped globally) are
     shown in a separate, clearly-labelled section - so sector context is
     available without polluting the per-stock items.
+
+    'meta_map' is the effective per-ticker profile (company_lookup + config
+    overrides). It used to be passed as an EMPTY dict, so the prompt fell back
+    to the bare ticker as the company name and had no site/subsidiaries - the
+    sector items were scored with less context than the ticker items.
     """
     if not config.get("sector_watch", SECTOR_WATCH_DEFAULT):
         return []
+    meta_map = meta_map or {}
     pool = []
     for ticker, items in (sector_report or {}).items():
         if not items:
             continue
-        reviewed = ai_analyze(items, config, secrets, {ticker: {}}, conn=conn,
-                              run_start=run_start,
+        reviewed = ai_analyze(items, config, secrets,
+                              {ticker: meta_map.get(ticker, {})}, conn=conn,
+                              run_start=run_start, prompt_mode="sector",
                               prompt_extra=("IMPORTANCE SCALE (this is the "
                                             "SECTOR tier): 8-10 = a sector-wide "
                                             "change that directly alters this "
@@ -3607,8 +3795,16 @@ def main():
     # Parse --no-write FIRST so every mode below (including --rediscover)
     # respects it: no DB/lookup/history writes, no Telegram alerts, no
     # Tavily credit usage.
+    #
+    # --dry-run IMPLIES --no-write. They used to be independent, and that was a
+    # trap: a "dry run" suppressed only the Telegram message, while every
+    # database write is gated on NO_WRITE. So `--force --dry-run` (which the
+    # installer ran on every deploy) marked the items it WOULD have sent as
+    # pushed=1, wrote them into the repeat/event ledger and spent API credits -
+    # without sending anything, permanently swallowing that window of news.
+    # "Dry" must mean "changes nothing", so it now does.
     global NO_WRITE
-    NO_WRITE = "--no-write" in sys.argv
+    NO_WRITE = ("--no-write" in sys.argv) or ("--dry-run" in sys.argv)
 
     # ---- CLI modes first (never blocked by the schedule guard) ----
     # Match the PREFIX for modes that can carry a value (--purge-junk=3,
@@ -3717,6 +3913,16 @@ def main():
 
     dry_run = "--dry-run" in sys.argv
     snapshot = "--snapshot" in sys.argv  # manual run: always deliver (current picture)
+
+    # One run at a time: cron and the panel's "Run now" can otherwise overlap,
+    # which risks a duplicate Telegram digest. Taken AFTER the CLI modes (those
+    # are quick and single-purpose) and before any fetching.
+    lock_state, run_lock = acquire_run_lock()
+    if lock_state == "busy":
+        print("  Another news_updater run is already in progress - exiting so it "
+              "is not disturbed (prevents a duplicate digest).")
+        sys.exit(0)
+
     start_time = datetime.now(EASTERN)
     run_start = start_time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -4002,25 +4208,39 @@ def main():
             # match: the term filter above decides relevance.
             fetch_source(wire_src, _wire, src_status(wire_key, strict=False))
 
-        # 3.6) EXA neural search - semantic recall: finds big/impact news
-        #      about the company that keyword sources miss ("the Shenzhen-
-        #      based insurer" instead of "Huize"). This is ALSO the noisiest
-        #      source: neural search happily returns the whole sector, so it
-        #      is now filtered to items that really mention the company.
-        #      Skipped when the free sources already covered the ticker.
-        if src_on("exa") and secrets.get("exa_api_key"):
+        # 3.6) EXA neural search - semantic recall: finds pages ABOUT the
+        #      company that keyword search misses ("the Shenzhen-based insurer"
+        #      instead of "Huize").
+        #
+        #      WHY THIS IS OFF BY DEFAULT NOW. EXA is the most expensive source
+        #      per useful item and was the least productive:
+        #        - an 8-result neural search is largely discarded before it can
+        #          even be filtered (the log showed 5-8 of 8 dropped as
+        #          stale/undated every ticker, every run);
+        #        - the old query ended in the same sector words as the macro
+        #          query (重大 监管 政策 影响 风险), so it returned sector
+        #          articles that the relevance gate then rejected: 610 of 616
+        #          stored Exa rows never mentioned the company.
+        #      A paid credit per ticker per run bought ~0 usable items, so the
+        #      per-ticker search is disabled unless you turn it back on with
+        #      `exa_min_free_items` set high enough to matter. The EXA budget is
+        #      better spent on the MACRO tier, where a semantic query genuinely
+        #      finds differently-worded big news.
+        if src_on("exa") and secrets.get("exa_api_key") \
+                and config.get("exa_per_ticker", EXA_PER_TICKER_DEFAULT):
             free_count = sum(1 for it in all_new if it.get("ticker") == ticker)
             exa_min_free = _cfg_int(config, "exa_min_free_items", EXA_MIN_FREE_ITEMS)
             if free_count >= exa_min_free:
                 print(f"  {ticker}: free sources already found {free_count} item(s) "
                       f"this run - skipping EXA (saving credits).")
             else:
-                exa_query = (f"{' '.join(zh_terms[:2])} {' '.join(en_terms[:2])} "
-                             f"重大 监管 政策 影响 风险")
+                # Company-name-only neural query: no sector words, so the
+                # results have a chance of surviving the relevance gate.
+                exa_query = " ".join(zh_terms[:2] + en_terms[:1])
                 fetch_source(
                     "Exa",
                     lambda sd: fetch_exa(exa_query, secrets, config, sd,
-                                         limit=8, category="news"),
+                                         limit=5, category="news"),
                     src_status("exa"))
 
         # 4) Company RSS feeds (configured per ticker) - source "RSS".
@@ -4114,7 +4334,7 @@ def main():
 
     # ---- Optional 🏭 SECTOR CONTEXT tier (sector_watch, default OFF) ----
     sector_pushed = collect_sector_watch(sector_report, conn, config, secrets,
-                                         run_start) \
+                                         run_start, meta_map=effective_meta) \
         if any(sector_report.values()) else []
     for items in (sector_report or {}).values():
         for it in items:
