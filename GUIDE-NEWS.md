@@ -217,6 +217,34 @@ and analysed by the next run (bounded, so nothing is stranded forever).
 Both sections are sent as their own Telegram message, on top of the per-stock
 digest, so they never eat the digest's 10 seats.
 
+## Reading Chinese items (translation)
+
+Every stored item carries an English title (the AI translates it), shown above
+the original Chinese line in the Stored-news table. Three ways to handle
+Chinese:
+
+* **Automatically** — the per-ticker AI call translates as it scores, so
+  anything that reaches the digest is already English. A run also back-fills
+  English titles for stored items that missed the AI (a busy run trims to
+  `max_items_per_run`; those rows used to stay Chinese and unreadable forever).
+* **On demand, one row** — the **EN** button next to a 🇨🇳 item translates that
+  headline (a single tiny AI call, nothing written to the DB).
+* **On demand, the whole article** — the **译** link opens the article through
+  Google Translate (`translate.google.com/translate?...&u=<url>`), which needs
+  no API key and works on any Chinese site.
+* **Bulk back-fill** — the **🌐 Translate missing** button fills in English
+  titles for every stored row that has none (one AI call per ~25 headlines).
+
+Cost is negligible: one batched call translates ~12–25 headlines in a single
+request (~17s measured), using your own AI key on the server.
+
+```bash
+python3 news_updater.py --translate            # back-fill up to 200 stored rows
+python3 news_updater.py --translate=50         # ... a specific number
+python3 news_updater.py --translate-pushed     # only rows that were pushed
+python3 news_updater.py --translate=LX         # only one ticker
+```
+
 ## No-spam behavior
 
 - Exact dedup (SQLite hash per source+URL).

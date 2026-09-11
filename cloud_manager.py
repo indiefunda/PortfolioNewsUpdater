@@ -13,6 +13,7 @@ This can share the same free VM as the price monitor - it just deploys the
 news files and adds a separate 2x-daily cron job.
 """
 
+import base64
 import json
 import os
 import re
@@ -641,9 +642,11 @@ HTML = """<!DOCTYPE html>
     <div class="row" style="margin-bottom:8px">
       <input id="newsFilter" placeholder="Filter: ticker, category, title, source..." style="flex:1" onkeyup="renderNews()">
       <button class="btn-ghost" onclick="loadNews()">📥 Load stored news</button>
+      <button class="btn-ghost" onclick="translateAll()" title="Fill in English titles for stored items that have none (one batched AI call per ~25 headlines)">🌐 Translate missing</button>
       <button class="btn-ghost" onclick="purgeJunk()" title="Delete stored, never-pushed items scored <= 2 (old filter gaps)">🧹 Purge junk</button>
     </div>
     <div class="status" id="newsStatus">Click "Load stored news" to fetch from the server.</div>
+    <div class="hint">🇨🇳 marks a Chinese-language item. Click <b>EN</b> on a row to translate that one, or the <b>译</b> link to open the article through Google Translate.</div>
     <div id="newsTableWrap"></div>
     <div class="hint">Every item the updater found is stored here for ~3 weeks (rolling cleanup). Only the top-N by AI importance are pushed to Telegram.</div>
   </div>
@@ -849,20 +852,60 @@ function renderNews(){
   if(!rows.length){ $('newsTableWrap').innerHTML = '<div class="empty">No stored news (or filter matches nothing).</div>'; return; }
   let html = '';
   for(const n of rows){
-    const title = n.title_en || n.title_raw || '';
+    const idx = news.indexOf(n);
+    const raw = n.title_raw || '';
+    const en = n.title_en || '';
+    // Show the English title when we have one, and keep the original Chinese
+    // underneath - the translation is a convenience, not a replacement.
+    const title = en || raw;
+    const untranslated = !en || en === raw;
     const imp = n.importance!=null ? '⭐'+n.importance : '—';
     const pushed = n.pushed ? '<span class="badge ok">pushed</span>' : '<span class="badge gray">stored</span>';
     const src = (n.source||'') + (n.lang==='zh' ? ' 🇨🇳' : '');
-    // Index into the FULL array, so deletion targets the right row even while
-    // a filter is active and the table is only showing a subset.
-    const idx = news.indexOf(n);
+    // On-demand English for one row (no DB write).
+    const enBtn = (n.lang==='zh' && untranslated && raw)
+      ? ' <button class="btn-x" title="Translate this headline to English" onclick="translateRow('+idx+')">EN</button>' : '';
+    // Google Translate proxy for the ARTICLE (works on any site, no API key).
+    const gt = (n.url && n.lang==='zh')
+      ? ' <a class="btn-x" style="text-decoration:none" target="_blank" rel="noopener" title="Open this article through Google Translate" '+
+        'href="https://translate.google.com/translate?sl=auto&tl=en&u='+encodeURIComponent(n.url)+'">译</a>' : '';
+    const zhSub = (raw && en && en !== raw)
+      ? '<div style="color:var(--muted);font-size:11px">'+escapeHtml(raw.slice(0,110))+'</div>' : '';
     html += '<tr><td><button class="btn-x" title="Delete this item from the stored news" '+
       'onclick="deleteNews('+idx+')">✕</button></td>'+
       '<td>'+escapeHtml(n.first_seen||'')+'</td><td>'+escapeHtml(n.ticker||'')+'</td>'+
       '<td>'+escapeHtml(src)+'</td><td>'+escapeHtml(n.category||'')+'</td><td>'+imp+'</td>'+
-      '<td>'+pushed+'</td><td>'+(n.url?'<a href="'+escapeHtml(n.url)+'" target="_blank" rel="noopener">'+escapeHtml(title)+'</a>':escapeHtml(title))+'</td></tr>';
+      '<td>'+pushed+'</td><td>'+(n.url?'<a href="'+escapeHtml(n.url)+'" target="_blank" rel="noopener">'+escapeHtml(title)+'</a>':escapeHtml(title))+
+      enBtn+gt+zhSub+'</td></tr>';
   }
-  $('newsTableWrap').innerHTML = '<div class="tablewrap"><table><thead><tr><th></th><th>Seen (ET)</th><th>Ticker</th><th>Source</th><th>Cat</th><th>Imp</th><th>Status</th><th>Title (EN)</th></tr></thead><tbody>'+html+'</tbody></table></div>';
+  $('newsTableWrap').innerHTML = '<div class="tablewrap"><table><thead><tr><th></th><th>Seen (ET)</th><th>Ticker</th><th>Source</th><th>Cat</th><th>Imp</th><th>Status</th><th>Title</th></tr></thead><tbody>'+html+'</tbody></table></div>';
+}
+
+// Translate ONE row on demand (display only - the server does not touch the DB).
+async function translateRow(idx){
+  const n = news[idx];
+  if(!n) return;
+  const text = n.title_en && n.title_en !== n.title_raw ? n.title_en : (n.title_raw || '');
+  if(!text) return;
+  $('newsStatus').textContent = 'Translating...';
+  const d = await api('/api/translate', {texts:[text]});
+  if(d.ok && d.translations && d.translations[0]){
+    n.title_en = d.translations[0];
+    $('newsStatus').textContent = '✅ Translated.';
+    renderNews();
+  } else {
+    $('newsStatus').textContent = '❌ '+(d.error||'translation failed');
+  }
+}
+
+// Bulk: fill in English titles for stored items that have none (server-side).
+async function translateAll(){
+  $('newsStatus').textContent = 'Translating stored headlines (one AI call per ~25 items)...';
+  const d = await api('/api/translate_stored', {limit:150});
+  $('newsStatus').textContent = d.ok
+    ? '✅ Translated '+d.translated+' of '+d.considered+' item(s).'
+    : '❌ '+(d.error||'translation failed');
+  if(d.ok) loadNews();
 }
 
 async function deleteNews(idx){
@@ -1403,9 +1446,95 @@ class Handler(BaseHTTPRequestHandler):
                          "error": "" if deleted else (text or "nothing deleted"),
                          "output": text})
 
+    def _handle_translate(self):
+        """
+        Translate a few headline strings with the user's own AI key.
+
+        Runs the updater's --translate-texts mode on the VM, so the API key
+        never leaves the server and the panel needs no translation service of
+        its own. Text is passed through a temp file (not the shell) and results
+        come back as JSON.
+        """
+        zone = find_vm_zone()
+        if not zone:
+            self._send_json({"ok": False, "error": "VM not found. Create the server first."})
+            return
+        data, error = self._read_json_body()
+        if error:
+            self._send_json({"ok": False, "error": error}, 400)
+            return
+        texts = [str(t) for t in (data or {}).get("texts", []) if str(t).strip()][:20]
+        if not texts:
+            self._send_json({"ok": False, "error": "No text given."}, 400)
+            return
+        running, why = ensure_vm_running(zone)
+        if not running:
+            self._send_json({"ok": False, "error": why})
+            return
+        home = get_vm_home(zone)
+        payload = json.dumps({"texts": texts}, ensure_ascii=False)
+        # base64 avoids all shell quoting problems with Chinese text.
+        b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        cmd = (f"cd {home} && echo '{b64}' | base64 -d > /tmp/nu_texts.json && "
+               f"python3 news_updater.py --translate-texts=/tmp/nu_texts.json 2>&1")
+        ok, out, err = run_gcloud([
+            "compute", "ssh", "--zone", zone, VM_NAME, "--command", cmd,
+            "--quiet"], timeout=180)
+        translations = []
+        for line in reversed((out + err).splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    translations = json.loads(line).get("translations", [])
+                    break
+                except Exception:
+                    continue
+        self._send_json({"ok": bool(translations), "translations": translations,
+                         "error": "" if translations else ((err or out).strip()[-300:])})
+
+    def _handle_translate_stored(self):
+        """Backfill English titles for stored rows that never got one."""
+        zone = find_vm_zone()
+        if not zone:
+            self._send_json({"ok": False, "error": "VM not found. Create the server first."})
+            return
+        data, _ = self._read_json_body()
+        try:
+            limit = max(1, min(400, int((data or {}).get("limit", 150))))
+        except (TypeError, ValueError):
+            limit = 150
+        running, why = ensure_vm_running(zone)
+        if not running:
+            self._send_json({"ok": False, "error": why})
+            return
+        home = get_vm_home(zone)
+        ok, out, err = run_gcloud([
+            "compute", "ssh", "--zone", zone, VM_NAME,
+            "--command", f"cd {home} && python3 news_updater.py --translate={limit} 2>&1",
+            "--quiet"], timeout=600)
+        result = {}
+        for line in reversed((out + err).splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    result = json.loads(line)
+                    break
+                except Exception:
+                    continue
+        self._send_json({"ok": bool(result.get("ok")),
+                         "translated": result.get("translated", 0),
+                         "considered": result.get("considered", 0),
+                         "error": "" if result.get("ok") else ((err or out).strip()[-300:])})
+
     def do_POST(self):
         parsed = urlparse(self.path)
         if not self._origin_ok():
+            return
+        if parsed.path == "/api/translate":
+            self._handle_translate()
+            return
+        if parsed.path == "/api/translate_stored":
+            self._handle_translate_stored()
             return
         # Mutating routes are POST-only: a foreign page can still make a simple
         # POST, but it cannot do so with a JSON content type without a CORS
@@ -1430,6 +1559,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/delete_news":
             self._handle_delete_news()
+            return
+        if parsed.path == "/api/translate":
+            self._handle_translate()
+            return
+        if parsed.path == "/api/translate_stored":
+            self._handle_translate_stored()
             return
         if parsed.path == "/api/upload":
             data, error = self._read_json_body()

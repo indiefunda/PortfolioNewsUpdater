@@ -3351,6 +3351,95 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
     return new_items
 
 
+def translate_titles(texts, config, secrets, chunk=25):
+    """
+    Translate a list of Chinese headlines to English in as few AI calls as
+    possible: one JSON round-trip per `chunk` headlines (measured: 12 headlines
+    in one ~17s call, so the cost is negligible).
+
+    Returns a list of the same length, with the ORIGINAL string kept for any
+    entry the model did not answer - never '' , so a failed translation can
+    never blank out a title.
+    """
+    texts = list(texts or [])
+    if not texts:
+        return []
+    key = secrets.get("ai_api_key", "")
+    if not key:
+        return texts
+    base = config.get("ai_base_url") or DEFAULT_AI_BASE
+    model = config.get("ai_model") or DEFAULT_AI_MODEL
+    out = list(texts)
+    for start in range(0, len(texts), chunk):
+        batch = texts[start:start + chunk]
+        items = [{"n": i, "title": t} for i, t in enumerate(batch, 1)]
+        prompt = (
+            "Translate each Chinese headline below into concise, natural "
+            "English. Keep company names, tickers, numbers and percentages "
+            "as they are. Do not add commentary. If a headline is already "
+            "English, repeat it unchanged.\n"
+            'Return ONLY a JSON array of objects with keys "n" and "en", one '
+            "per headline, in the same order.\n\n"
+            "HEADLINES:\n" + json.dumps(items, ensure_ascii=False)
+        )
+        content = _chat(base, model, key,
+                        "You are a precise JSON-returning translator.", prompt)
+        parsed = _parse_json_array(content) if content else None
+        if not parsed:
+            print(f"  [warn] translation batch {start//chunk + 1} failed; "
+                  f"keeping the original titles.", file=sys.stderr)
+            continue
+        by_n = {}
+        for obj in parsed:
+            try:
+                by_n[int(obj.get("n"))] = str(obj.get("en") or "").strip()
+            except Exception:
+                continue
+        for i in range(len(batch)):
+            got = by_n.get(i + 1, "")
+            if got:
+                out[start + i] = got
+    return out
+
+
+def translate_stored_news(conn, config, secrets, limit=200, pushed_only=False,
+                          ticker=None, dry_run=False):
+    """
+    Backfill English titles for stored rows that never got one.
+
+    Rows end up untranslated when they are trimmed out of a busy run before the
+    AI stage (they used to be stranded permanently: the old trim left them
+    marked 'seen', so no later run would re-fetch them). This gives those rows
+    their English title so the panel is readable.
+
+    Returns (translated, considered).
+    """
+    where = ["title_raw IS NOT NULL", "title_raw != ''",
+             "(title_en IS NULL OR title_en = '' OR title_en = title_raw)"]
+    params = []
+    if pushed_only:
+        where.append("pushed = 1")
+    if ticker:
+        where.append("ticker = ?")
+        params.append(ticker.upper())
+    rows = conn.execute(
+        "SELECT id, title_raw FROM news WHERE " + " AND ".join(where) +
+        " ORDER BY pushed DESC, id DESC LIMIT ?", params + [limit]).fetchall()
+    if not rows:
+        return 0, 0
+    if dry_run:
+        return 0, len(rows)
+    titles = [r[1] for r in rows]
+    translated = translate_titles(titles, config, secrets)
+    n = 0
+    for (row_id, raw), en in zip(rows, translated):
+        if en and en != raw:
+            conn.execute("UPDATE news SET title_en=? WHERE id=?", (en, row_id))
+            n += 1
+    conn.commit()
+    return n, len(rows)
+
+
 def analyze_macro(macro_items, config, secrets, conn, run_start, pseudo="MACRO"):
     """
     ONE tiny batched AI call for the macro items (translate + score + impact
@@ -3853,6 +3942,53 @@ def main():
 
     if "--dump-lookup" in sys.argv:
         print(json.dumps(load_lookup(), ensure_ascii=False, indent=1))
+        sys.exit(0)
+
+    # ---- translate stored headlines (panel button / backfill) ----
+    #   --translate              translate untranslated stored rows (up to 200)
+    #   --translate=50           ... a specific number of rows
+    #   --translate-pushed       only rows that were pushed to Telegram
+    #   --translate=LX           ... only one ticker (implies pushed_only=False)
+    #   --translate-texts=FILE   translate the strings in a JSON file and print
+    #                            them (used by the panel's per-row EN button;
+    #                            reads/writes no database at all)
+    if any(a.startswith("--translate-texts=") for a in sys.argv):
+        path = next(a.split("=", 1)[1] for a in sys.argv
+                    if a.startswith("--translate-texts="))
+        config = load_config()
+        secrets = load_secrets()
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                texts = json.load(fh).get("texts") or []
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": f"could not read {path}: {exc}"}))
+            sys.exit(1)
+        translations = translate_titles([str(t) for t in texts], config, secrets)
+        print(json.dumps({"ok": True, "translations": translations},
+                         ensure_ascii=False))
+        sys.exit(0)
+
+    if any(a == "--translate" or a.startswith("--translate") for a in sys.argv):
+        limit, ticker_arg, pushed_only = 200, None, False
+        for a in sys.argv:
+            if a.startswith("--translate="):
+                v = a.split("=", 1)[1].strip()
+                if v.isdigit():
+                    limit = max(1, int(v))
+                elif v:
+                    ticker_arg = v.upper()
+            elif a == "--translate-pushed":
+                pushed_only = True
+        config = load_config()
+        secrets = load_secrets()
+        conn = _db()
+        n, considered = translate_stored_news(
+            conn, config, secrets, limit=limit, pushed_only=pushed_only,
+            ticker=ticker_arg, dry_run=NO_WRITE)
+        conn.close()
+        print(json.dumps({"ok": True, "translated": n, "considered": considered,
+                          "pushed_only": pushed_only, "ticker": ticker_arg},
+                         ensure_ascii=False))
         sys.exit(0)
 
     if "--dump-usage" in sys.argv:
@@ -4399,6 +4535,21 @@ def main():
             pass
         print(f"  Trimming to the {max_to_filter} most recent for AI analysis "
               f"({len(trimmed)} deferred, {released} re-queued for the next run).")
+
+    # Any stored row that never reached the AI has no English title, which makes
+    # the panel unreadable for a Chinese-only reader (this is exactly what left
+    # 30 Chinese rows in the browser view). Translate them in one batched call -
+    # cheap (a dozen headlines per call) and it means every stored item is always
+    # readable, whether or not it made the digest.
+    if not NO_WRITE:
+        try:
+            n_tr, n_seen_rows = translate_stored_news(conn, config, secrets,
+                                                      limit=60)
+            if n_tr:
+                print(f"  [translate] filled in English titles for {n_tr} "
+                      f"stored item(s) that had none.")
+        except Exception as exc:
+            print(f"  [warn] translating stored titles failed: {exc}", file=sys.stderr)
 
     if not all_new and not macro_pushed and not global_pushed and not sector_pushed:
         print("  No new items - nothing to do.")
