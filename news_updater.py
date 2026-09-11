@@ -233,6 +233,12 @@ SECTOR_WATCH_MAX_PER_RUN = 2
 # Configurable: global_markets.
 GLOBAL_MARKETS_DEFAULT = False
 GLOBAL_MARKETS_MAX_PER_RUN = 2
+# How many macro/global candidates may be STORED per run. The wires produce
+# dozens of macro-ish items per run but only the top few are ever pushed, so
+# storing them all just filled the browsable DB with rows that never got an AI
+# score (they showed as "—" in the panel). Everything not stored is simply not
+# seen again, so the DB stays a record of notable macro news.
+MACRO_STORE_MAX_PER_RUN = 12
 # Near-duplicate detection: two items for the same ticker whose titles share
 # this much of their token sets are the SAME story from different outlets.
 STORY_JACCARD_MIN = 0.6
@@ -3332,11 +3338,20 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
                 raw_items.append(item)
             set_last_fetched(conn, "MACRO", "ExaMacro", now_utc_str)
     seen_keys = set()
-    new_items = []
+    candidates = []
     for it in raw_items:
         # Same hard freshness backstop as the per-ticker path: a macro wire/
         # search hit with an ancient publish time is a recycled story.
         if _is_stale_item(it, max_age_hours):
+            continue
+        hay = f"{it.get('title', '')} {it.get('snippet', '')}"
+        # Drop routine market chatter BEFORE storing it. The wire carries every
+        # tick ("US futures extend gains", "spot silver rises 1.34%", "euro
+        # extends decline", "SK Hynix up 2% premarket", single-stock moves).
+        # Storing those filled the browsable database with rows that can never
+        # be pushed - and, because only the top few macro items get scored, most
+        # of them also showed up with no importance at all.
+        if market_noise(hay):
             continue
         key = (it["source"], it["id"])
         if key in seen_keys:
@@ -3345,10 +3360,151 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
         it["published_at"] = _normalize_pub(it.get("date", ""))
         it["first_seen"] = run_start
         if is_new(conn, "MACRO", it["source"], it["id"], it["title"]):
-            new_items.append(it)
-            mark_seen(conn, "MACRO", it["source"], it["id"], it["title"], it.get("url", ""))
-            insert_news(conn, it)
-    return new_items
+            candidates.append(it)
+
+    # Store at most macro_store_max_per_run per run (default 12), not every
+    # candidate the wires produced. These are the rows that get an AI score;
+    # the rest never enter the database, so it stays a browsable record of
+    # notable macro news instead of a dump of the tape.
+    store_cap = max(1, _cfg_int(config, "macro_store_max_per_run",
+                                MACRO_STORE_MAX_PER_RUN))
+    if len(candidates) > store_cap:
+        print(f"  [macro] {len(candidates)} candidate(s) passed the quality gate; "
+              f"storing the newest {store_cap}.")
+        candidates = candidates[:store_cap]
+    for it in candidates:
+        mark_seen(conn, "MACRO", it["source"], it["id"], it["title"], it.get("url", ""))
+        insert_news(conn, it)
+    return candidates
+
+
+# ---------------------------------------------------------------------------
+# Routine-market filter for the macro/global tiers
+# ---------------------------------------------------------------------------
+# The 7x24 wires carry the whole tape, not just news. Filtering only by
+# "is this macro-ish" let the database fill with tick-by-tick market chatter:
+# "US stock futures extend gains", "spot silver rises 1.34%", "euro extends
+# decline against dollar, last at $1.1576", "SK Hynix up over 2% in premarket",
+# "VIX falls 1.49 points", single-stock quotes. Those can never be actionable
+# and only the top few macro items get an AI score, so the rest were stored with
+# no importance at all - pure clutter.
+ROUTINE_MARKET_PATTERNS = [
+    r"盘前|盘后|premarket|pre-market|after-?hours",
+    r"(涨幅|跌幅|升幅|降幅)?(扩大|收窄)(至|到)",
+    r"(涨|跌|升|降)[\d.]+\s*(%|％|个百分点|个基点|点)",
+    r"上涨|下跌|走高|走低|回落|反弹|跳水",
+    r"报[\d.,]+\s*(美元|元|点|%|％)",
+    r"最新报|现报|报收|收于|收盘价",
+    r"extend(s|ed)?\s+(gains|losses|decline|rally)",
+    r"(falls?|rises?|drops?|jumps?|gains?|slides?|climbs?|sinks?|retreats?|extends?|ticks?|eases?|holds?|wavers?|closes?)\b[^.;]{0,24}?\b[\d.]+\s*(%|point|bp|basis point)",
+    r"(falls?|rises?|drops?|up|down)\s+(over|more than|nearly)\s+[\d.]+\s*%",
+    r"创(日内|历史|阶段)?新(高|低)",
+    r"一度|盘中|盘中触及",
+    r"美元指数|dollar index",
+    r"(欧洲|欧元|英镑|日元|美元).{0,12}(跌|涨|走低|走高|贬值|升值)",
+    r"\b(euro|yen|sterling|yuan|dollar)\b[^.;]{0,40}\b(extends?|falls?|rises?|slips?|drops?|weakens?|strengthens?|gains?)\b",
+    # Treasury yields / auctions / buybacks: market mechanics, not policy.
+    r"(10|2|30|two|ten|thirty)[\s-]*year[^.;]{0,12}(treasury|note|bond)?[^.;]{0,12}(yield|收益率)",
+    r"(国债|美债).{0,8}(收益率|回购|招标|中标|发行)",
+    r"国库券|Treasury (bill|auction|buyback|note|bond)",
+    r"国际金价|现货(黄金|白银|原油)|WTI|布伦特|Brent|COMEX",
+    r"金价|油价|银价",
+    r"VIX|恐慌指数|fear index",
+    r"空头头寸|short interest",
+    # Rate-odds chatter: the market's betting line, not a policy action.
+    r"加息预期|降息预期|rate-?hike (odds|bets|expectations|probability)|"
+    r"Fed (rate )?(odds|bets)|expects? .{0,12}(rate hike|rate cut|加息|降息)|"
+    r"traders? .{0,24}(odds|bets|expect)|概率|押注|预计.{0,6}(加息|降息)",
+    r"隔夜逆回购|reverse repo|RRP",
+    r"外汇指数|currency index|emerging[- ]market",
+    # A market reaction to a data release is still just a market reaction
+    # ("After inflation data, euro extends decline..."). The release itself
+    # ("US August CPI rises 3.4%") is kept by the noteworthy list.
+    r"(after|following|despite|amid|on)\s+.{0,24}?\b(inflation|CPI|jobs|payroll|GDP)\b",
+    # Chinese market statistics: a bare "上涨0.23%"-style move. A data RELEASE
+    # states a comparison ("同比上涨3.2%", "高于预期") and is kept below.
+    r"(上涨|下跌|上升|下降|回落|走高|走低|增长|下滑)\s*[\d.]+\s*(%|％|个百分点|点)",
+    r"(数据|通胀数据)(公布|发布)?(后|之后)",
+]
+# A market item that ALSO carries one of these is real macro news and is kept.
+# Deliberately NARROW: an actual policy ACT or a data RELEASE, never the
+# market's reaction to one, and never the market's odds on one.
+NOTEWORTHY_MARKET_PATTERNS = [
+    r"加息\s*\d|降息\s*\d|上调.{0,6}利率|下调.{0,6}利率",
+    r"(hikes?|cuts?|raises?|lowers?)\s+(rates?|the (benchmark|policy) rate)",
+    r"利率决议|议息会议|点阵图|政策声明",
+    # A data release: the noun followed by a reported change (never a bare
+    # mention of "inflation data", which is usually a market reaction).
+    r"(CPI|通胀|inflation|PPI|非农|payrolls?|失业率|GDP|出口|进口)"
+    r"\s*(同比|环比)?\s*(rise|rose|rises|fall|fell|falls|jump|jumps|climb|climbs|"
+    r"slow|slows|accelerat|ease|eases|beat|beats|miss|misses|print)",
+    # Chinese data release: needs a comparison, which market stats lack.
+    r"(同比|环比|超预期|高于预期|低于预期|不及预期|超出预期)",
+    r"(CPI|GDP|非农|通胀)\s*(数据)?\s*(公布|发布|出炉)",
+    r"衰退|recession", r"刺激|stimulus", r"关税|tariff", r"制裁|sanction",
+    r"降准|LPR|MLF|存款准备金|货币政策|宽松|紧缩",
+    r"助贷|消费金融|小额贷款|互联网贷款|贷款新规",
+    r"证监会|金融监管总局|银保监会|国务院|发改委|政治局",
+    r"中央金融|中央经济|国常会|中国金龙|中概股",
+]
+ROUTINE_MARKET_RE = re.compile("|".join(ROUTINE_MARKET_PATTERNS), re.IGNORECASE)
+NOTEWORTHY_MARKET_RE = re.compile("|".join(NOTEWORTHY_MARKET_PATTERNS),
+                                  re.IGNORECASE)
+
+
+def market_noise(text):
+    """
+    True when an item is routine market chatter that should never be stored.
+
+    It is noise when it looks like price/market reporting AND carries no
+    policy-grade subject. "Fed's Powell says further hikes possible" and
+    "US August CPI rises 3.4%" survive (they have a subject that matters);
+    "Nasdaq 100 futures extend gains to 1%" and "SK Hynix up 2% premarket"
+    do not.
+    """
+    if not text:
+        return False
+    if not ROUTINE_MARKET_RE.search(text):
+        return False
+    return not NOTEWORTHY_MARKET_RE.search(text)
+
+
+def purge_macro_noise(conn, dry_run=False):
+    """
+    Delete stored macro/global rows that the new quality gate would never keep,
+    plus unanalyzed macro rows that were never going to be pushed.
+
+    The macro tier used to store EVERY candidate the wires produced and only
+    score the top few, so the browsable database filled with tape chatter
+    ("US futures extend gains", "SK Hynix up 2% premarket") that showed up with
+    no importance at all. This removes that backlog. Pushed rows are never
+    touched - they are the record of what was actually delivered.
+
+    Returns (deleted, scanned).
+    """
+    rows = conn.execute(
+        "SELECT id, title_raw, title_en, snippet, pushed, importance FROM news "
+        "WHERE ticker IN ('MACRO', 'GLOBAL')").fetchall()
+    doomed = []
+    for row in rows:
+        # Positional access: this connection has no row factory.
+        row_id, title_raw, title_en, snippet, pushed, importance = row[:6]
+        if pushed:
+            continue                       # never delete what was delivered
+        hay = " ".join(str(x or "") for x in (title_raw, title_en, snippet))
+        if market_noise(hay):
+            doomed.append(row_id)
+        elif importance is None:
+            # Stored but never scored, and not delivered: the wire's leftovers.
+            doomed.append(row_id)
+    if dry_run:
+        return len(doomed), len(rows)
+    for chunk_start in range(0, len(doomed), 200):
+        chunk = doomed[chunk_start:chunk_start + 200]
+        conn.execute("DELETE FROM news WHERE id IN (%s)"
+                     % ",".join("?" * len(chunk)), chunk)
+    conn.commit()
+    return len(doomed), len(rows)
 
 
 def translate_titles(texts, config, secrets, chunk=25):
@@ -3942,6 +4098,19 @@ def main():
 
     if "--dump-lookup" in sys.argv:
         print(json.dumps(load_lookup(), ensure_ascii=False, indent=1))
+        sys.exit(0)
+
+    #   --purge-macro-noise      delete stored macro chatter + unscored leftovers
+    #   --purge-macro-noise-dry  report what it would delete, change nothing
+    # NOTE: do NOT combine this with --no-write: that swaps the session onto an
+    # in-memory database (by design), so there is nothing to scan or delete.
+    if "--purge-macro-noise" in sys.argv or "--purge-macro-noise-dry" in sys.argv:
+        dry = "--purge-macro-noise-dry" in sys.argv
+        conn = _db()
+        deleted, scanned = purge_macro_noise(conn, dry_run=dry)
+        conn.close()
+        print(json.dumps({"ok": True, "deleted": deleted, "scanned": scanned,
+                          "dry_run": dry}, ensure_ascii=False))
         sys.exit(0)
 
     # ---- translate stored headlines (panel button / backfill) ----

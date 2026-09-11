@@ -217,6 +217,47 @@ and analysed by the next run (bounded, so nothing is stranded forever).
 Both sections are sent as their own Telegram message, on top of the per-stock
 digest, so they never eat the digest's 10 seats.
 
+## Fighting macro noise (routine market chatter)
+
+The 7x24 wires carry the whole tape, not just news. Filtering only on "is this
+macro-ish" let the database fill with tick-by-tick market chatter that could
+never be pushed — and because only the top few macro items get an AI score, most
+of those rows also showed up in the panel with **no importance at all**:
+
+```
+US three major stock index futures extend gains, all up
+Nasdaq 100 futures extend gains to 1%.
+US stock fear index VIX falls 1.49 points.
+SK Hynix up over 2% in U.S. premarket, last at $192.12
+Spot silver rises 1.34%, hitting a new intraday high.
+美国财政部8周期国库券中标利率3.845%
+【美元指数10日上涨】…上涨0.23%
+```
+
+Two things now prevent that:
+
+* **Quality gate** (`market_noise()`): an item that looks like price/market
+  reporting **and** carries no policy-grade subject is dropped before it is
+  stored. Real macro news survives — a data *release* ("US August CPI rises
+  3.4%"), a policy *act* ("央行下调LPR"), a regulatory move, sanctions — while
+  the market's *reaction* to it and its *odds* on it do not ("traders raise
+  Fed rate-hike bets", "After inflation data, euro extends decline…").
+* **Storage cap** (`macro_store_max_per_run`, default 12): the macro tier used
+  to store every candidate it collected and score only the top few. It now
+  stores at most 12 per run, so the browsable DB stays a record of notable
+  macro news instead of a dump of the tape. Typical effect: ~48 → 12 rows/run.
+
+To clean out a backlog collected before the gate existed:
+
+```bash
+python3 news_updater.py --purge-macro-noise-dry   # show what would go
+python3 news_updater.py --purge-macro-noise       # delete it
+```
+
+It removes stored macro/global chatter plus unscored leftovers, and **never**
+touches a row that was pushed to Telegram (those are the record of what you
+were actually sent).
+
 ## Reading Chinese items (translation)
 
 Every stored item carries an English title (the AI translates it), shown above
