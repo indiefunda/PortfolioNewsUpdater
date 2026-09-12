@@ -1591,6 +1591,17 @@ def build_zh_terms(meta):
         v = str(value or "").strip()
         if not v or not is_chinese(v):      # ZH list only
             return
+        # Never spend a search slot on a query phrase ("奇富科技 新闻") or a
+        # domain - those come from discovery's keyword field and match nothing
+        # as a news term.
+        if re.search(r"\s", v) and is_chinese(v):
+            return
+        if any(w in v for w in _QUERY_WORDS):
+            return
+        if is_generic_term(v):
+            return
+        if "http" in v or re.fullmatch(r"[a-z0-9.\-]+\.[a-z]{2,}", v.lower()):
+            return
         candidates.append((term_quality(v) if rank_hint is None else rank_hint,
                            len(candidates), v))
 
@@ -1722,56 +1733,315 @@ def build_site_domains(meta):
     return domains[:3]
 
 
+def build_discovery_queries(ticker, name_hint, name_en="", overseas_only=False):
+    """
+    Search queries for subsidiary discovery, built from DIFFERENT ANGLES.
+
+    The old discovery asked one question - "<name> 子公司 旗下品牌" - which
+    reliably returns Chinese corporate-registry pages: full legal entity names
+    (湖北恒隆汽车系统集团有限公司) and nothing else. That is why discovery never
+    surfaced brands (分期乐, 平安普惠, Poni) or overseas entities (Global Care,
+    LU Global): registry pages do not list them as brands, and "overseas" is not
+    a concept in a domestic registry at all.
+
+    Each angle below targets a different kind of name:
+      * operations   - what the businesses/platforms are called
+      * brand        - consumer-facing brand names and apps
+      * international- foreign subsidiaries, which are the ones that never show
+                       up in a Chinese registry search
+    """
+    name = name_hint or ticker
+    if overseas_only:
+        return [
+            f"{name} overseas subsidiaries international expansion Hong Kong "
+            f"Singapore Indonesia Vietnam",
+            f"{ticker} {name_en} foreign subsidiary subsidiary list annual report",
+            f"{name} 海外 子公司 国际业务 香港 新加坡 越南 印尼",
+        ]
+    return [
+        # Chinese operations + platforms, phrased the way articles phrase them.
+        f"{name} 旗下 业务 平台 产品 品牌",
+        f"{name} 子公司 品牌 应用",
+        # Consumer/brand names, including apps.
+        f"{name} 旗下APP 品牌 消费金融 平台 名称",
+        # English/brand names and international operations.
+        f"{ticker} {name_en} subsidiaries brands international".strip(),
+        f"{ticker} {name_en} company structure brands products".strip(),
+    ]
+
+
+# Registry-name suffixes. A name containing one of these is a legal entity, not
+# a brand - useful as a classification signal but a poor news search term.
+_LEGAL_SUFFIXES = ("有限公司", "股份有限公司", "有限责任公司", "集团有限", "公司",
+                   "Inc", "Ltd", "Limited", "LLC", "Corporation", "Co.,")
+
+
+# Words that make a "keyword" a QUERY PHRASE rather than a name. Discovery
+# sometimes returns things like "奇富科技 新闻" or "QFIN 财报" - that is the search
+# instruction, not the entity, and as a term it both wastes a budget slot and
+# matches nothing.
+_QUERY_WORDS = ("新闻", "财报", "公告", "股价", "股票", "业绩", "动态", "消息",
+                "news", "stock", "results", "earnings", "report", "quote")
+# GENERIC business words. As a search term these match the entire market
+# ("金融服务" returned a wall of unrelated finance stories), so a name made only
+# of these is never useful - discovery does sometimes emit them.
+_GENERIC_TERMS = {
+    "金融服务", "金融科技", "fintech", "financial services", "finance",
+    "technology", "technology company", "平台", "开放平台", "小微企业金融",
+    "小微企业主金融服务", "消费金融", "贷款", "保险", "银行", "投资", "理财",
+    "科技", "信息科技", "网络科技", "集团", "控股", "公司", "服务",
+}
+# A name is generic when every CJK character run in it is one of these words,
+# i.e. it carries no company-specific information.
+_GENERIC_CJK_RUNS = ("金融", "服务", "科技", "平台", "小微", "企业", "信息",
+                     "网络", "集团", "控股", "公司", "消费", "贷款", "银行",
+                     "保险", "投资", "理财", "开放")
+
+
+def is_generic_term(term):
+    """True when a term is a generic business phrase, not a company name."""
+    t = str(term or "").strip()
+    if not t:
+        return True
+    if t.lower() in _GENERIC_TERMS:
+        return True
+    if not is_chinese(t):
+        return False
+    # Strip generic runs; if nothing specific remains, it is generic.
+    leftover = t
+    for run in _GENERIC_CJK_RUNS:
+        leftover = leftover.replace(run, "")
+    return len(leftover.strip()) == 0
+
+
+def brand_like_names(names, limit=8):
+    """
+    Keep only names that are usable as NEWS SEARCH TERMS.
+
+    Discovery returns far more legal entities than brands, so without this the
+    brands are diluted away. Rejected here:
+      * legal entities (they contain 有限公司 / Inc / Ltd ...);
+      * domains and URLs ("lu.com") - they belong in website fields;
+      * query phrases ("奇富科技 新闻", "QFIN 财报") - a phrase with a space or a
+        search modifier is the instruction, not a name;
+      * mixed-script marketing slogans ("一横N纵") - phrases, not names;
+      * anything longer than a brand usually is.
+    """
+    out = []
+    for raw in names or []:
+        n = str(raw or "").strip()
+        if not n or n in out:
+            continue
+        if any(suffix in n for suffix in _LEGAL_SUFFIXES):
+            continue
+        low = n.lower()
+        if "http" in low or re.fullmatch(r"[a-z0-9.\-]+\.[a-z]{2,}", low):
+            continue                      # a domain, not a name
+        # A phrase, not a name: a space inside CHINESE almost always means a
+        # query ("奇富科技 新闻"). English brand names legitimately contain
+        # spaces ("Poni Insurtech", "Global Care"), so those are allowed.
+        if re.search(r"\s", n) and is_chinese(n):
+            continue
+        if any(w in n for w in _QUERY_WORDS):
+            continue
+        if is_generic_term(n):
+            continue
+        # A bare ticker ("CAAS", "LX") is legitimate as an English term - the
+        # company's own English name is often exactly that. Keep it.
+        if ":" in n and not re.fullmatch(r"[A-Za-z]{1,6}", n):   # "NASDAQ:CAAS"
+            continue
+        has_cjk = is_chinese(n)
+        has_latin = bool(re.search(r"[A-Za-z]", n))
+        if has_cjk and has_latin:
+            # Allow only when the Latin part is a real word (e.g. "5G网络").
+            if not re.findall(r"[A-Za-z]{2,}", n):
+                continue
+        if has_cjk and not has_latin:
+            if not (2 <= len(n) <= 8):
+                continue
+        elif has_latin and not has_cjk:
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9&.\- ]{1,30}", n):
+                continue
+            if len(n) > 24:
+                continue
+        out.append(n)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def prune_cross_ticker_keywords(lookup, max_tickers=1):
+    """
+    A brand name may belong to only ONE ticker in the lookup.
+
+    The brand-discovery pass is fuzzy about ownership: asked for HUIZ's brands,
+    the model listed "LU Global" (which is Lufax's). A name attached to several
+    tickers makes one company's news look like another's, so it is resolved to
+    its most likely owner and removed from the rest.
+
+    Ownership is decided by evidence, not by list order:
+      * the name contains the ticker symbol, or starts with / contains the
+        ticker's own Chinese or English name -> that ticker keeps it;
+      * otherwise it is genuinely ambiguous and is dropped from every ticker
+        (the ticker-specific names, which are what actually find news, stay).
+
+    Deterministic and cheap, so it runs on every discovery.
+    """
+    def owned_by(ticker, entry, name):
+        low = name.lower()
+        if re.search(r"(?<![a-z0-9])" + re.escape(ticker.lower()) + r"(?![a-z0-9])", low):
+            return True
+        for key in ("name_zh", "name_en"):
+            base = str(entry.get(key) or "").strip().lower()
+            if len(base) >= 2 and (base in low or low in base):
+                return True
+        return False
+
+    owners = {}
+    for ticker, entry in (lookup or {}).items():
+        for k in ("keywords", "subsidiaries_zh", "subsidiaries_other"):
+            for name in (entry.get(k) or []):
+                name = str(name or "").strip()
+                if not name:
+                    continue
+                key = name.lower()
+                rec = owners.setdefault(key, {"name": name, "where": []})
+                rec["where"].append((ticker, k))
+                if owned_by(ticker, entry, name):
+                    rec.setdefault("owner", ticker)
+    resolved = 0
+    for key, info in owners.items():
+        tickers = {t for t, _ in info["where"]}
+        if len(tickers) <= max_tickers:
+            continue
+        keep = info.get("owner")          # None -> drop it everywhere
+        for ticker, field in info["where"]:
+            if ticker == keep:
+                continue
+            entry = lookup.get(ticker) or {}
+            entry[field] = [x for x in (entry.get(field) or [])
+                            if str(x).strip().lower() != key]
+        resolved += 1
+    return resolved
+
+
+def discover_brands(ticker, name_hint, name_en, snippets, config, secrets):
+    """
+    A second, BRAND-FOCUSED extraction pass over the discovery snippets.
+
+    The main profile extraction returns whatever names it can support, and
+    because registry pages dominate the snippets it mostly returns registry
+    names. This pass asks a narrower question - "what are the consumer brands,
+    products, apps and foreign subsidiaries?" - which is what news headlines
+    actually use. Its output is merged into `keywords`, which build_zh_terms()
+    now ranks (short brand-like names first), so brands reach the search budget
+    even when the registry names are still present.
+    """
+    if not snippets or not secrets.get("ai_api_key"):
+        return []
+    base = config.get("ai_base_url") or DEFAULT_AI_BASE
+    model = config.get("ai_model") or DEFAULT_AI_MODEL
+    prompt = (
+        f"From the search results below, list the CONSUMER BRANDS, PRODUCTS, "
+        f"APPS and FOREIGN/OVERSEAS subsidiaries of the company {ticker}"
+        f"{(' (' + name_hint + ')') if name_hint else ''}.\n"
+        f"{('English name: ' + name_en) if name_en else ''}\n"
+        "Rules:\n"
+        "  - Return the SHORT names that appear in news headlines, NOT legal "
+        "entity names. Prefer 分期乐 over 深圳市分期乐网络科技有限公司, and "
+        "Fenqile over Shenzhen Fenqile Network Technology Co., Ltd.\n"
+        "  - INCLUDE overseas subsidiaries and their local brand names (e.g. "
+        "Poni Insurtech, Global Care, LU Global) - these are important and are "
+        "easy to miss.\n"
+        "  - INCLUDE apps and platform/product names.\n"
+        "  - Do NOT include the company's own name, generic words (公司, 集团, "
+        "银行 or 'financial services'), domain names or URLs, marketing "
+        "slogans, or names you cannot support from the results.\n"
+        "  - CRITICAL: every name must belong to THIS company. If a name looks "
+        "like it belongs to a DIFFERENT listed company or a competitor, leave "
+        "it out.\n"
+        'Return ONLY a JSON object: {"brands_zh": [Chinese brand names], '
+        '"brands_other": [non-Chinese brand names]}.\n\n'
+        "SEARCH RESULTS:\n" + "\n".join(snippets[:14])
+    )
+    content = _chat(base, model, secrets.get("ai_api_key", ""),
+                    "You are a precise JSON-returning assistant.", prompt)
+    parsed = _parse_json_object(content) if content else None
+    if not parsed:
+        return []
+    names = []
+    for key in ("brands_zh", "brands_other"):
+        for v in (parsed.get(key) or []):
+            v = str(v or "").strip()
+            if v and v not in names:
+                names.append(v)
+    return brand_like_names(names)
+
+
 def discover_company(ticker, config, secrets, existing=None):
     """
     THE lookup step: for a ticker that is missing / stale / too sparse in
-    company_lookup.json, search the web for its Chinese/local names and its
-    subsidiaries (the real alpha - e.g. LX -> 分期乐, Fenqile, Indonesia
-    companies), extract a structured profile with AI, and WRITE IT BACK to
-    the lookup file so it is used from then on.
+    company_lookup.json, search the web for its Chinese/local names AND its
+    brands and overseas entities, extract a structured profile with AI, and
+    WRITE IT BACK to the lookup file so it is used from then on.
 
-    Discovery sources, cheapest first:
-      1. Tavily (general topic, 1 search) - best for reference lookups.
-      2. Eastmoney search on the ticker symbol (free).
-      3. Google News zh on "<TICKER> 股票" (free).
+    Discovery runs TWO passes over DIFFERENT query angles, because one query
+    angle returns one kind of name:
+
+      pass 1 - operations (Chinese): 子公司 业务 平台 品牌 -> the company's
+               Chinese names plus registry entities.
+      pass 2 - international (mixed): overseas/international + annual-report
+               phrasing -> the foreign subsidiaries and local brands that a
+               Chinese registry search can never surface (Poni Insurtech,
+               Global Care, LU Global, Fenmoli...).
+
+    Sources, cheapest first: EXA (semantic, best for related entities) then
+    Tavily (reference lookups); free Eastmoney/Google News as a last resort.
     Returns the (possibly minimal) entry.
     """
     existing = existing or {}
     name_hint = str(existing.get("name_zh") or "").strip()
+    name_en = str(existing.get("name_en") or "").strip()
     ai_key = secrets.get("ai_api_key", "")
     snippets = []
 
-    # 1) EXA (neural) - the best discovery source: finds related companies /
-    #    subsidiaries semantically (e.g. 深圳市分期乐网络科技 for LX, 陆金申华
-    #    for LU) that keyword search never surfaces. Category "company" returns
-    #    company-profile pages; small text snippets for the AI grounding.
+    def add_snippets(res, label):
+        if not res:
+            return
+        snippets.extend(f"- {it['title']}: {it.get('snippet', '')[:200]}" for it in res)
+        print(f"  [discovery] {ticker}: {label} returned {len(res)} result(s).")
+
+    # ---- pass 1: the company's Chinese names, businesses and platforms ----
+    queries = build_discovery_queries(ticker, name_hint, name_en)[:3]
     if secrets.get("exa_api_key"):
-        q = f"{name_hint or ticker} 子公司 旗下品牌 相关企业 subsidiaries related companies"
-        res = fetch_exa(q, secrets, config, since_dt=None, limit=6,
-                        with_text=True, category="company")
-        if res:
-            snippets.extend(f"- {it['title']}: {it.get('snippet', '')[:200]}" for it in res)
-            print(f"  [discovery] {ticker}: EXA returned {len(res)} company result(s) "
-                  f"for profile lookup.")
+        # EXA is neural: it finds RELATED entities that keyword search misses.
+        q = f"{name_hint or ticker} 子公司 旗下品牌 业务 平台 海外 subsidiaries brands"
+        add_snippets(fetch_exa(q, secrets, config, since_dt=None, limit=6,
+                               with_text=True, category="company"),
+                     "EXA (company)")
+    if secrets.get("tavily_api_key"):
+        for q in queries:
+            add_snippets(fetch_tavily(q, secrets, config, since_dt=None, limit=6,
+                                      topic="general"), f"Tavily '{q[:34]}'")
+            if len(snippets) >= 12:
+                break
 
-    # 1b) Tavily general - fallback / enrichment (only if EXA gave us nothing).
-    if not snippets and secrets.get("tavily_api_key"):
-        queries = []
-        if name_hint:
-            queries.append(f"{name_hint} 公司 子公司 旗下品牌 subsidiaries brands")
-        else:
-            queries.append(f"{ticker} company profile subsidiaries brands stock")
-            queries.append(f"{ticker} 上市公司 子公司 旗下品牌")
-        for q in queries[:2]:
-            res = fetch_tavily(q, secrets, config, since_dt=None, limit=6, topic="general")
-            if res:
-                snippets.extend(f"- {it['title']}: {it.get('snippet', '')[:200]}" for it in res)
-                print(f"  [discovery] {ticker}: Tavily returned {len(res)} result(s) "
-                      f"for profile lookup ({q[:50]}...).")
-                if len(snippets) >= 10:
-                    break
+    # ---- pass 2: overseas / international entities ----
+    # This is the angle that finds the subsidiaries a registry search cannot.
+    if len(snippets) < 14:
+        for q in build_discovery_queries(ticker, name_hint, name_en,
+                                        overseas_only=True)[:2]:
+            if secrets.get("exa_api_key") and len(snippets) < 8:
+                add_snippets(fetch_exa(q, secrets, config, since_dt=None, limit=5,
+                                       with_text=True, category="company"),
+                             "EXA (overseas)")
+            if secrets.get("tavily_api_key"):
+                add_snippets(fetch_tavily(q, secrets, config, since_dt=None, limit=6,
+                                          topic="general"), f"Tavily '{q[:34]}'")
+            if len(snippets) >= 20:
+                break
 
-    # 2) Free fallbacks / enrichment (only if Tavily gave us nothing).
+    # ---- free fallbacks (no paid keys, or everything failed) ----
     if not snippets:
         em_terms = [ticker] + ([name_hint] if name_hint else [ticker + " 股票"])
         em = fetch_eastmoney_search(ticker, since_dt=None, limit=6, terms=em_terms)
@@ -1809,27 +2079,44 @@ def discover_company(ticker, config, secrets, existing=None):
             f"You are a corporate research assistant. Below are search results "
             f"for the stock {ticker}"
             f"{(' (Chinese name: ' + name_hint + ')') if name_hint else ''}.\n"
-            "Extract a structured profile of this company:\n"
+            "Extract a structured profile of this company.\n"
+            "\n"
+            "THE MOST IMPORTANT DISTINCTION - two very different kinds of name:\n"
+            "  * BRAND names are short and are what news headlines use:\n"
+            "      分期乐, 桔子理财, 提钱乐, 平安普惠, 元保数科, Fenqile, Poni,\n"
+            "      Global Care, LU Global\n"
+            "  * LEGAL ENTITY names are long, end in 有限公司 / Inc / Ltd, and are\n"
+            "    almost never written in a headline:\n"
+            "      深圳市分期乐网络科技有限公司, Ping An Puhui Financing Guarantee Co., Ltd.\n"
+            "Report BOTH, but never let the legal entities crowd out the brands,\n"
+            "and never invent a brand name to fill the list.\n"
+            "\n"
+            "Keys:\n"
             "  name_zh: official Chinese name (or '' if unknown)\n"
             "  name_en: official English name\n"
-            "  aliases_zh: list of other Chinese names/abbreviations\n"
-            "  subsidiaries_zh: list of Chinese subsidiary/brand names - "
-            "include brands, apps, fintech platforms, BANKS, brokers, "
-            "overseas/HK entities and any subsidiary mentioned (e.g. 分期乐 "
-            "for LexinFintech, 平安普惠 for Lufax)\n"
-            "  subsidiaries_other: list of non-Chinese subsidiaries/brands "
-            "(e.g. Fenqile, Temu, LU Global)\n"
+            "  aliases_zh: other Chinese names/abbreviations the company is called\n"
+            "    (e.g. 乐信集团, 乐信金融)\n"
+            "  subsidiaries_zh: Chinese subsidiary names. List the SHORT BRAND\n"
+            "    names FIRST (分期乐, 桔子理财, 提钱乐, 平安普惠, 鼎盛资产, 云犀科技),\n"
+            "    then the legal entities. Include platforms, apps, microlending\n"
+            "    units, guarantee companies and any Hong Kong entity\n"
+            "  subsidiaries_other: non-Chinese subsidiary/brand names - this is\n"
+            "    where OVERSEAS entities belong (Fenqile, Poni Insurtech,\n"
+            "    Global Care, LU Global, Fenmoli, and any Indonesia/Vietnam/\n"
+            "    Singapore/Hong Kong entity). Look for these especially: they are\n"
+            "    easy to miss and they never appear in a Chinese registry\n"
             "  website: the official corporate website URL (or '' if unknown)\n"
             "  news_url: the official news / press-release page URL (or '' if unknown)\n"
-            "  subsidiary_websites: JSON object mapping each subsidiary/brand "
-            "name to its website URL when visible in the results (or {})\n"
-            "  keywords: 3-8 search keywords (Chinese and English names/brands) "
-            "that will be used to find news about this company AND its "
-            "subsidiaries\n"
+            "  subsidiary_websites: JSON object mapping each subsidiary/brand\n"
+            "    name to its website URL when visible in the results (or {})\n"
+            "  keywords: 5-10 search keywords for finding news about this company\n"
+            "    AND its subsidiaries. PREFER SHORT BRAND NAMES (Chinese and\n"
+            "    English) over legal entity names - these are used as search\n"
+            "    terms and long legal names waste the budget\n"
             "ONLY include names and URLs you can support from the search results "
             "below. If something is unclear, omit it rather than guessing.\n"
             "Return ONLY a JSON object with exactly these keys.\n\n"
-            "SEARCH RESULTS:\n" + "\n".join(snippets[:12])
+            "SEARCH RESULTS:\n" + "\n".join(snippets[:16])
         )
         content = _chat(base, model, ai_key, "You are a precise JSON-returning assistant.", prompt)
         parsed = _parse_json_object(content) if content else None
@@ -1840,6 +2127,25 @@ def discover_company(ticker, config, secrets, existing=None):
                   f"site={entry.get('website') or '?'}, "
                   f"subs_zh={entry.get('subsidiaries_zh')}, "
                   f"subs_other={entry.get('subsidiaries_other')})")
+            # Second, brand-focused pass: the profile pass above is dominated by
+            # registry pages, so brands and overseas brands need their own
+            # question. The result goes into `keywords`, which build_zh_terms()
+            # ranks (short brand-like names first) so they reach the search
+            # budget even alongside the legal names.
+            try:
+                brands = discover_brands(ticker, name_hint or entry.get("name_zh", ""),
+                                         name_en or entry.get("name_en", ""),
+                                         snippets, config, secrets)
+                if brands:
+                    have = set(str(x) for x in (entry.get("keywords") or []))
+                    added = [b for b in brands if b not in have]
+                    if added:
+                        entry["keywords"] = list(entry.get("keywords") or []) + added
+                        print(f"  [discovery] {ticker}: brand pass added "
+                              f"{len(added)} brand/overseas name(s): {added}")
+            except Exception as exc:
+                print(f"  [warn] brand extraction failed for {ticker}: {exc}",
+                      file=sys.stderr)
         else:
             print(f"  [discovery] {ticker}: AI extraction failed - keeping minimal profile.", file=sys.stderr)
     else:
@@ -1884,8 +2190,16 @@ def discover_company(ticker, config, secrets, existing=None):
     # Persist to the lookup file (create it if missing).
     lookup = load_lookup()
     lookup[ticker] = entry
+    # A brand may belong to only ONE ticker: the brand pass is fuzzy about
+    # ownership (asked for HUIZ's brands it once listed "LU Global", which is
+    # Lufax's), so names claimed by several tickers are dropped from all of
+    # them. Without this, one company's news looks like another's.
+    ambiguous = prune_cross_ticker_keywords(lookup)
+    if ambiguous:
+        print(f"  [discovery] dropped {ambiguous} name(s) claimed by more than one "
+              f"ticker (ambiguous ownership).")
     save_lookup(lookup)
-    return entry
+    return lookup.get(ticker, entry)
 
 
 def ensure_company_meta(ticker, config, secrets, force=False):
