@@ -4188,29 +4188,37 @@ def main():
     #                           config.
     if "--dump-effective-meta" in sys.argv:
         config = load_config()
+        secrets = load_secrets()
         out = {}
-        for t in [str(x).strip().upper() for x in config.get("tickers", []) if str(x).strip()]:
-            try:
-                meta = ensure_company_meta(t, config, load_secrets())
-            except Exception as exc:
-                out[t] = {"error": str(exc)}
-                continue
-            entry = {
-                "name_zh": meta.get("name_zh") or "",
-                "name_en": meta.get("name_en") or "",
-                "aliases_zh": list(meta.get("aliases_zh") or []),
-                "subsidiaries_zh": list(meta.get("subsidiaries_zh") or []),
-                "subsidiaries_other": list(meta.get("subsidiaries_other") or []),
-                "keywords": list(meta.get("keywords") or []),
-                "website": meta.get("website") or "",
-                # The terms actually used for searching, in ranked order.
-                "search_terms_zh": build_zh_terms(meta),
-                "search_terms_en": build_en_terms(meta),
-                # Which of those came from the user's config (editable) vs the
-                # auto-discovery (informational).
-                "from_config": sorted((config.get("ticker_meta") or {}).get(t, {}).keys()),
-            }
-            out[t] = entry
+        # ensure_company_meta() chatters on stdout ("[lookup] CAAS: from
+        # lookup..."), and this mode's whole output must be ONE JSON object for
+        # the panel to parse. Swallow anything printed while building it.
+        import contextlib
+        import io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            tickers = [str(x).strip().upper() for x in config.get("tickers", [])
+                       if str(x).strip()]
+            for t in tickers:
+                try:
+                    meta = ensure_company_meta(t, config, secrets)
+                except Exception as exc:
+                    out[t] = {"error": str(exc)}
+                    continue
+                out[t] = {
+                    "name_zh": meta.get("name_zh") or "",
+                    "name_en": meta.get("name_en") or "",
+                    "aliases_zh": list(meta.get("aliases_zh") or []),
+                    "subsidiaries_zh": list(meta.get("subsidiaries_zh") or []),
+                    "subsidiaries_other": list(meta.get("subsidiaries_other") or []),
+                    "keywords": list(meta.get("keywords") or []),
+                    "website": meta.get("website") or "",
+                    # The terms actually used for searching, in ranked order.
+                    "search_terms_zh": build_zh_terms(meta),
+                    "search_terms_en": build_en_terms(meta),
+                    # Which keys the user's own config provides (editable).
+                    "from_config": sorted((config.get("ticker_meta") or {}).get(t, {}).keys()),
+                }
         print(json.dumps(out, ensure_ascii=False))
         sys.exit(0)
 
