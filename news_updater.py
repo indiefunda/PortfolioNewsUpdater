@@ -1978,7 +1978,50 @@ def discover_brands(ticker, name_hint, name_en, snippets, config, secrets):
     return brand_like_names(names)
 
 
-def discover_company(ticker, config, secrets, existing=None):
+def discover_identity_from_headlines(ticker, snippets, config, secrets):
+    """
+    Last-resort identity extraction from NEWS HEADLINES only.
+
+    When the paid discovery sources are unavailable (Tavily's hard daily cap is
+    the common case) all we may have is a handful of free news headlines. That
+    is still enough to learn the company's Chinese name and common aliases, and
+    without them a Chinese-first news search cannot work at all - the ad-hoc
+    scan would be left with just the English ticker.
+
+    Returns {name_zh, name_en, aliases_zh} (any of them possibly absent).
+    """
+    if not snippets or not secrets.get("ai_api_key"):
+        return {}
+    base = config.get("ai_base_url") or DEFAULT_AI_BASE
+    model = config.get("ai_model") or DEFAULT_AI_MODEL
+    prompt = (
+        f"These are recent news headlines about the stock {ticker}. Identify the "
+        "company.\n"
+        'Return ONLY a JSON object with keys: name_zh (the company\'s Chinese '
+        "name exactly as it appears in Chinese media, or ''), name_en (English "
+        "name), aliases_zh (array of other Chinese names/abbreviations used for "
+        "it, e.g. 拼多多, 拼多多控股).\n"
+        "Only include names you can actually support from the headlines. Use '' "
+        "or [] when unsure - never guess.\n\n"
+        "HEADLINES:\n" + "\n".join(snippets[:20])
+    )
+    content = _chat(base, model, secrets.get("ai_api_key", ""),
+                    "You are a precise JSON-returning assistant.", prompt)
+    parsed = _parse_json_object(content) if content else None
+    if not parsed:
+        return {}
+    out = {}
+    for k in ("name_zh", "name_en"):
+        v = str(parsed.get(k) or "").strip()
+        if v:
+            out[k] = v
+    aliases = [str(x).strip() for x in (parsed.get("aliases_zh") or []) if str(x).strip()]
+    if aliases:
+        out["aliases_zh"] = list(dict.fromkeys(aliases))[:6]
+    return out
+
+
+def discover_company(ticker, config, secrets, existing=None, persist=True):
     """
     THE lookup step: for a ticker that is missing / stale / too sparse in
     company_lookup.json, search the web for its Chinese/local names AND its
@@ -2042,16 +2085,28 @@ def discover_company(ticker, config, secrets, existing=None):
                 break
 
     # ---- free fallbacks (no paid keys, or everything failed) ----
+    # These matter for the AD-HOC scan especially: Tavily has a hard daily cap,
+    # and once it is reached discovery would otherwise produce NO profile at all
+    # (no Chinese name, no brands), leaving the scan with only the English
+    # ticker. Google News is free and still returns plenty.
+    name_seed = name_hint or name_en or ticker
     if not snippets:
         em_terms = [ticker] + ([name_hint] if name_hint else [ticker + " 股票"])
         em = fetch_eastmoney_search(ticker, since_dt=None, limit=6, terms=em_terms)
         if em:
             snippets.extend(f"- {it['title']}" for it in em)
     if not snippets:
-        gz = fetch_rss(google_news_url(f"{ticker} 股票", "zh"), ticker,
-                       source="GoogleNewsZH", lang="zh")
-        if gz:
-            snippets.extend(f"- {it['title']}" for it in gz[:6])
+        # zh feed first (best chance of the Chinese name), then EN for brands.
+        for seed_lang in (("zh", name_seed), ("en", name_en or ticker)):
+            lang, seed = seed_lang
+            gz = fetch_rss(google_news_url(f"{seed} 股票" if lang == "zh" else
+                                           f"{seed} stock", lang),
+                           ticker, source=f"GoogleNews{'ZH' if lang == 'zh' else ''}",
+                           lang=lang)
+            if gz:
+                snippets.extend(f"- {it['title']}" for it in gz[:8])
+                print(f"  [discovery] {ticker}: free {lang.upper()} news fallback "
+                      f"returned {len(gz)} headline(s).")
 
     today = datetime.now(EASTERN).strftime("%Y-%m-%d")
     entry = {
@@ -2152,6 +2207,25 @@ def discover_company(ticker, config, secrets, existing=None):
         print(f"  [discovery] {ticker}: no AI key or no search results - "
               f"keeping minimal profile (will retry when stale).", file=sys.stderr)
 
+    # If discovery produced nothing usable (AI refused to guess, Tavily down,
+    # or the daily cap was reached), try the headlines-only identity pass
+    # before giving up: a Chinese name is the minimum needed to search the
+    # Chinese sources at all.
+    if not entry.get("name_zh") and snippets and ai_key:
+        try:
+            identity = discover_identity_from_headlines(ticker, snippets, config, secrets)
+            if identity:
+                for k, v in identity.items():
+                    if k == "aliases_zh":
+                        entry[k] = list(dict.fromkeys(list(entry.get(k) or []) + v))
+                    elif v and not entry.get(k):
+                        entry[k] = v
+                print(f"  [discovery] {ticker}: recovered identity from headlines "
+                      f"(zh={entry.get('name_zh') or '?'}, aliases={entry.get('aliases_zh')})")
+        except Exception as exc:
+            print(f"  [warn] headline identity pass failed for {ticker}: {exc}",
+                  file=sys.stderr)
+
     # If discovery produced nothing usable (AI refused to guess, Tavily down),
     # backdate last_updated so we retry within ~a week instead of waiting out
     # the full refresh window - otherwise a new ticker could sit with zero
@@ -2167,12 +2241,15 @@ def discover_company(ticker, config, secrets, existing=None):
     # did not have, tell the user on Telegram - this is the "wait, they own
     # Temu / a bank in Hong Kong?" moment, and it is exactly the alpha they
     # want to know about.
+    #
+    # Skipped entirely for an AD-HOC scan (persist=False): that path must not
+    # notify, must not write, and must leave no trace.
     existing_subs = set((existing.get("subsidiaries_zh") or [])
                         + (existing.get("subsidiaries_other") or []))
     new_subs = [s for s in (entry.get("subsidiaries_zh") or [])
                 + (entry.get("subsidiaries_other") or []) if s not in existing_subs]
     new_name = bool(entry.get("name_zh")) and entry.get("name_zh") != name_hint
-    if (new_subs or new_name) and not NO_WRITE:
+    if persist and (new_subs or new_name) and not NO_WRITE:
         token = secrets.get("telegram_bot_token", "")
         chat_id = secrets.get("telegram_chat_id", "")
         if token and chat_id:
@@ -2186,6 +2263,11 @@ def discover_company(ticker, config, secrets, existing=None):
             send_telegram(token, chat_id, "\n".join(msg))
             print(f"  [discovery] {ticker}: sent Telegram alert "
                   f"({len(new_subs)} new subsidiary name(s)).")
+
+    if not persist:
+        # Ad-hoc scan: return the profile WITHOUT writing company_lookup.json.
+        entry["_adhoc"] = True
+        return entry
 
     # Persist to the lookup file (create it if missing).
     lookup = load_lookup()
@@ -2202,17 +2284,20 @@ def discover_company(ticker, config, secrets, existing=None):
     return lookup.get(ticker, entry)
 
 
-def ensure_company_meta(ticker, config, secrets, force=False):
+def ensure_company_meta(ticker, config, secrets, force=False, persist=True):
     """
     The per-startup entry point: look the ticker up in company_lookup.json
     (seeded from config ticker_meta), run discovery when it is missing,
     stale, too sparse (no subsidiaries known), or force=True (--rediscover),
     then return the effective profile (discovered entry overlaid with
     explicit config overrides).
+
+    persist=False is the AD-HOC path: it resolves the profile and returns it
+    without writing company_lookup.json, so a one-off ticker leaves no trace.
     """
     lookup = load_lookup()
     lookup, seed_changed = seed_lookup_from_config(config, lookup)
-    if seed_changed:
+    if seed_changed and persist:
         # Persist config-seeded entries so the file exists even for tickers
         # that don't need (re-)discovery (e.g. LX already has subsidiaries).
         save_lookup(lookup)
@@ -2248,7 +2333,8 @@ def ensure_company_meta(ticker, config, secrets, force=False):
         print(f"  [lookup] {ticker}: {'FORCED ' if force else ''}"
               f"not in company lookup "
               f"{'(or stale/sparse)' if entry else ''} - searching and populating...")
-        entry = discover_company(ticker, config, secrets, existing=entry or {})
+        entry = discover_company(ticker, config, secrets, existing=entry or {},
+                                 persist=persist)
     elif entry is not None:
         print(f"  [lookup] {ticker}: from lookup "
               f"({entry.get('name_zh') or '?'}"
@@ -3990,6 +4076,235 @@ def translate_stored_news(conn, config, secrets, limit=200, pushed_only=False,
     return n, len(rows)
 
 
+# ---------------------------------------------------------------------------
+# Ad-hoc ticker scan (panel "Deep search" tab)
+# ---------------------------------------------------------------------------
+# A one-off, READ-ONLY analysis of any ticker: discover its brands, deep-search
+# the recent past, score + label each article, then summarise the overall
+# sentiment. It deliberately touches NO state - no news.db, no dedup ledger, no
+# company_lookup.json, no usage counters, no Telegram. That is a property of the
+# code path, not a flag: none of the write helpers (insert_news, mark_seen,
+# save_lookup, record_pushed_stories, set_last_fetched) are ever called here.
+ADHOC_DEFAULT_DAYS = 75          # ~2.5 months
+ADHOC_MAX_ARTICLES = 40          # cap for the AI scoring call
+
+
+def adhoc_collect(ticker, meta, config, secrets, days=ADHOC_DEFAULT_DAYS):
+    """
+    Deep-search the last `days` for one ticker. Returns (items, cost) where
+    cost records the paid calls actually made, so the user can see what a scan
+    costs.
+
+    Sources: Google News zh + EN (free), Eastmoney (free), Tavily news
+    (recency-bounded). No EXA: it is the most expensive source and the
+    relevance gate drops most of what it returns.
+    """
+    zh_terms = build_zh_terms(meta)
+    en_terms = build_en_terms(meta)
+    since = datetime.now(EASTERN) - timedelta(days=days)
+    cost = {"tavily_searches": 0, "ai_calls": 0, "sources": []}
+    collected = []
+
+    # Tavily's `days` cap is small, so ask it separately with its own window.
+    def tav_days():
+        return max(1, min(30, days))
+
+    # --- Google News, Chinese: one query built from the ranked names/brands ---
+    if zh_terms:
+        q = " OR ".join(zh_terms[:6])
+        res = fetch_rss(google_news_url(q, "zh"), ticker, since,
+                        source="GoogleNewsZH", lang="zh")
+        if res:
+            collected.extend(res)
+            cost["sources"].append(f"GoogleNewsZH:{len(res)}")
+    # --- Google News, English: ticker + English names/brands ---
+    q = " OR ".join([f"{ticker} stock"] + en_terms[:3])
+    res = fetch_rss(google_news_url(q, "en"), ticker, since,
+                    source="GoogleNews", lang="en")
+    if res:
+        collected.extend(res)
+        cost["sources"].append(f"GoogleNews:{len(res)}")
+
+    # --- Eastmoney search, one query per term (capped) ---
+    if zh_terms:
+        out = []
+        for term in zh_terms[:EASTMONEY_MAX_QUERIES]:
+            r = fetch_eastmoney_search(term, since, terms=zh_terms)
+            if r:
+                out.extend(r)
+        if out:
+            collected.extend(out)
+            cost["sources"].append(f"Eastmoney:{len(out)}")
+
+    # --- Tavily news, recency-bounded (1-2 queries) ---
+    if secrets.get("tavily_api_key"):
+        tav_query = " OR ".join((zh_terms[:3] + en_terms[:2]) or [ticker])
+        r = fetch_tavily(tav_query, secrets, config, since,
+                         limit=10, topic="news", terms=zh_terms + en_terms)
+        if r is not None:
+            cost["tavily_searches"] += 1
+            collected.extend(r)
+            cost["sources"].append(f"Tavily:{len(r)}")
+
+    # --- keep only what is actually about this company ---
+    resolved = resolve_relevance(meta)
+    items, seen = [], set()
+    for it in collected:
+        it.setdefault("ticker", ticker)
+        # For an ad-hoc scan we keep sector-relevant items too (the user is
+        # researching), but never anything unrelated to the company or sector.
+        verdict = passes_relevance({"ticker": ticker, "title": it.get("title", ""),
+                                    "snippet": it.get("snippet", "")}, meta, resolved)
+        if verdict == "unrelated":
+            continue
+        pub = _parse_pub(it.get("date", ""))
+        if pub and pub < since:
+            continue
+        it["published_at"] = _normalize_pub(it.get("date", ""))
+        key = story_key(it)
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(it)
+    # Same-story collapse across sources (the same helper the live pipeline uses).
+    kept, collapsed = dedupe_same_story(items)
+    # Newest first, capped so the scoring call stays bounded.
+    kept.sort(key=lambda i: _parse_pub(i.get("published_at") or i.get("date") or "")
+              or datetime.min.replace(tzinfo=EASTERN), reverse=True)
+    if collapsed:
+        print(f"  [adhoc] {ticker}: collapsed {collapsed} duplicate(s) across sources.")
+    return kept[:ADHOC_MAX_ARTICLES], cost
+
+
+def adhoc_analyze(items, ticker, meta, config, secrets):
+    """
+    Score + label every article (ONE batched AI call) and then summarise the
+    overall recent sentiment (a second small call). Returns (articles, overall).
+    """
+    if not items:
+        return [], {}
+    enriched = ai_analyze(items, config, secrets, {ticker: meta},
+                          conn=None, run_start=None, prompt_mode="ticker")
+    articles = []
+    for it in enriched:
+        articles.append({
+            "title": it.get("title", ""),
+            "title_en": it.get("title_en") or it.get("title", ""),
+            "url": it.get("url", ""),
+            "source": it.get("source", ""),
+            "date": (it.get("published_at") or "")[:10],
+            "lang": it.get("lang", "en"),
+            "importance": it.get("importance"),
+            "sentiment": it.get("sentiment", "neutral"),
+            "category": it.get("category", ""),
+            "reason": it.get("reason", ""),
+            "impact": it.get("impact", ""),
+        })
+
+    # ---- overall sentiment: one small call over the scored headlines ----
+    overall = {}
+    key = secrets.get("ai_api_key", "")
+    if key and articles:
+        base = config.get("ai_base_url") or DEFAULT_AI_BASE
+        model = config.get("ai_model") or DEFAULT_AI_MODEL
+        name_zh = meta.get("name_zh") or ticker
+        brief = [
+            {"n": i, "title": a["title_en"], "importance": a["importance"],
+             "sentiment": a["sentiment"], "date": a["date"], "category": a["category"]}
+            for i, a in enumerate(articles, 1)
+        ]
+        prompt = (
+            f"Below are the {len(brief)} most relevant news items about the stock "
+            f"{ticker} ({name_zh}) from the recent past, with an importance score "
+            f"and a per-item sentiment already assigned.\n\n"
+            "Give ONE short analysis of where the news flow currently stands.\n"
+            "Return ONLY a JSON object with keys:\n"
+            "  sentiment: one of bullish / bearish / neutral / mixed\n"
+            "  confidence: integer 1-10 (how one-sided the news is)\n"
+            "  summary: 2-4 sentences in English. Say what the dominant themes "
+            "are, whether the balance of news is positive or negative, and what "
+            "would change that view. Be concrete and mention the most important "
+            "items. Do not repeat the list back.\n"
+            "  themes: array of 2-5 very short theme labels (e.g. 'regulatory "
+            "pressure', 'earnings miss', 'buyback')\n"
+            "  drivers: array of up to 3 objects {title, why} for the items that "
+            "matter most, referencing their titles.\n\n"
+            "ITEMS:\n" + json.dumps(brief, ensure_ascii=False)
+        )
+        content = _chat(base, model, key,
+                        "You are a precise JSON-returning equity analyst.", prompt)
+        parsed = _parse_json_object(content) if content else None
+        if parsed:
+            counts = {"positive": 0, "negative": 0, "neutral": 0}
+            for a in articles:
+                s = (a.get("sentiment") or "neutral").lower()
+                counts[s if s in counts else "neutral"] += 1
+            overall = {
+                "sentiment": str(parsed.get("sentiment") or "neutral").lower(),
+                "confidence": parsed.get("confidence"),
+                "summary": str(parsed.get("summary") or "").strip(),
+                "themes": [str(t) for t in (parsed.get("themes") or [])][:5],
+                "drivers": parsed.get("drivers") or [],
+                "counts": counts,
+            }
+    return articles, overall
+
+
+def adhoc_scan(ticker, config, secrets, days=ADHOC_DEFAULT_DAYS, refresh_profile=True):
+    """
+    The full ad-hoc scan: discover -> deep search -> score -> summarise.
+    Writes NOTHING anywhere. Returns the JSON-ready result dict.
+    """
+    ticker = str(ticker or "").strip().upper()
+    if not ticker:
+        return {"ok": False, "error": "No ticker given."}
+    result = {"ok": True, "ticker": ticker, "lookback_days": days,
+              "articles": [], "overall": {}, "cost": {}}
+
+    # 1) discover the company's names and brands WITHOUT persisting anything.
+    meta = {}
+    try:
+        if refresh_profile:
+            meta = ensure_company_meta(ticker, config, secrets, force=True,
+                                       persist=False)
+        else:
+            meta = ensure_company_meta(ticker, config, secrets, persist=False)
+    except Exception as exc:
+        result["profile_error"] = str(exc)
+        meta = {}
+    result["profile"] = {
+        "name_zh": meta.get("name_zh") or "",
+        "name_en": meta.get("name_en") or "",
+        "aliases_zh": list(meta.get("aliases_zh") or []),
+        "subsidiaries_zh": list(meta.get("subsidiaries_zh") or []),
+        "subsidiaries_other": list(meta.get("subsidiaries_other") or []),
+        "search_terms_zh": build_zh_terms(meta),
+        "search_terms_en": build_en_terms(meta),
+        "saved": False,
+    }
+    if not (meta.get("name_zh") or meta.get("name_en")):
+        result["ok"] = False
+        result["error"] = (f"Could not identify {ticker} - no profile found. "
+                           f"Check the symbol.")
+        return result
+
+    # 2) deep search over the lookback window.
+    items, cost = adhoc_collect(ticker, meta, config, secrets, days=days)
+
+    # 3) score + label, then summarise.
+    articles, overall = adhoc_analyze(items, ticker, meta, config, secrets)
+    if secrets.get("ai_api_key"):
+        cost["ai_calls"] = (1 if articles else 0) + (1 if overall else 0)
+    result["articles"] = articles
+    result["overall"] = overall
+    result["cost"] = cost
+    if not articles:
+        result["ok"] = False
+        result["error"] = (f"No recent articles found for {ticker} in the last "
+                           f"{days} days.")
+    return result
+
+
 def analyze_macro(macro_items, config, secrets, conn, run_start, pseudo="MACRO"):
     """
     ONE tiny batched AI call for the macro items (translate + score + impact
@@ -4489,6 +4804,34 @@ def main():
             ensure_company_meta(t, config, secrets, force=True)
         print("  [rediscover] done.")
         sys.exit(0)
+
+    #   --adhoc-scan=TICKER[:DAYS]   one-off deep search + sentiment analysis for
+    #                                ANY ticker. Reads only: no news.db, no
+    #                                company_lookup.json, no usage counters, no
+    #                                Telegram. Prints one JSON object.
+    if any(a.startswith("--adhoc-scan") for a in sys.argv):
+        arg = ""
+        for a in sys.argv:
+            if a.startswith("--adhoc-scan="):
+                arg = a.split("=", 1)[1].strip()
+        ticker, days = arg, ADHOC_DEFAULT_DAYS
+        if ":" in arg:
+            ticker, _, d = arg.partition(":")
+            try:
+                days = max(7, min(365, int(d.strip() or ADHOC_DEFAULT_DAYS)))
+            except ValueError:
+                days = ADHOC_DEFAULT_DAYS
+        config = load_config()
+        secrets = load_secrets()
+        # The scan prints progress; keep stdout clean for the JSON result.
+        import contextlib
+        import io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            res = adhoc_scan(ticker, config, secrets, days=days)
+            res["log"] = buf.getvalue().strip().splitlines()[-20:]
+        print(json.dumps(res, ensure_ascii=False))
+        sys.exit(0 if res.get("ok") else 1)
 
     if "--dump-lookup" in sys.argv:
         print(json.dumps(load_lookup(), ensure_ascii=False, indent=1))

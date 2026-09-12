@@ -515,6 +515,22 @@ HTML = """<!DOCTYPE html>
   <div class="msg" id="msg"></div>
 
   <div class="card">
+    <h2>🔎 Deep search — any ticker, one-off (nothing is saved)</h2>
+    <div class="row" style="margin-bottom:8px">
+      <input id="adhocTicker" placeholder="Ticker (e.g. BABA, PDD, FUTU…)" style="width:180px;text-transform:uppercase">
+      <select id="adhocDays" style="width:170px">
+        <option value="30">Last 1 month</option>
+        <option value="75" selected>Last 2.5 months</option>
+        <option value="120">Last 4 months</option>
+        <option value="180">Last 6 months</option>
+      </select>
+      <button class="btn-ok" onclick="adhocScan()">🔎 Deep search now</button>
+    </div>
+    <div class="status" id="adhocStatus">Discover a company's brands, deep-search the recent past, score each article, and summarise the overall sentiment. Read-only: no database, no saved profile, no Telegram.</div>
+    <div id="adhocResult"></div>
+  </div>
+
+  <div class="card">
     <h2>1. Connect to Google</h2>
     <div class="status" id="authStatus">Checking...</div>
     <button class="btn-ghost" onclick="authGoogle()">🔑 Authenticate to Google</button>
@@ -1004,6 +1020,77 @@ function applyMetaEdit(){
   meta[t] = entry;
   $('tickerMeta').value = JSON.stringify(meta, null, 2);
   showMsg('✅ '+t+' updated in the JSON below. Press "Upload config to server" to apply.', 'ok');
+}
+
+async function adhocScan(){
+  const t = ($('adhocTicker').value || '').trim().toUpperCase().replace(/[^A-Z0-9.-]/g,'');
+  if(!t){ showMsg('Type a ticker first.','err'); return; }
+  const days = $('adhocDays').value || 75;
+  $('adhocStatus').textContent = 'Scanning '+t+' (discovery + deep search + AI). This takes 1-3 minutes...';
+  $('adhocResult').innerHTML = '';
+  const d = await api('/api/adhoc_scan', {ticker:t, days:days});
+  if(!d.ok){
+    $('adhocStatus').textContent = '❌ '+(d.error||'scan failed');
+    if(d.log && d.log.length){ $('adhocResult').innerHTML = '<div class="log">'+escapeHtml(d.log.join(NL))+'</div>'; }
+    return;
+  }
+  renderAdhoc(d);
+}
+
+function sentiBadge(s){
+  const v = String(s||'neutral').toLowerCase();
+  const map = {positive:['ok','▲ positive'], negative:['err','▼ negative'],
+               neutral:['gray','● neutral'], bullish:['ok','▲ bullish'],
+               bearish:['err','▼ bearish'], mixed:['gray','◆ mixed']};
+  const [cls, label] = map[v] || map.neutral;
+  return '<span class="badge '+cls+'">'+label+'</span>';
+}
+
+function renderAdhoc(d){
+  const p = d.profile || {}, o = d.overall || {}, c = d.cost || {};
+  const zh = (p.search_terms_zh || []).join(' / ');
+  const en = (p.search_terms_en || []).join(' / ');
+  let html = '';
+  // ---- profile + overall sentiment ----
+  html += '<div class="hint" style="margin-top:10px"><b>'+escapeHtml(d.ticker)+'</b> — '+
+          escapeHtml(p.name_zh||'')+(p.name_en?' / '+escapeHtml(p.name_en):'')+
+          '<br><b>Names searched:</b> '+escapeHtml(zh)+(en?'<br><b>EN:</b> '+escapeHtml(en):'')+
+          '<br><span style="color:var(--muted)">Lookback '+escapeHtml(d.lookback_days)+' days · '+
+          escapeHtml(String((d.articles||[]).length))+' article(s) · cost: '+
+          escapeHtml(String(c.tavily_searches||0))+' Tavily search(es), '+
+          escapeHtml(String(c.ai_calls||0))+' AI call(s) · nothing saved</span></div>';
+  if(o.summary){
+    html += '<div class="card" style="margin-top:10px;background:#12151c">'+
+      '<div style="margin-bottom:6px">'+sentiBadge(o.sentiment)+
+      (o.confidence!=null?' <span class="badge gray">confidence '+escapeHtml(String(o.confidence))+'/10</span>':'')+
+      (o.counts?' <span class="badge gray">'+escapeHtml(String(o.counts.positive||0))+' pos / '+
+        escapeHtml(String(o.counts.negative||0))+' neg / '+
+        escapeHtml(String(o.counts.neutral||0))+' neu</span>':'')+'</div>'+
+      '<div style="font-size:13px;line-height:1.5">'+escapeHtml(o.summary)+'</div>'+
+      ((o.themes&&o.themes.length)?'<div class="hint">Themes: '+escapeHtml(o.themes.join(', '))+'</div>':'')+
+      '</div>';
+  }
+  // ---- the articles ----
+  const rows = d.articles || [];
+  if(rows.length){
+    let body = '';
+    for(const a of rows){
+      const imp = a.importance!=null ? '⭐'+a.importance : '—';
+      body += '<tr><td>'+escapeHtml(a.date||'')+'</td>'+
+        '<td>'+escapeHtml(a.source||'')+'</td>'+
+        '<td>'+imp+'</td>'+
+        '<td>'+sentiBadge(a.sentiment)+'</td>'+
+        '<td>'+escapeHtml(a.category||'')+'</td>'+
+        '<td>'+(a.url?'<a href="'+escapeHtml(a.url)+'" target="_blank" rel="noopener">'+escapeHtml(a.title_en||a.title)+'</a>':escapeHtml(a.title_en||a.title))+
+        (a.lang==='zh' && a.url ? ' <a class="btn-x" style="text-decoration:none" target="_blank" rel="noopener" title="Open through Google Translate" href="https://translate.google.com/translate?sl=auto&tl=en&u='+encodeURIComponent(a.url)+'">译</a>' : '')+
+        (a.reason?'<div style="color:var(--muted);font-size:11px">'+escapeHtml(a.reason)+'</div>':'')+
+        (a.impact?'<div style="color:var(--muted);font-size:11px">→ '+escapeHtml(a.impact)+'</div>':'')+
+        '</td></tr>';
+    }
+    html += '<div class="tablewrap"><table><thead><tr><th>Date</th><th>Source</th><th>Imp</th><th>Sentiment</th><th>Cat</th><th>Article</th></tr></thead><tbody>'+body+'</tbody></table></div>';
+  }
+  $('adhocResult').innerHTML = html;
+  $('adhocStatus').textContent = '✅ Done. Nothing was saved — this scan left no trace.';
 }
 
 async function loadLookup(){
@@ -1550,6 +1637,63 @@ class Handler(BaseHTTPRequestHandler):
                          "error": "" if deleted else (text or "nothing deleted"),
                          "output": text})
 
+    def _handle_adhoc_scan(self):
+        """
+        One-off deep search for ANY ticker (panel "Deep search" tab).
+
+        Runs the updater's `--adhoc-scan` mode on the VM, which is a READ-ONLY
+        path: it resolves the company's brands with discovery, deep-searches the
+        lookback window, scores + labels each article and summarises the overall
+        sentiment - without writing news.db, company_lookup.json, the dedup
+        ledger, the usage counters or Telegram. Nothing about the scan is
+        persisted on this side either: the result goes straight to the browser.
+        """
+        zone = find_vm_zone()
+        if not zone:
+            self._send_json({"ok": False, "error": "VM not found. Create the server first."})
+            return
+        data, error = self._read_json_body()
+        if error:
+            self._send_json({"ok": False, "error": error}, 400)
+            return
+        # Sanitize: this value reaches a shell command line.
+        ticker = "".join(ch for ch in str((data or {}).get("ticker") or "")
+                         if ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-")[:12].upper()
+        try:
+            days = max(7, min(365, int((data or {}).get("days", 75))))
+        except (TypeError, ValueError):
+            days = 75
+        if not ticker:
+            self._send_json({"ok": False, "error": "No ticker given."}, 400)
+            return
+        running, why = ensure_vm_running(zone)
+        if not running:
+            self._send_json({"ok": False, "error": why})
+            return
+        home = get_vm_home(zone)
+        # A scan is discovery + several searches + 2 AI calls: allow real margin.
+        ok, out, err = run_gcloud([
+            "compute", "ssh", "--zone", zone, VM_NAME,
+            "--command", f"cd {home} && python3 news_updater.py "
+                         f"--adhoc-scan={ticker}:{days} 2>&1",
+            "--quiet"], timeout=900)
+        text = (out + err).strip()
+        result = None
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    result = json.loads(line)
+                    break
+                except Exception:
+                    continue
+        if result is None:
+            self._send_json({"ok": False,
+                             "error": "The scan produced no result.",
+                             "log": text.splitlines()[-20:]})
+            return
+        self._send_json(result)
+
     def _handle_translate(self):
         """
         Translate a few headline strings with the user's own AI key.
@@ -1633,6 +1777,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         if not self._origin_ok():
+            return
+        if parsed.path == "/api/adhoc_scan":
+            self._handle_adhoc_scan()
             return
         if parsed.path == "/api/translate":
             self._handle_translate()
