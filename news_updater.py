@@ -1528,42 +1528,108 @@ def ingest_items(conn, all_new, source, items, ticker, since_dt, max_age_hours,
 # ---------------------------------------------------------------------------
 # Company lookup + auto-discovery (the "alpha" config)
 # ---------------------------------------------------------------------------
+def term_quality(term):
+    """
+    How useful is this term for FINDING news? Lower is better.
+
+    The single biggest recall problem was the budget: MAX_ZH_TERMS is 8 and
+    discovery returns full legal entity names ("湖北恒隆汽车系统集团有限公司",
+    "上海陆家嘴国际金融资产交易市场股份有限公司"), which pushed the short brand
+    names that news actually uses ("分期乐", "平安普惠") out of the slots. A
+    legal-registry name is a precise filter but a poor search term.
+
+    Ranking: the company's own short name first, then brands/subsidiaries by
+    length, then long legal names, then keywords (which are often market-data
+    symbols like "YB.US" rather than search terms).
+    """
+    t = str(term or "").strip()
+    if not t:
+        return 99
+    cjk = is_chinese(t)
+    if cjk:
+        n = len(t)
+        if n <= 4:
+            return 0          # brand-length: 乐信, 分期乐, 桔子理财, 元保
+        if n <= 6:
+            return 1          # short entity: 乐信集团, 元保科技
+        if n <= 10:
+            return 3
+        return 5              # full legal name: 深圳分期乐网络科技有限公司
+    # Latin terms: a brand name beats a long corporate name, and a bare
+    # ticker/symbol ("YB.US", "LX") is not a search term at all. Latin terms
+    # belong to build_en_terms(), not here.
+    if re.fullmatch(r"[A-Za-z0-9.\-]{1,8}", t):
+        return 9
+    words = t.split()
+    if len(words) >= 2:
+        return 7              # "Huize Holding" - an EN term, not a ZH one
+    return 8
+
+
 def build_zh_terms(meta):
     """
-    Chinese search terms from a company profile: name_zh + aliases_zh +
-    subsidiaries_zh (e.g. 乐信, 乐信集团, 分期乐, 桔子理财). Capped at
-    MAX_ZH_TERMS, de-duplicated. Used for Google News zh / Eastmoney /
-    Baidu (the Chinese sources where subsidiary news actually shows up).
+    Chinese search terms from a company profile, ranked by usefulness.
+
+    Sources: name_zh, aliases_zh, subsidiaries_zh, subsidiaries_other AND
+    `keywords` - the lookup has always stored discovered keywords ("元保数科",
+    "元保香港", "云犀科技", "平安陆金所") and this function simply ignored them, so
+    names discovery had found were never searched.
+
+    Ranking matters because the budget is only MAX_ZH_TERMS (8). Discovery
+    returns full legal entity names ("湖北恒隆汽车系统集团有限公司"), and putting
+    those first pushed the short brand names that headlines actually use
+    ("分期乐", "平安普惠") out of the slots. Short brand-length names win.
+
+    Latin terms are excluded here (they are handled by build_en_terms) - an
+    English word in a Chinese query just dilutes it.
     """
-    terms = []
-    if meta:
-        for key in ("name_zh",):
-            v = str(meta.get(key) or "").strip()
-            if v and v not in terms:
-                terms.append(v)
-        for key in ("aliases_zh", "subsidiaries_zh"):
-            for v in (meta.get(key) or []):
-                v = str(v or "").strip()
-                if v and v not in terms:
-                    terms.append(v)
-    return terms[:MAX_ZH_TERMS]
+    if not meta:
+        return []
+    candidates = []   # (rank, insertion order, term)
+
+    def add(value, rank_hint=None):
+        v = str(value or "").strip()
+        if not v or not is_chinese(v):      # ZH list only
+            return
+        candidates.append((term_quality(v) if rank_hint is None else rank_hint,
+                           len(candidates), v))
+
+    add(meta.get("name_zh"), rank_hint=0)       # the company's own name always
+    for key in ("aliases_zh", "subsidiaries_zh", "subsidiaries_other", "keywords"):
+        for v in (meta.get(key) or []):
+            add(v)
+    # Stable sort by rank, keeping insertion order inside a rank, then dedupe.
+    ordered, seen = [], set()
+    for _, _, term in sorted(candidates, key=lambda c: (c[0], c[1])):
+        if term.lower() in seen:
+            continue
+        seen.add(term.lower())
+        ordered.append(term)
+    return ordered[:MAX_ZH_TERMS]
 
 
 def build_en_terms(meta):
     """
     Non-Chinese search terms from a company profile: name_en +
-    subsidiaries_other (e.g. Fenqile, Fenqile Indonesia). Used for Tavily
-    and Google News EN, so subsidiary news is found even when it never
-    mentions the ticker symbol or the Chinese name.
+    subsidiaries_other (e.g. Fenqile, Fenqile Indonesia) and Latin keywords.
+    Used for Tavily and Google News EN, so subsidiary news is found even when
+    it never mentions the ticker symbol or the Chinese name.
     """
     terms = []
     if meta:
         v = str(meta.get("name_en") or "").strip()
         if v and v not in terms:
             terms.append(v)
-        for v in (meta.get("subsidiaries_other") or []):
-            v = str(v or "").strip()
-            if v and v not in terms:
+        for key in ("subsidiaries_other", "keywords"):
+            for v in (meta.get(key) or []):
+                v = str(v or "").strip()
+                if not v or v in terms or is_chinese(v):
+                    continue
+                # Skip bare tickers/market symbols ("YB.US", "LX") - common
+                # English words return noise, the ticker is already searched by
+                # the Google News EN query itself.
+                if re.fullmatch(r"[A-Z0-9.\-]{1,8}", v):
+                    continue
                 terms.append(v)
     return terms[:5]
 
@@ -1874,11 +1940,25 @@ def ensure_company_meta(ticker, config, secrets, force=False):
               f"({entry.get('name_zh') or '?'}"
               f"{' + ' + str(len(entry.get('subsidiaries_zh') or []) + len(entry.get('subsidiaries_other') or [])) + ' subsidiary term(s)' if entry.get('subsidiaries_zh') or entry.get('subsidiaries_other') else ''})")
 
-    # Explicit config ticker_meta always overrides the discovered entry.
+    # Explicit config ticker_meta overrides the discovered entry.
+    #
+    # Scalar fields (name_zh, name_en, website...) are replaced outright, which
+    # is what "override" should mean. LIST fields are UNIONED instead, because
+    # replacing them silently discards everything discovery had found: a config
+    # entry with `subsidiaries_zh: []` would otherwise throw away the 8 CAAS
+    # entities the lookup had discovered. Nothing is lost, the user's own names
+    # are simply added.
     cfg_meta = config.get("ticker_meta", {}).get(ticker, {}) or {}
     merged = dict(entry or {})
+    list_keys = ("aliases_zh", "subsidiaries_zh", "subsidiaries_other", "keywords")
     for k, v in cfg_meta.items():
-        if v not in (None, "", [], {}):
+        if v in (None, "", [], {}):
+            continue
+        if k in list_keys and isinstance(v, list):
+            old = list(merged.get(k) or [])
+            merged[k] = list(dict.fromkeys([str(x).strip() for x in v if str(x).strip()]
+                                           + [str(x).strip() for x in old if str(x).strip()]))
+        else:
             merged[k] = v
     return merged
 
@@ -4098,6 +4178,40 @@ def main():
 
     if "--dump-lookup" in sys.argv:
         print(json.dumps(load_lookup(), ensure_ascii=False, indent=1))
+        sys.exit(0)
+
+    #   --dump-effective-meta   what the updater ACTUALLY searches with, per
+    #                           ticker (config merged over the discovered
+    #                           lookup, plus the ranked term lists). The panel
+    #                           uses this to seed the names editor, so the user
+    #                           sees the real picture instead of only their own
+    #                           config.
+    if "--dump-effective-meta" in sys.argv:
+        config = load_config()
+        out = {}
+        for t in [str(x).strip().upper() for x in config.get("tickers", []) if str(x).strip()]:
+            try:
+                meta = ensure_company_meta(t, config, load_secrets())
+            except Exception as exc:
+                out[t] = {"error": str(exc)}
+                continue
+            entry = {
+                "name_zh": meta.get("name_zh") or "",
+                "name_en": meta.get("name_en") or "",
+                "aliases_zh": list(meta.get("aliases_zh") or []),
+                "subsidiaries_zh": list(meta.get("subsidiaries_zh") or []),
+                "subsidiaries_other": list(meta.get("subsidiaries_other") or []),
+                "keywords": list(meta.get("keywords") or []),
+                "website": meta.get("website") or "",
+                # The terms actually used for searching, in ranked order.
+                "search_terms_zh": build_zh_terms(meta),
+                "search_terms_en": build_en_terms(meta),
+                # Which of those came from the user's config (editable) vs the
+                # auto-discovery (informational).
+                "from_config": sorted((config.get("ticker_meta") or {}).get(t, {}).keys()),
+            }
+            out[t] = entry
+        print(json.dumps(out, ensure_ascii=False))
         sys.exit(0)
 
     #   --purge-macro-noise      delete stored macro chatter + unscored leftovers

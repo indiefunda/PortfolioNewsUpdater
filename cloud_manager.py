@@ -569,9 +569,16 @@ HTML = """<!DOCTYPE html>
       <div class="status" id="tavilyUsage" style="flex:1;margin-bottom:0">Search budget — Tavily | EXA: —</div>
       <button class="btn-ghost" onclick="loadUsage()" style="margin-top:0">↻ Check</button>
     </div>
-    <label>Chinese names — ticker_meta (this is where the Chinese edge comes from)</label>
+    <label>Chinese names &amp; subsidiaries — ticker_meta (this is where the Chinese edge comes from)</label>
+    <div class="row" style="margin-bottom:6px">
+      <input id="metaTicker" placeholder="Ticker (e.g. CAAS)" style="width:120px;text-transform:uppercase">
+      <button class="btn-ghost" onclick="fillMetaEditor($('metaTicker').value.trim().toUpperCase())">👁 Show what this ticker searches</button>
+      <button class="btn-ok" onclick="applyMetaEdit()">✔ Apply to JSON below</button>
+    </div>
+    <div class="status" id="metaEditStatus">Pick a ticker to see the company names and subsidiaries the app really searches — including everything auto-discovery found. Edit the lines and press Apply.</div>
+    <textarea id="metaEdit" rows="6" style="width:100%;padding:12px;border-radius:8px;border:1px solid var(--border);background:#12151c;color:var(--text);font-family:monospace;font-size:12px;"></textarea>
     <textarea id="tickerMeta" rows="8" style="width:100%;padding:12px;border-radius:8px;border:1px solid var(--border);background:#12151c;color:var(--text);font-family:monospace;font-size:13px;" placeholder='{"LX":{"name_zh":"乐信","name_en":"LexinFintech","aliases_zh":["乐信集团"],"subsidiaries_zh":["分期乐","桔子理财"]}}'></textarea>
-    <div class="hint">Per ticker: Chinese name + aliases + subsidiary brands (e.g. LX → 分期乐). Used to search Google News zh-CN, Eastmoney, Baidu and Tavily.</div>
+    <div class="hint">Per ticker: Chinese name + aliases + subsidiary brands (e.g. LX → 分期乐). Used to search Google News zh-CN, Eastmoney, Baidu and Tavily. <b>Your entries here always win</b>, and the app does NOT lose what it discovered: config and discovered names are merged, with short brand names tried first (they are what headlines actually use).</div>
     <div class="row">
       <div style="flex:1">
         <label>Push mode</label>
@@ -729,7 +736,7 @@ async function load(){
   window._maxItems = d.config.max_items_per_run || dflt.max_items_per_run || 40;
   window._maxDigest = d.config.max_digest_items || dflt.max_digest_items || 10;
   renderChips();
-  refreshStatus(); loadCron(); loadLogs(); loadUsage();
+  refreshStatus(); loadCron(); loadLogs(); loadUsage(); loadEffectiveMeta();
 }
 
 // A secret input: show a placeholder when one is stored, and mark it so save()
@@ -934,6 +941,71 @@ async function deleteNews(idx){
   }
 }
 
+async function loadEffectiveMeta(){
+  const d = await api('/api/effective_meta');
+  if(!d.ok || !d.meta){ return; }
+  window._effective = d.meta;
+  const t = $('metaTicker').value.trim().toUpperCase();
+  if(t && d.meta[t]) fillMetaEditor(t);
+}
+
+// Newline as a character code, NOT an escape sequence. This panel is a Python
+// triple-quoted string, so a backslash-n written here is turned into a REAL
+// newline before the browser sees it, which breaks the JavaScript. Using a char
+// code is immune to that (it has bitten twice now).
+const NL = String.fromCharCode(10);
+
+// Show what the app REALLY searches for a ticker: the user's config merged
+// with everything auto-discovery found. Previously the box showed only the
+// user's own config, which is why it looked empty for HUIZ/YB/CAAS/LU while
+// the app was in fact searching discovered subsidiaries for them.
+function fillMetaEditor(ticker){
+  const m = (window._effective || {})[ticker];
+  const box = $('metaEdit');
+  if(!m){ box.value = ''; $('metaEditStatus').textContent = 'No profile known for '+ticker+' yet - run the updater once.'; return; }
+  const show = (list) => (list && list.length) ? list.join(', ') : '';
+  const subs = [].concat(m.subsidiaries_zh || [], m.subsidiaries_other || []);
+  box.value = [
+    'name_zh: ' + (m.name_zh || ''),
+    'name_en: ' + (m.name_en || ''),
+    'aliases_zh (comma separated): ' + show(m.aliases_zh),
+    'subsidiaries (comma separated): ' + show(subs),
+    'website: ' + (m.website || '')
+  ].join(NL);
+  const zh = (m.search_terms_zh || []).join(' / ');
+  $('metaEditStatus').innerHTML =
+    '<b>Actually searching '+ticker+' with:</b> '+escapeHtml(zh)+
+    (m.search_terms_en && m.search_terms_en.length ? '<br>EN: '+escapeHtml(m.search_terms_en.join(' / ')) : '')+
+    '<br><span style="color:var(--muted)">Edit the lines above and press Apply to make them yours (your entries are tried first). Everything discovery found is shown, so nothing is hidden.</span>';
+}
+
+// Turn the editor back into the ticker_meta JSON shape and merge it into the box.
+function applyMetaEdit(){
+  const t = $('metaTicker').value.trim().toUpperCase();
+  if(!t){ showMsg('Type a ticker first.','err'); return; }
+  const lines = {};
+  for(const line of $('metaEdit').value.split(NL)){
+    const i = line.indexOf(':');
+    if(i > 0){ lines[line.slice(0,i).trim().toLowerCase()] = line.slice(i+1).trim(); }
+  }  let meta = {};
+  try { meta = JSON.parse($('tickerMeta').value || '{}'); } catch(e){ meta = {}; }
+  const split = (s) => String(s||'').split(',').map(x=>x.trim()).filter(Boolean);
+  const subs = split(lines['subsidiaries']);
+  const entry = Object.assign({}, meta[t] || {});
+  if(lines['name_zh']) entry.name_zh = lines['name_zh'];
+  if(lines['name_en']) entry.name_en = lines['name_en'];
+  if(lines['aliases_zh']) entry.aliases_zh = split(lines['aliases_zh']);
+  if(subs.length){
+    // Keep Chinese and Latin names in the right buckets.
+    entry.subsidiaries_zh = subs.filter(s => /[\u4e00-\u9fff]/.test(s));
+    entry.subsidiaries_other = subs.filter(s => !/[\u4e00-\u9fff]/.test(s));
+  }
+  if(lines['website']) entry.website = lines['website'];
+  meta[t] = entry;
+  $('tickerMeta').value = JSON.stringify(meta, null, 2);
+  showMsg('✅ '+t+' updated in the JSON below. Press "Upload config to server" to apply.', 'ok');
+}
+
 async function loadLookup(){
   $('lookupStatus').textContent = 'Fetching company lookup from the server...';
   const d = await api('/api/lookup');
@@ -1132,6 +1204,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "cron": fetch_vm_cron_status()})
         elif parsed.path == "/api/news":
             self._handle_news()
+        elif parsed.path == "/api/effective_meta":
+            self._handle_effective_meta()
         elif parsed.path == "/api/lookup":
             self._handle_lookup()
         elif parsed.path == "/api/tavily":
@@ -1300,6 +1374,36 @@ class Handler(BaseHTTPRequestHandler):
             "--command", f"cd {home} && python3 news_updater.py --force{extra} 2>&1",
             "--quiet"], timeout=1800)
         self._send_json({"ok": ok, "error": (err or "") if not ok else "", "output": out + err})
+
+    def _handle_effective_meta(self):
+        """
+        The names + subsidiaries the updater ACTUALLY searches with, per ticker.
+
+        The Step 3 textarea only ever held the user's own config, which is why
+        it looked empty for HUIZ/YB/CAAS/LU while the app was in fact searching
+        discovered entities for them. This returns the real (merged) view so the
+        panel can seed the editor with everything, and the user can edit it in
+        one place.
+        """
+        zone = find_vm_zone()
+        if not zone:
+            self._send_json({"ok": False, "error": "VM not found. Create the server first."})
+            return
+        home = get_vm_home(zone)
+        ok, out, err = run_gcloud([
+            "compute", "ssh", "--zone", zone, VM_NAME,
+            "--command", f"cd {home} && python3 news_updater.py --dump-effective-meta "
+                         f"2>/dev/null || echo '{{}}'",
+            "--quiet"], timeout=90)
+        if not ok:
+            self._send_json({"ok": False, "error": (err or "SSH failed").strip()[:300]})
+            return
+        try:
+            data = json.loads(out)
+        except Exception:
+            self._send_json({"ok": False, "error": "Could not parse the effective metadata."})
+            return
+        self._send_json({"ok": True, "meta": data if isinstance(data, dict) else {}})
 
     def _handle_news(self):
         """Fetch the stored news DB from the VM via the updater's --dump-news mode."""
