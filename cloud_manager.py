@@ -548,6 +548,7 @@ HTML = """<!DOCTYPE html>
     <div id="adhocResult"></div>
   </div>
 
+  </div><!-- /pane -->
   <div class="tabpane" id="pane-setup" style="display:none">
   <div class="card">
     <h2>1. Connect to Google</h2>
@@ -572,6 +573,7 @@ HTML = """<!DOCTYPE html>
     <div class="hint">Uses the same free e2-micro VM as your price monitor.</div>
   </div>
 
+  </div><!-- /pane -->
   <div class="tabpane" id="pane-config" style="display:none">
   <div class="card">
     <h2>3. Configuration</h2>
@@ -666,6 +668,7 @@ HTML = """<!DOCTYPE html>
     <div class="hint">Sends your stocks, AI settings, and Telegram keys to the cloud server. Keys stay local and on your VM — never shared.</div>
   </div>
 
+  </div><!-- /pane -->
   <div class="tabpane" id="pane-news" style="display:none">
   <div class="card">
     <h2>4. Schedule & run history</h2>
@@ -706,7 +709,7 @@ HTML = """<!DOCTYPE html>
     <div class="hint">This grows automatically (monthly re-search per ticker; new subsidiaries are alerted on Telegram). "Re-discover now" forces it immediately — costs ~1–2 Tavily searches + 1 AI call per ticker. To override anything, edit the Chinese names JSON in Step 3 — config overrides always win.</div>
   </div>
 
-  </div><!-- /news -->
+  </div><!-- /pane -->
 <script>
 let tickers = [];
 let news = [];
