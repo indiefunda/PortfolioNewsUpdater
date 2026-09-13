@@ -39,6 +39,7 @@ OFFLINE = [
     ("py", "test_no_write_credits.py", []),
     ("py", "test_junk_domains.py", []),
     ("py", "test_junk_fetch_filter.py", []),
+    ("py", "test_crash_record.py", []),
     ("py", "test_schedule.py", []),
     ("py", "schedule_sim.py", []),
     ("py", "check_panel_js.py", []),

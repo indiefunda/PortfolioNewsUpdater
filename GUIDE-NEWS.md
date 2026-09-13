@@ -498,6 +498,8 @@ those jobs running.
 | Out-of-season run skipped | Expected — the DST guard makes the wrong-season cron job a fast no-op. |
 | Manual run skipped | The panel's **Run now (test)** always forces a run (`--force`). |
 | Double-clicking `start_cloud.bat` does nothing / a window flashes and closes | Was caused by **LF-only line endings and unbalanced quotes in `REM` comments**: cmd.exe counts double quotes before deciding a line is a comment, so it swallowed `setlocal`, `set "URL="` and the `if not defined` checks — the panel never started and the browser was asked to open a file literally named `!URL!`. Fixed, and now enforced by `.gitattributes` (`*.bat text eol=crlf`) plus `python _audit/check_batch_quotes.py`. If you copy the batch files by hand, keep them **CRLF**. |
+| A run shows as **interrupted** | Not a failure. The run stopped because whatever was reading its output went away — you closed the window, or the output was piped into `head`/`tail`. Nothing is wrong with the app. It used to be reported as a red **error** (and Ctrl-C too), which made the badge meaningless. The row's tickers/new/sent/duration show how far it got before it stopped. |
+| A run shows as **error** | The reason is printed on the line under the row in **4. Schedule & run history**. `unhandled: <Type>: <msg>` is a real crash — the full traceback is in the run log on the server. Rows written before this existed show no reason, because the old code did not store one. |
 | The Setup/Config tabs are blank | They fill from `/api/config`. If the panel server errors, `api()` now reports `HTTP 500` instead of a cryptic JSON parse error, and `load()` names the missing config object rather than throwing on `undefined`. |
 
 ## Checking your changes before shipping them

@@ -497,6 +497,15 @@ HTML = """<!DOCTYPE html>
   .badge.ok { background:#14532d; color:#a7f3d0; }
   .badge.err { background:#7c2d12; color:#fecaca; }
   .badge.gray { background:#2a2e38; color:#cbd5e1; }
+  /* A run whose output reader disconnected (closed window, killed pipe) is not
+     a failure of the pipeline, so it gets its own colour. Painting it red
+     trains you to ignore the red badge, which is worse than not showing it. */
+  .badge.warn { background:#78350f; color:#fde68a; }
+  /* The reason line under a run. The table used to show status only, so a
+     failed run was a red badge with no explanation - the only way to find out
+     what happened was to ask. */
+  tr.detail td { color:var(--muted); font-size:12px; white-space:normal;
+                 padding-top:0; padding-bottom:9px; }
   /* Tabs: the page had grown into one long scroll (deep search + 6 steps) */
   .tabs { display:flex; gap:6px; flex-wrap:wrap; margin:0 0 14px 0; }
   .tab { background:#232733; color:var(--muted); border:1px solid var(--border);
@@ -1223,6 +1232,20 @@ async function runNow(withSnapshot){
   showMsg(msg, d.ok?'ok':'err');
   loadLogs(); }
 
+// Status badge for a run-history row. Only a genuine failure is red:
+//   ran         - completed
+//   interrupted - the run stopped because its OUTPUT READER went away (closed
+//                 window, killed pipe). Nothing in the pipeline failed.
+//   disabled    - the updater is switched off in config
+//   anything else (error, ...) - a real failure, red
+function runBadge(status){
+  const s = String(status||'?');
+  if(s === 'ran')         return '<span class="badge ok">ran</span>';
+  if(s === 'interrupted') return '<span class="badge warn">interrupted</span>';
+  if(s === 'disabled')    return '<span class="badge gray">disabled</span>';
+  return '<span class="badge err">'+escapeHtml(s)+'</span>';
+}
+
 async function loadLogs(){
   $('logStatus').textContent = 'Fetching run history...';
   const d = await api('/api/logs');
@@ -1234,10 +1257,13 @@ async function loadLogs(){
   $('logStatus').textContent = logs.length + ' run(s) recorded.';
   let rows='';
   for(const r of logs.slice(0,10)){
-    const st = r.status==='ran' ? '<span class="badge ok">ran</span>' : '<span class="badge err">'+(r.status||'?')+'</span>';
-    rows += '<tr><td>'+escapeHtml(r.timestamp||'—')+'</td><td>'+st+'</td>'+
+    rows += '<tr><td>'+escapeHtml(r.timestamp||'—')+'</td><td>'+runBadge(r.status)+'</td>'+
       '<td>'+escapeHtml(r.tickers_checked||0)+'</td><td>'+escapeHtml(r.new_items||0)+'</td>'+
       '<td>'+escapeHtml(r.sent_items||0)+'</td><td>'+(r.duration_sec!=null?r.duration_sec+'s':'—')+'</td></tr>';
+    // The reason, on its own line, for anything that did not simply "run".
+    if(r.error){
+      rows += '<tr class="detail"><td colspan="6">'+escapeHtml(r.error)+'</td></tr>';
+    }
   }
   wrap.innerHTML = '<div class="tablewrap"><table><thead><tr><th>Time (ET)</th><th>Status</th><th>Tickers</th><th>New</th><th>Sent</th><th>Duration</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
 }

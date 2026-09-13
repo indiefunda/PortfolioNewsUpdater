@@ -45,6 +45,7 @@ auto-grown company_lookup.json and tavily_usage.json (also git-ignored).
 """
 
 import base64
+import errno
 import hashlib
 import html
 import json
@@ -372,6 +373,14 @@ def append_run_record(record):
         _write_json(RUN_HISTORY_FILE, records)
     except Exception as exc:
         print(f"  [error] could not write run history: {exc}", file=sys.stderr)
+
+
+# Progress of the run currently in flight. main() publishes these so the
+# top-level crash handler at the bottom of this file can report how far the run
+# actually got, instead of writing a row of zeros that reads like "it ran and
+# found nothing".
+_RUN_START = None      # datetime the run began (ET)
+_RUN_RECORD = None     # the live record dict main() is filling in
 
 
 # ---------------------------------------------------------------------------
@@ -5203,6 +5212,11 @@ def main():
         "duration_sec": None,
         "error": None,
     }
+    # Publish the run's progress for the top-level crash handler (see the bottom
+    # of this file), so a crash records how far the run got rather than zeros.
+    global _RUN_START, _RUN_RECORD
+    _RUN_START = start_time
+    _RUN_RECORD = record
 
     config = load_config()
     if not config:
@@ -5822,21 +5836,67 @@ def main():
     append_run_record(record)
 
 
+def _is_broken_pipe(exc):
+    """True when the failure is only 'nobody is reading our output any more'.
+
+    Closing the terminal/panel that launched a run, or piping the output into
+    `head`/`tail` (which exit once they have their lines), makes Python's next
+    print() raise EPIPE. That says nothing about the pipeline itself, so it must
+    not be reported as a failure - a red badge for "you closed the window"
+    teaches you to ignore the red badge.
+    """
+    if isinstance(exc, BrokenPipeError):
+        return True
+    return isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.EPIPE
+
+
+def _record_crash(exc):
+    """Write a run-history row for a crash, keeping whatever progress we had.
+
+    The old handler wrote only timestamp/status/error, so every failure showed
+    up in the panel as 0 tickers / 0 new / 0 sent / no duration - which reads
+    like "it ran and found nothing" instead of "it died before counting".
+    """
+    now = datetime.now(EASTERN)
+    # main() publishes its in-flight record, so reuse it and keep the counters
+    # accumulated up to the point of failure.
+    rec = dict(_RUN_RECORD) if isinstance(_RUN_RECORD, dict) else {}
+    rec.setdefault("timestamp", now.strftime("%Y-%m-%d %H:%M:%S %Z"))
+    # Always define duration_sec, even when there is no start time to measure
+    # from (a crash before main() built its record): otherwise the key is simply
+    # missing and the row is a different shape from every other row.
+    rec.setdefault("duration_sec", None)
+    if rec["duration_sec"] is None and _RUN_START is not None:
+        rec["duration_sec"] = round((now - _RUN_START).total_seconds(), 2)
+    rec["tickers_checked"] = rec.get("tickers_checked") or 0
+    rec["new_items"] = rec.get("new_items") or 0
+    rec["sent_items"] = rec.get("sent_items") or 0
+    if _is_broken_pipe(exc):
+        rec["status"] = "interrupted"
+        rec["error"] = ("stopped early: the output reader disconnected (broken "
+                        "pipe) - e.g. the window was closed or the output was "
+                        "piped into head/tail. Nothing failed in the app.")
+    elif isinstance(exc, KeyboardInterrupt):
+        rec["status"] = "interrupted"
+        rec["error"] = "stopped by Ctrl-C - not a failure."
+    else:
+        rec["status"] = "error"
+        rec["error"] = f"unhandled: {type(exc).__name__}: {exc}"
+    append_run_record(rec)
+
+
 if __name__ == "__main__":
     try:
         main()
-    except Exception as exc:
-        # Never die silently: log the traceback AND record the failure in the
-        # run history so the panel shows what happened.
+    except (Exception, KeyboardInterrupt) as exc:
+        # Never die silently: log the traceback AND record it in the run history
+        # so the panel shows what happened (and how far the run got).
+        # KeyboardInterrupt is a BaseException, so it needs naming explicitly -
+        # `except Exception` alone would let Ctrl-C escape unrecorded.
         import traceback
         traceback.print_exc()
         try:
-            from datetime import datetime as _dt
-            append_run_record({
-                "timestamp": _dt.now(EASTERN).strftime("%Y-%m-%d %H:%M:%S %Z"),
-                "status": "error",
-                "error": f"unhandled: {type(exc).__name__}: {exc}",
-            })
+            _record_crash(exc)
         except Exception:
             pass
-        sys.exit(1)
+        sys.exit(130 if isinstance(exc, KeyboardInterrupt) else 1)
