@@ -140,5 +140,26 @@ check("both pushed copies survive",
       not ({30, 31} & set(v2)), f"victims={v2}")
 
 print()
+print("=" * 76)
+print("TEST 6 - the panel's ROWS=<n> contract")
+print("=" * 76)
+# purgeJunk() sizes the job with a dry run and regexes ROWS=<n> out of the
+# output. If that line ever changes shape the button silently reports "no
+# duplicates found", so the contract is asserted here rather than trusted.
+import contextlib  # noqa: E402
+import io  # noqa: E402
+import re as _re  # noqa: E402
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    nu._print_duplicate_groups(g2, 1, dry_run=True)
+out = buf.getvalue()
+m = _re.search(r"ROWS=([0-9]+)", out)
+check("panel regex finds ROWS=", m is not None, out.strip().splitlines()[-1][:60])
+check("count matches what would be removed", m is not None and int(m.group(1)) == 1)
+check("dry-run wording says nothing was deleted",
+      "would remove" in out and "GROUPS=" in out)
+
+print()
 print(f"RESULT: {'ALL TESTS PASSED' if fail == 0 else str(fail) + ' FAILURE(S)'}")
 sys.exit(1 if fail else 0)
