@@ -338,6 +338,23 @@ python3 news_updater.py --translate=LX         # only one ticker
 
 ## No-spam behavior
 
+- **Junk-domain gate.** EXA and Tavily both return **SEO content farms**: a page
+  that scrapes one real story, stuffs every company name it can find into the
+  body, and publishes it on a disposable domain. The precision filter above
+  CANNOT catch these, because the keyword genuinely is present — that is the
+  whole trick. The symptom is the same article arriving tagged for five
+  different tickers. When this was measured, **165 of 1,214 stored rows (14%)
+  sat on such domains** (`constanta.fmufjl.cyou`, `jingmen.visualstudio-cn.top`,
+  `novara.whatswebap.com`) and **10 of them had been pushed to Telegram**.
+  These are now dropped at fetch time (`is_junk_host()`), with a second check in
+  `insert_news()` so every source — including RSS, Google News and the wires —
+  is covered. The rule is deliberately conservative, because a false positive
+  silently deletes a real story: free/abused TLDs (`.cyou`, `.icu`, `.top`,
+  `.cam`, …) are rejected outright, ambiguous ones (`.info`, `.biz`, `.site`)
+  need a machine-generated label as well, and `.com`/`.cn`/`.net` offenders are
+  matched against a curated list — a generic heuristic there would have thrown
+  away real outlets such as `fx168news.com` and `stocktitan.net`.
+  Run `--purge-junk-domains` once after upgrading to clear history.
 - Exact dedup (SQLite hash per source+URL).
 - **Precision filters**: every source result must really mention one of the
   ticker's Chinese names/subsidiaries (with a smarter matcher that rejects
@@ -418,6 +435,8 @@ python3 news_updater.py --rediscover      # force re-discovery of ALL tickers no
 python3 news_updater.py --rediscover=LU   # ... only for LU
 python3 news_updater.py --purge-junk      # delete stored junk (never-pushed, importance<=2)
 python3 news_updater.py --purge-junk=3    # ... with a custom junk bar
+python3 news_updater.py --purge-junk-domains  # delete rows on content-farm/spam domains
+python3 news_updater.py --dry-run --purge-junk-domains  # ... list them, delete nothing
 python3 news_updater.py --purge-macro-noise-dry  # show macro chatter that would go
 python3 news_updater.py --purge-macro-noise      # delete it (never touches pushed rows)
 python3 news_updater.py --translate            # fill in English titles for stored rows
@@ -478,6 +497,20 @@ those jobs running.
 | Too many/too few items | Switch `push_mode` to `score` and raise `push_min_score`, or lower `push_min_importance`/`push_max_per_ticker` (all editable in the panel). `max_items_per_run` and `max_digest_items` have **no panel input** — hand-edit `config_local.json` on the server if you need them. |
 | Out-of-season run skipped | Expected — the DST guard makes the wrong-season cron job a fast no-op. |
 | Manual run skipped | The panel's **Run now (test)** always forces a run (`--force`). |
+| Double-clicking `start_cloud.bat` does nothing / a window flashes and closes | Was caused by **LF-only line endings and unbalanced quotes in `REM` comments**: cmd.exe counts double quotes before deciding a line is a comment, so it swallowed `setlocal`, `set "URL="` and the `if not defined` checks — the panel never started and the browser was asked to open a file literally named `!URL!`. Fixed, and now enforced by `.gitattributes` (`*.bat text eol=crlf`) plus `python _audit/check_batch_quotes.py`. If you copy the batch files by hand, keep them **CRLF**. |
+| The Setup/Config tabs are blank | They fill from `/api/config`. If the panel server errors, `api()` now reports `HTTP 500` instead of a cryptic JSON parse error, and `load()` names the missing config object rather than throwing on `undefined`. |
+
+## Checking your changes before shipping them
+
+```bash
+python _audit/run_all.py          # 18 offline checks, one verdict (add --net for AI tests)
+```
+
+Runs every test suite, the panel structure/JS/DOM-id/batch-file checkers and the
+documentation check. It verifies the **exit code of each script *and* scans its
+output for failure markers**, because two suites here used to print
+`RESULT: N FAILURE(S)` while still exiting `0` — so a green run could hide a
+real failure.
 
 ## How the schedule stays reliable across DST
 

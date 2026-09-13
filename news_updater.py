@@ -36,6 +36,9 @@ New CLI modes:
   --dump-lookup    print the company lookup (names/subsidiaries/websites)
   --dump-usage     print the Tavily usage counters (panel meter)
   --rediscover[=TICKER]  force a re-discovery of the company lookup now
+  --purge-junk-domains   delete stored rows sitting on content-farm/spam
+                   domains (the junk-domain gate only stops NEW ones);
+                   combine with --dry-run to list them without deleting
 
 Reads config_local.json and secrets_local.json (both git-ignored), plus the
 auto-grown company_lookup.json and tavily_usage.json (also git-ignored).
@@ -768,6 +771,12 @@ def mark_seen(conn, ticker, source, item_id, title, url):
 def insert_news(conn, item):
     """Store a brand-new item in the news database (raw form, pre-AI)."""
     if NO_WRITE:
+        return
+    # Safety net for every source. The fetch-level filter covers EXA and
+    # Tavily, but Google News / RSS / the 7x24 wires could in principle link a
+    # content farm too, and this is the single point all of them funnel
+    # through - so a farm that slips past a fetcher still never reaches the DB.
+    if is_junk_host(item.get("url", "")):
         return
     now = datetime.now(EASTERN).strftime("%Y-%m-%d %H:%M:%S")
     h = _hash_of(item)
@@ -2785,6 +2794,140 @@ def tavily_usage_today():
     return data
 
 
+# ---------------------------------------------------------------------------
+# Domain quality gate - junk / content-farm hostnames
+# ---------------------------------------------------------------------------
+# EXA and Tavily both return SEO content farms: a page that scrapes one real
+# financial story, stuffs every company name it can find into the body, and
+# publishes it on a disposable domain. The relevance gate CANNOT catch them,
+# because the keyword genuinely is present - that is the entire trick. The
+# result is the same article arriving tagged for five different tickers, and
+# "news" that reads as noise.
+#
+# Real examples pulled from the live DB (145 of 1214 rows - 12% - were these,
+# and several had already been pushed to Telegram):
+#     constanta.fmufjl.cyou            jingmen.visualstudio-cn.top
+#     tangier.qepzdeoelpuaftzo.top     oakville.1ejcv.icu
+#     novara.whatswebap.com            durban.pc-kakaotalk.com.cn
+#     meizhou.qrlwh.com                www.fuhuikjjt.cn
+# The signature is a machine-generated label (almost no vowels, or a long
+# consonant run) on a cheap TLD, frequently prefixed with a random city name.
+#
+# This is deliberately conservative, because a false positive SILENTLY DELETES
+# a real story. Two mechanisms:
+#   1. JUNK_TLDS  - free/abused TLDs that legitimate financial outlets do not
+#      use. Dropped outright, which also covers domains that do not exist yet.
+#      .top/.xyz are in here rather than the suspect tier below: they are
+#      spam-dedicated in practice, so requiring a machine-looking label would
+#      let a word-label farm like "spam.top" straight through.
+#   2. JUNK_TLDS_SUSPECT - TLDs that are spam-heavy but still carry some real
+#      sites (.info, .biz, .site). These need corroboration from a
+#      machine-generated label before they are dropped.
+# .com/.cn/.net junk is handled by JUNK_HOSTS (curated), because a generic
+# label heuristic there would misfire on real outlets - `fx168news.com` has a
+# 1-in-6 vowel ratio and `stocktitan.net` has a 7-consonant run; both are real.
+JUNK_TLDS = frozenset({
+    "cyou", "icu", "buzz", "click", "rest", "monster", "sbs", "cfd", "lol",
+    "quest", "makeup", "beauty", "gq", "tk", "ml", "cf", "ga", "loan",
+    "download", "men", "bid", "date", "review", "stream", "gdn", "racing",
+    "party", "accountant", "cricket", "faith", "zip", "mov", "cam", "surf",
+    "mom", "dad", "kim", "country", "work", "top", "xyz",
+})
+JUNK_TLDS_SUSPECT = frozenset({
+    "info", "biz", "site", "online", "website", "space", "fun",
+    "host", "store", "live", "life", "world", "today", "press", "digital",
+    "agency", "solutions", "services", "support", "center", "tools", "zone",
+    "club", "vip", "pw", "ws", "su", "name", "mobi", "asia", "bar", "wiki",
+})
+# Curated second-level domains observed in the wild. Matched as a SUFFIX, so
+# every subdomain of a junk SLD is covered.
+JUNK_HOSTS = (
+    # .top farms kept as explicit evidence as well as a second line of defence
+    # (the .top TLD rule already covers them): their labels look like words, so
+    # the machine-label heuristic alone would miss them.
+    "visualstudio-cn.top", "qepzdeoelpuaftzo.top", "aljmpzskihrj.top",
+    "kmwrnzzvcmuyepx.top", "illgiwnysvcv.top", "notepad-im.top",
+    "notepadd.top", "dy-qishui.top",
+    # .com / .cn / .net junk (the heuristic deliberately does not run on these)
+    "whatswebap.com", "baixi.net", "pc-kakaotalk.com.cn", "world-cn.cn",
+    "mtsoln.com", "qrlwh.com", "fuhuikjjt.cn", "caifudd.cn", "4ke.cn",
+)
+
+
+def _host_of(url):
+    """Bare lowercase hostname of a URL, without a leading 'www.'.
+
+    Uses urllib.parse (imported as a module at the top of this file - a bare
+    `urlparse` is NOT in scope, and a bare try/except around it would have
+    turned a NameError into "every URL looks clean", silently disabling this
+    whole gate).
+
+    A scheme-less string is handled explicitly: urlparse("example.com") parses
+    it as a PATH, so .hostname is None. Without the fallback below every
+    scheme-less URL - including a bare host passed in by a caller - looked
+    clean, which made the purge command find nothing to delete.
+    """
+    text = (url or "").strip()
+    try:
+        host = urllib.parse.urlparse(text).hostname or ""
+    except ValueError:
+        host = ""
+    if not host:
+        authority = re.split(r"[/?#]", text, 1)[0]
+        authority = authority.rsplit("@", 1)[-1]          # drop user:pass@
+        if authority.startswith("["):                      # IPv6 literal
+            host = authority.split("]", 1)[0] + "]"
+        else:
+            host = authority.split(":", 1)[0]              # drop :port
+    host = host.lower().rstrip(".")
+    return host[4:] if host.startswith("www.") else host
+
+
+def _machine_label(label):
+    """True when a hostname label looks generated rather than written.
+
+    Loose on purpose - callers only apply it to TLDs that real financial
+    outlets do not publish on, where the cost of a false positive is small.
+    """
+    core = re.sub(r"[^a-z0-9]", "", (label or "").lower())
+    if len(core) < 5:
+        return False
+    letters = [c for c in core if c.isalpha()]
+    digits = sum(1 for c in core if c.isdigit())
+    if len(letters) < 3:
+        return digits >= 3
+    vowels = sum(1 for c in letters if c in "aeiou")
+    if vowels / len(letters) < 0.3:
+        return True
+    run = best = 0
+    for c in letters:
+        if c in "aeiou":
+            run = 0
+        else:
+            run += 1
+            best = max(best, run)
+    if best >= 4:
+        return True
+    return digits >= 2
+
+
+def is_junk_host(url):
+    """True when a URL points at a content farm / disposable spam domain."""
+    host = _host_of(url)
+    if not host or "." not in host:
+        return False
+    for bad in JUNK_HOSTS:
+        if host == bad or host.endswith("." + bad):
+            return True
+    labels = host.split(".")
+    tld = labels[-1]
+    if tld in JUNK_TLDS:
+        return True
+    if tld in JUNK_TLDS_SUSPECT:
+        return any(_machine_label(l) for l in labels[:-1])
+    return False
+
+
 def fetch_tavily(query, secrets, config, since_dt=None, limit=8, topic="news",
                  terms=None):
     """
@@ -2851,10 +2994,14 @@ def fetch_tavily(query, secrets, config, since_dt=None, limit=8, topic="news",
             usage["month_count"] += 1
             _write_json(TAVILY_USAGE_FILE, usage)
         items = []
+        junk = 0
         for r in data.get("results", []) or []:
             title = (r.get("title") or "").strip()
             url = r.get("url", "") or ""
             if not title:
+                continue
+            if is_junk_host(url):
+                junk += 1
                 continue
             content = (r.get("content") or "")[:300]
             # Precision filter (news path only): drop results that mention
@@ -2877,6 +3024,9 @@ def fetch_tavily(query, secrets, config, since_dt=None, limit=8, topic="news",
                 "lang": "zh" if is_chinese(title) else "en",
                 "snippet": content,
             })
+        if junk:
+            print(f"  [tavily] dropped {junk} junk-domain result(s) "
+                  f"(content farms / disposable spam hosts).")
         return items
     except Exception as exc:
         print(f"  [error] Tavily search '{query}': {exc}", file=sys.stderr)
@@ -3015,10 +3165,14 @@ def fetch_exa(query, secrets, config, since_dt=None, limit=6, with_text=False,
         enforce_delta = category == "news" and since_dt is not None
         items = []
         dropped = 0
+        junk = 0
         for r in data.get("results", []) or []:
             title = (r.get("title") or "").strip()
             url = r.get("url") or ""
             if not title:
+                continue
+            if is_junk_host(url):
+                junk += 1
                 continue
             if enforce_delta:
                 pub_dt = _parse_pub(r.get("publishedDate") or "")
@@ -3038,6 +3192,9 @@ def fetch_exa(query, secrets, config, since_dt=None, limit=6, with_text=False,
         if dropped:
             print(f"  [exa] dropped {dropped} stale/undated result(s) "
                   f"(delta window starts {since_dt.strftime('%Y-%m-%d %H:%M')}).")
+        if junk:
+            print(f"  [exa] dropped {junk} junk-domain result(s) "
+                  f"(content farms / disposable spam hosts).")
         return items
     except Exception as exc:
         print(f"  [error] EXA search '{query[:50]}': {exc}", file=sys.stderr)
@@ -4743,6 +4900,51 @@ def main():
     # Match the PREFIX for modes that can carry a value (--purge-junk=3,
     # --rediscover=LU): an exact `"--mode" in sys.argv` test is False for
     # "--mode=value", which silently ran the normal pipeline instead.
+    if any(a == "--purge-junk-domains" or a.startswith("--purge-junk-domains=")
+           for a in sys.argv):
+        # One-time cleanup of rows whose URL is a content farm / disposable spam
+        # host. The gate in is_junk_host() only stops NEW junk, so everything
+        # fetched before it existed is still in the DB (145 rows, 12%, when this
+        # was written - some of them already pushed to Telegram).
+        #
+        # NOTE: this scans the REAL database file read-only rather than going
+        # through _db(). Under --no-write, _db() returns an empty :memory:
+        # database, so a "dry run" through it would cheerfully report "no junk
+        # found" no matter what the real DB contains - exactly the wrong answer
+        # from a safety check. --dry-run always means "list, change nothing".
+        try:
+            scan = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True, timeout=30)
+            # Match on the URL, not on a pre-stripped host: is_junk_host() runs
+            # its own _host_of(), so handing it a bare host re-parsed it as a
+            # path and matched nothing.
+            victims = [(r[0], r[1], r[2], _host_of(r[3]), r[4]) for r in scan.execute(
+                "SELECT id, ticker, source, url, pushed FROM news")
+                if is_junk_host(r[3])]
+            scan.close()
+        except sqlite3.Error as exc:
+            print(f"  [purge-domains] cannot read {DB_FILE}: {exc}")
+            sys.exit(1)
+        if not victims:
+            print("  [purge-domains] no junk-domain rows found - nothing to do.")
+            sys.exit(0)
+        counts = {}
+        for _, _, _, host, pushed in victims:
+            counts[(host, pushed)] = counts.get((host, pushed), 0) + 1
+        print(f"  [purge-domains] {len(victims)} row(s) on junk domains:")
+        for (host, pushed), n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            print(f"    {'PUSHED' if pushed else '      '}  {host:40} {n}")
+        if NO_WRITE:
+            print("  [purge-domains] --no-write/--dry-run: listed only, "
+                  "nothing deleted.")
+            sys.exit(0)
+        conn = _db()
+        conn.executemany("DELETE FROM news WHERE id=?",
+                         [(v[0],) for v in victims])
+        conn.commit()
+        conn.close()
+        print(f"  [purge-domains] deleted {len(victims)} row(s).")
+        sys.exit(0)
+
     if any(a == "--purge-junk" or a.startswith("--purge-junk=") for a in sys.argv):
         # One-time cleanup of stored trash (never-pushed items scored at or
         # below the junk bar). Run this after a filter fix to clean history.

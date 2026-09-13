@@ -11,11 +11,20 @@ REM      cmd /c "... & set /p U=<file & start "" "%U%""
 REM  expands %U% while the LINE is parsed - before `set` has run -
 REM  so the browser was launched with an empty argument.
 REM
-REM  Delay uses `ping`, not `timeout`: `timeout` needs a console
-REM  stdin and exits immediately with "Input redirection is not
-REM  supported" when there is none (e.g. launched from another
-REM  script or a non-interactive context), which made this loop
-REM  give up instantly and open the fallback port instead.
+REM  Delay uses `ping`, not `timeout`: `timeout` needs a console stdin
+REM  and exits immediately with 'Input redirection is not supported'
+REM  when there is none (e.g. launched from another script or a
+REM  non-interactive context), which made this loop give up instantly
+REM  and open the fallback port instead.
+REM
+REM  NOTE: no double quotes appear anywhere in this comment block on
+REM  purpose. cmd.exe counts double quotes BEFORE deciding a line is a
+REM  comment, so an odd number of them in a REM line makes the parser
+REM  swallow every following line until the quotes balance. That is
+REM  exactly what happened here: setlocal enabledelayedexpansion and
+REM  set URL= were silently eaten, so this script printed
+REM  '[open_panel] opening !URL!' and Windows tried to open a FILE
+REM  called !URL!. _audit/check_batch_quotes.py now guards against it.
 REM ============================================================
 setlocal enabledelayedexpansion
 set "URLFILE=%~dp0panel_url.txt"

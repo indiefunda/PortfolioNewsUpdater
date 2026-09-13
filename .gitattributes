@@ -1,0 +1,26 @@
+# Line-ending policy.
+#
+# This is not cosmetic. cmd.exe mis-parses batch files that use bare LF line
+# endings: it counts double quotes and consumes following lines while looking
+# for a closer, so REM comments get executed as commands and real statements
+# (setlocal, set, if) are silently swallowed. The symptom here was a launcher
+# that reported "[open_panel] opening !URL!" and then tried to open a FILE
+# named !URL!, leaving the panel never started at all.
+#
+# The .bat/.cmd files in this repository are stored with LF (git's default),
+# so whether the launcher worked depended on the cloner's core.autocrlf - and
+# with core.autocrlf=false (common on Windows dev boxes and CI) it did not.
+# Pinning eol here makes the checkout correct regardless of local config.
+#
+# _audit/check_batch_quotes.py enforces both invariants.
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Shell scripts run on the Debian VM and MUST stay LF - a CRLF shebang fails
+# with "bad interpreter: No such file or directory".
+*.sh text eol=lf
+
+# These are generated/compared byte-for-byte; never rewrite them.
+*.db binary
+*.png binary

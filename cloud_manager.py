@@ -759,7 +759,12 @@ function removeTicker(t){ tickers=tickers.filter(x=>x!==t); renderChips(); }
 async function api(path, body){
   const opts = body ? {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify(body)} : {};
-  const r = await fetch(path, opts); return r.json();
+  const r = await fetch(path, opts);
+  // The panel answers a server-side failure with an HTML error page, so
+  // r.json() blows up with "Unexpected token '<'" - a message that names
+  // neither the endpoint nor the real problem.
+  if(!r.ok) throw new Error(path + ' -> HTTP ' + r.status);
+  return r.json();
 }
 
 // Switching the provider auto-fills the correct base URL + a sensible model
@@ -773,6 +778,14 @@ function aiProviderChanged(){
 
 async function load(){
   const d = await api('/api/config');
+  if(!d || !d.config){
+    // Without this guard the next line throws "Cannot read properties of
+    // undefined (reading 'tickers')", load() aborts, and the Setup and Config
+    // tabs stay blank with no explanation - which looks exactly like "the tabs
+    // are broken" rather than "the server did not answer".
+    throw new Error('/api/config returned no config object (got: '
+      + JSON.stringify(d === undefined ? null : d).slice(0, 120) + ')');
+  }
   // Sanitize on load too - a hand-edited config_local.json could otherwise
   // inject into the chip onclick handlers.
   tickers = (d.config.tickers || []).map(t => String(t).toUpperCase().replace(/[^A-Z0-9.-]/g,'')).filter(Boolean);

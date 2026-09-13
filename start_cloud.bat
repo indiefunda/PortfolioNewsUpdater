@@ -43,9 +43,15 @@ REM
 REM The browser step is a SEPARATE SCRIPT (open_panel.cmd) for two reasons:
 REM
 REM   1. It cannot be done inline here. The obvious one-liner
-REM          start "" /b cmd /c "timeout /t 3 >nul & set /p U=<file & start ""%U%""
+REM          start /b cmd /c 'timeout /t 3 >nul & set /p U=<file & start %U%'
 REM      expands %U% when the whole LINE is parsed - before `set` has run - so
 REM      the browser was launched with an empty argument and nothing opened.
+REM
+REM      (Quoted here with single quotes for that reason: cmd.exe counts
+REM      double quotes before deciding a line is a comment, so an odd number
+REM      inside a REM line makes it swallow the following lines. That bug
+REM      previously hid this file's own browser step. See
+REM      _audit/check_batch_quotes.py.)
 REM   2. Nesting a quoted path (%~dp0 ends with a backslash) inside another
 REM      quoted cmd /c string is fragile. Its own script avoids all of it.
 REM

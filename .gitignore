@@ -16,6 +16,9 @@ config_local.json
 
 # Runtime data
 news.db
+# SQLite WAL sidecars: they hold real row data, so they must be ignored too
+news.db-shm
+news.db-wal
 run_history.json
 news_run_history.json
 seen.json
@@ -32,9 +35,46 @@ news_updater.lock
 _test_ai.py
 .edgar_cache/
 
-# Local audit workspace: contains a SNAPSHOT COPY of your private news.db,
-# company_lookup.json and config_local.json (tickers/holdings). Never commit.
-_audit/
+# Local audit workspace.
+#
+# The TOOLING in here is versioned on purpose: a test suite that only exists on
+# one machine cannot stop a regression, and the whole point of run_all.py is to
+# be the gate you run before shipping. So the directory contents are ignored by
+# default and the pure tooling is allowed back at the end of this block.
+#
+# Everything that embeds PRIVATE data stays ignored:
+#   news.db / news.db-shm / news.db-wal  snapshot of the real news database
+#   company_lookup.json                  names/subsidiaries of YOUR tickers
+#   config_local.json                    YOUR tickers/holdings
+#   exa_usage.json / tavily_usage.json   your API spend
+#   *.before-*.py                        large pre-change backups
+_audit/*
+# --- private data and scratch (never commit) ---
+_audit/news.db
+_audit/news.db-shm
+_audit/news.db-wal
+_audit/company_lookup.json
+_audit/config_local.json
+_audit/exa_usage.json
+_audit/tavily_usage.json
+_audit/news_run_history.json
+_audit/*.before-*.py
+_audit/panel.js
+_audit/commitmsg*.txt
+_audit/analyze*.py
+_audit/dbg_*.py
+_audit/apply_*.py
+_audit/fix_*.py
+_audit/redo_cleanup.py
+_audit/what_was_lost.py
+_audit/*.log
+# --- tooling (versioned; no private data in any of these) ---
+!_audit/run_all.py
+!_audit/check_*.py
+!_audit/show_pane_order.py
+!_audit/verify_docs.py
+!_audit/schedule_sim.py
+!_audit/test_*.py
 
 # OS
 Thumbs.db
