@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -1232,6 +1233,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("X-Content-Type-Options", "nosniff")
+        # The page is served from changing source (a code change must be visible
+        # on reload, not after a cache expiry). A stale copy of an older panel
+        # is indistinguishable from a broken one.
+        self.send_header("Cache-Control", "no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         try:
@@ -1303,6 +1309,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path in ("/", "/index.html"):
             self._send_html(HTML)
+        elif parsed.path == "/api/ping":
+            # Cheap liveness/identity probe (no gcloud calls).
+            self._send_json({"ok": True, "app": "portfolio-news-updater"})
         elif parsed.path == "/api/config":
             # NEVER return the real secrets. This endpoint is readable by any
             # page that can reach the panel (DNS rebinding makes 127.0.0.1
@@ -1970,12 +1979,41 @@ def main():
     HOST = "127.0.0.1"
     server = None
     port = PORT
+
+    def panel_already_running(p):
+        """
+        Is a PortfolioNewsUpdater panel already answering on this port?
+
+        Uses /api/ping, deliberately: /api/status shells out to gcloud several
+        times (find_vm_zone, vm_status, auth_status) and can take many seconds,
+        so it is useless as a liveness probe. /api/ping answers immediately and
+        identifies the app.
+        """
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{p}/api/ping",
+                                        timeout=3) as resp:
+                return b"portfolio-news-updater" in resp.read(200)
+        except Exception:
+            return False
+
     for candidate in (PORT, 8002, 8003):
         try:
             server = ThreadingHTTPServer((HOST, candidate), Handler)
             port = candidate
             break
         except OSError as exc:
+            if panel_already_running(candidate):
+                # Refusing to start a second copy is deliberate: two panels
+                # serve DIFFERENT urls, so the browser could be showing an older
+                # instance while edits go to the newer one - which looks exactly
+                # like "the buttons stopped working". This bit me once already.
+                print("=" * 56)
+                print(f" A panel is ALREADY running on http://localhost:{candidate}")
+                print(" Nothing was started, to avoid two panels fighting.")
+                print(" Close the existing panel window (or: taskkill /F /IM python.exe)")
+                print(" and run start_cloud.bat again.")
+                print("=" * 56)
+                return
             print(f"  port {candidate} unavailable ({exc}); trying the next one...")
     if server is None:
         print("=" * 50)
