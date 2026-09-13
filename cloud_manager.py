@@ -605,7 +605,7 @@ HTML = """<!DOCTYPE html>
     <input id="exaKey" type="password" placeholder="paste your free EXA key (optional)">
     <div class="row">
       <div class="status" id="tavilyUsage" style="flex:1;margin-bottom:0">Search budget — Tavily | EXA: —</div>
-      <button class="btn-ghost" onclick="loadUsage()" style="margin-top:0">↻ Check</button>
+      <button class="btn-ghost" onclick="reload('usage', loadUsage)" style="margin-top:0">↻ Check</button>
     </div>
     <label>Chinese names &amp; subsidiaries — ticker_meta (this is where the Chinese edge comes from)</label>
     <div class="row" style="margin-bottom:6px">
@@ -674,7 +674,7 @@ HTML = """<!DOCTYPE html>
     <h2>4. Schedule & run history</h2>
     <div class="status" id="cronStatus">—</div>
     <div class="row">
-      <button class="btn-ghost" onclick="loadCron()">↻ Check schedule</button>
+      <button class="btn-ghost" onclick="reload('cron', loadCron)">↻ Check schedule</button>
       <button class="btn-ok" onclick="runNow(false)">▶ Run now (test)</button>
       <button class="btn-ok" onclick="runNow(true)" title="Real run; if nothing is NEW it sends a 📊 snapshot of the current picture instead of nothing">📊 Run now + snapshot</button>
     </div>
@@ -688,7 +688,7 @@ HTML = """<!DOCTYPE html>
     <h2>5. Stored news (last ~3 weeks, browsable)</h2>
     <div class="row" style="margin-bottom:8px">
       <input id="newsFilter" placeholder="Filter: ticker, category, title, source..." style="flex:1" onkeyup="renderNews()">
-      <button class="btn-ghost" onclick="loadNews()">📥 Load stored news</button>
+      <button class="btn-ghost" onclick="reload('news', loadNews)">📥 Load stored news</button>
       <button class="btn-ghost" onclick="translateAll()" title="Fill in English titles for stored items that have none (one batched AI call per ~25 headlines)">🌐 Translate missing</button>
       <button class="btn-ghost" onclick="purgeJunk()" title="Delete stored, never-pushed items scored <= 2 (old filter gaps)">🧹 Purge junk</button>
     </div>
@@ -701,7 +701,7 @@ HTML = """<!DOCTYPE html>
   <div class="card">
     <h2>6. Company lookup (auto-discovered)</h2>
     <div class="row" style="margin-bottom:8px">
-      <button class="btn-ghost" onclick="loadLookup()">📖 Load company lookup</button>
+      <button class="btn-ghost" onclick="reload('lookup', loadLookup)">📖 Load company lookup</button>
       <button class="btn-ok" onclick="rediscover()">🔍 Re-discover subsidiaries now</button>
     </div>
     <div class="status" id="lookupStatus">Shows what the updater knows about each company: Chinese names, aliases, subsidiaries (分期乐, Temu…) and their websites. New tickers are looked up and populated automatically.</div>
@@ -724,8 +724,20 @@ function showTab(name){
     b.classList.toggle('active', b.dataset.tab === name);
   }
   try { localStorage.setItem('pn_tab', name); } catch(e) {}
-  // Load that tab's data on first visit (the tables start empty).
-  if(name === 'news'){ loadCron(); loadLogs(); }
+  // Lazy per tab: each section loads only what it actually shows, and only the
+  // first time. The mapping below follows where the elements really live:
+  //   scan   : the ad-hoc form (no server state)
+  //   setup  : auth status + VM status
+  //   config : search-budget meter + the names/subsidiaries editor
+  //   news   : schedule, run history, stored news, company lookup
+  if(name === 'scan'){ once('status', refreshStatus); }
+  // refreshStatus() fills BOTH the auth line and the VM line, so one key.
+  if(name === 'setup'){ once('status', refreshStatus); }
+  if(name === 'config'){ once('usage', loadUsage); once('meta', loadEffectiveMeta); }
+  if(name === 'news'){
+    once('cron', loadCron); once('logs', loadLogs);
+    once('news', loadNews); once('lookup', loadLookup);
+  }
 }
 function initTabs(){
   let want = 'scan';
@@ -796,9 +808,23 @@ async function load(){
   window._maxItems = d.config.max_items_per_run || dflt.max_items_per_run || 40;
   window._maxDigest = d.config.max_digest_items || dflt.max_digest_items || 10;
   renderChips();
-  refreshStatus(); loadCron(); loadLogs(); loadUsage(); loadEffectiveMeta();
+  // NOTHING else loads here on purpose. Every one of these calls shells out to
+  // gcloud over ssh, and /api/status alone measured ~8 SECONDS. Firing five of
+  // them on page load made the panel feel broken (and they contend for the same
+  // gcloud). Each tab loads its own data the first time it is opened instead -
+  // see showTab()/once().
   initTabs();
 }
+
+// Fetch something the first time it is needed, then remember it. Keeps the
+// per-tab gcloud round-trips down to one visit instead of every page load.
+const _loaded = {};
+function once(key, fn){
+  if(_loaded[key]) return;
+  _loaded[key] = true;
+  try { fn(); } catch(e) { _loaded[key] = false; }
+}
+function reload(key, fn){ _loaded[key] = true; fn(); }
 
 // A secret input: show a placeholder when one is stored, and mark it so save()
 // knows the user did not replace it.
