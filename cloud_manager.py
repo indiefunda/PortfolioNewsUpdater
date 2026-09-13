@@ -637,7 +637,7 @@ HTML = """<!DOCTYPE html>
       </div>
       <div style="flex:1">
         <label>Max items per ticker per digest</label>
-        <input id="pushMaxPerTicker" type="number" min="1" value="3">
+        <input id="pushMaxPerTicker" type="number" min="1" value="2">
       </div>
     </div>
     <div class="row">

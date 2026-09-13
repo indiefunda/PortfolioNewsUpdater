@@ -187,8 +187,8 @@ EASTMONEY_MAX_QUERIES = 6
 # Defaults are conservative: a daily cap of 15 (~450/month worst case) plus a
 # monthly hard cap of 850 as insurance, and an adaptive skip that avoids using
 # Tavily for tickers the free sources already covered.
-TAVILY_MAX_DAILY_SEARCHES = 15
-TAVILY_MAX_MONTHLY_SEARCHES = 850
+TAVILY_MAX_DAILY_SEARCHES = 30
+TAVILY_MAX_MONTHLY_SEARCHES = 900
 # If the free sources (GoogleNewsZH + Eastmoney + Baidu) already found at
 # least this many NEW items for a ticker in the current run, skip Tavily for
 # it (budget save - Tavily is the scarce resource).
@@ -2807,6 +2807,15 @@ def fetch_tavily(query, secrets, config, since_dt=None, limit=8, topic="news",
     key = secrets.get("tavily_api_key", "")
     if not key:
         return []
+    # --no-write / --dry-run must not SPEND anything either. The guard used to
+    # sit only around the usage counter, so a "safe" test still fired the real
+    # request: the credit was consumed while the panel meter stayed at zero,
+    # which is the worst of both worlds. Refuse the call outright instead, and
+    # return None so the caller does not advance that source's delta.
+    if NO_WRITE:
+        print("  [tavily] --no-write/--dry-run: skipping the paid search "
+              "(no credits used).")
+        return None
     daily_cap = _cfg_int(config, "tavily_max_daily_searches", TAVILY_MAX_DAILY_SEARCHES)
     monthly_cap = _cfg_int(config, "tavily_max_monthly_searches", TAVILY_MAX_MONTHLY_SEARCHES)
     usage = tavily_usage_today()
@@ -2961,6 +2970,11 @@ def fetch_exa(query, secrets, config, since_dt=None, limit=6, with_text=False,
     key = secrets.get("exa_api_key", "")
     if not key:
         return []
+    # Same as Tavily: a dry run must not spend a credit it does not record.
+    if NO_WRITE:
+        print("  [exa] --no-write/--dry-run: skipping the paid search "
+              "(no credits used).")
+        return None
     daily_cap = _cfg_int(config, "exa_max_daily_searches", EXA_MAX_DAILY_SEARCHES)
     monthly_cap = _cfg_int(config, "exa_max_monthly_searches", EXA_MAX_MONTHLY_SEARCHES)
     usage = exa_usage_today()
@@ -3478,42 +3492,6 @@ def get_recent_pushed_titles(conn, ticker, limit=SEMANTIC_DEDUP_HISTORY):
     return [f"{r[0]}  [sent {str(r[1])[:10]}]" for r in rows if r[0]]
 
 
-def get_recent_seen_titles(conn, ticker, limit=SEMANTIC_DEDUP_HISTORY, before=None,
-                           exclude=None):
-    """
-    Return recent already-seen titles for a ticker (from the `seen` ledger),
-    newest first. This history is folded into the per-ticker AI-analysis
-    prompt so the model can flag recycled / same-event stories (known_event)
-    without a separate AI call.
-
-    'before' excludes the current run's items (marked 'seen' during the fetch
-    loop) so the "already reported BEFORE this run" block is unambiguous.
-
-    'exclude' drops specific titles from the history - used by ai_analyze to
-    remove the CURRENT BATCH's own titles from the "already reported" block.
-    Cross-source copies of one event arrive as separate numbered items, so the
-    prompt lists the current batch explicitly instead - that is what lets the
-    model recognise item 5 as the same story as item 1 without ever comparing
-    an item against itself.
-    """
-    if before:
-        cur = conn.execute(
-            "SELECT title, first_seen FROM seen WHERE ticker=? AND first_seen < ? "
-            "ORDER BY first_seen DESC LIMIT ?",
-            (ticker, before, limit),
-        )
-    else:
-        cur = conn.execute(
-            "SELECT title, first_seen FROM seen WHERE ticker=? "
-            "ORDER BY first_seen DESC LIMIT ?",
-            (ticker, limit),
-        )
-    rows = cur.fetchall()
-    if exclude:
-        ex = set(exclude)
-        return [f"{r[0]}  [first seen {str(r[1])[:10]}]"
-                for r in rows if r[0] and r[0] not in ex]
-    return [f"{r[0]}  [first seen {str(r[1])[:10]}]" for r in rows if r[0]]
 
 
 # Global-markets patterns: genuinely systemic US/global news that moves
