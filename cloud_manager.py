@@ -152,6 +152,7 @@ POST_ONLY_API = ("/api/upload", "/api/delete_news", "/api/auth_code")
 # them as GET; they are refused unless the request is same-origin (see
 # _origin_ok), which is what actually blocks the CSRF/DNS-rebinding vector.
 MUTATING_API = ("/api/auth", "/api/create_vm", "/api/run_now", "/api/purge_junk",
+                "/api/purge_duplicates",
                 "/api/rediscover")
 
 
@@ -699,7 +700,7 @@ HTML = """<!DOCTYPE html>
       <input id="newsFilter" placeholder="Filter: ticker, category, title, source..." style="flex:1" onkeyup="renderNews()">
       <button class="btn-ghost" onclick="reload('news', loadNews)">📥 Load stored news</button>
       <button class="btn-ghost" onclick="translateAll()" title="Fill in English titles for stored items that have none (one batched AI call per ~25 headlines)">🌐 Translate missing</button>
-      <button class="btn-ghost" onclick="purgeJunk()" title="Delete stored, never-pushed items scored <= 2 (old filter gaps)">🧹 Purge junk</button>
+      <button class="btn-ghost" onclick="purgeJunk()" title="Step 1: delete stored, never-pushed items scored <= 2. Step 2: find rows that are the SAME story stored more than once, show them, and delete the extras (never a row that was pushed)">🧹 Purge junk &amp; duplicates</button>
     </div>
     <div class="status" id="newsStatus">Click "Load stored news" to fetch from the server.</div>
     <div class="hint">🇨🇳 marks a Chinese-language item. Click <b>EN</b> on a row to translate that one, or the <b>译</b> link to open the article through Google Translate.</div>
@@ -955,10 +956,33 @@ async function loadNews(){
 }
 
 async function purgeJunk(){
-  if(!confirm('Delete all STORED (never-pushed) items scored <= 2? This cleans out old filter-gap junk (Heineken for LX, etc.). Pushed items and higher-scored stored items are kept.')) return;
-  $('newsStatus').textContent = '🧹 Purging junk on the server...';
-  const d = await api('/api/purge_junk', {});
-  $('newsStatus').textContent = d.ok ? '✅ '+d.output : '❌ '+(d.error||'failed');
+  // NOTE: this function deliberately contains NO newline escape sequences.
+  // The panel HTML is a Python triple-quoted string, so a backslash-n written
+  // here would become a REAL newline inside the JS string literal and break the
+  // entire script - and even writing that escape inside a comment breaks it,
+  // which is exactly what happened on the first attempt. Messages are joined
+  // with " | " and the regex uses [0-9] instead of the digit class.
+  //
+  // Step 1: low-quality stored items (never-pushed, scored <= 2). Safe.
+  if(!confirm('Step 1 of 2 - delete STORED (never-pushed) items scored <= 2? This cleans out old filter-gap junk (Heineken for LX, etc.). Pushed items and higher-scored stored items are kept.')) return;
+  $('newsStatus').textContent = '🧹 Purging low-quality items...';
+  const a = await api('/api/purge_junk', {});
+  if(!a.ok){ $('newsStatus').textContent = '❌ '+(a.error||'junk purge failed'); return; }
+
+  // Step 2: duplicate stories. Sized with a DRY RUN first - a purge can remove
+  // a large share of the archive, so it must never run unseen.
+  $('newsStatus').textContent = '🔍 Checking for duplicate stories...';
+  const b = await api('/api/purge_duplicates', {dry:true});
+  if(!b.ok){ $('newsStatus').textContent = '✅ '+a.output+' | ❌ '+(b.error||'duplicate check failed'); loadNews(); return; }
+  const m = /ROWS=([0-9]+)/.exec(b.output||'');
+  const n = m ? parseInt(m[1],10) : 0;
+  if(!n){ $('newsStatus').textContent = '✅ '+a.output+' | ✅ No duplicate stories found.'; loadNews(); return; }
+  const preview = (b.output||'').slice(0, 1200);
+  if(!confirm('Step 2 of 2 - found '+n+' row(s) that are the SAME story stored more than once. Keep the best copy of each and delete the rest? Rows that were pushed to Telegram are never deleted. Preview: '+preview)) return;
+
+  $('newsStatus').textContent = '🧹 Removing duplicates...';
+  const c = await api('/api/purge_duplicates', {dry:false});
+  $('newsStatus').textContent = c.ok ? ('✅ '+a.output+' | '+c.output) : '❌ '+(c.error||'duplicate purge failed');
   loadNews();
 }
 
@@ -1706,6 +1730,33 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"ok": ok, "error": (err or "") if not ok else "",
                          "output": "\n".join(tail)})
 
+    def _handle_purge_duplicates(self):
+        """Delete same-story duplicates from the stored news on the VM.
+
+        The panel calls this twice: dry=true to size the job and show the user
+        what would go, then dry=false after they confirm. A purge can remove a
+        large share of the archive, so it is never run unseen.
+        """
+        zone = find_vm_zone()
+        if not zone:
+            self._send_json({"ok": False, "error": "VM not found. Create the server first."})
+            return
+        data, error = self._read_json_body()
+        if error:
+            self._send_json({"ok": False, "error": error}, 400)
+            return
+        dry = bool((data or {}).get("dry"))
+        flag = ("--dry-run --purge-duplicates" if dry else "--purge-duplicates")
+        home = get_vm_home(zone)
+        ok, out, err = run_gcloud([
+            "compute", "ssh", "--zone", zone, VM_NAME,
+            "--command", f"cd {home} && python3 news_updater.py {flag} 2>&1",
+            "--quiet"], timeout=180)
+        tail = (out + err).strip().splitlines()
+        tail = tail[-24:] if len(tail) > 24 else tail
+        self._send_json({"ok": ok, "error": (err or "") if not ok else "",
+                         "dry": dry, "output": "\n".join(tail)})
+
     def _handle_delete_news(self):
         """
         Delete ONE stored news row on the VM (the panel's per-row ✕ button).
@@ -1916,6 +1967,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/purge_junk":
             self._handle_purge_junk()
+        elif parsed.path == "/api/purge_duplicates":
+            self._handle_purge_duplicates()
             return
         if parsed.path == "/api/rediscover":
             self._handle_rediscover()

@@ -355,6 +355,24 @@ python3 news_updater.py --translate=LX         # only one ticker
   matched against a curated list — a generic heuristic there would have thrown
   away real outlets such as `fx168news.com` and `stocktitan.net`.
   Run `--purge-junk-domains` once after upgrading to clear history.
+- **Duplicate purge (`🧹 Purge junk & duplicates`).** The live gate above is
+  deliberately strict, because it also decides what may occupy a **digest seat**,
+  where a false positive silently drops real news. The price of that strictness
+  is that a *reworded* headline for the same event still lands in the database
+  twice — e.g. `Citi expects Fed to hike in September, cut before mid-2027` and
+  `Citi forecasts September Fed hike, then cuts by 2027` score containment 0.571
+  against a required 0.82. Both are `stored`, so the digest was fine but the
+  browse view showed the same story twice.
+  The button therefore does two things, in order:
+  1. deletes stored, never-pushed items scored **<= 2** (the old filter gaps);
+  2. **dry-runs** the duplicate pass, shows you how many rows it found and what
+     they are, and only deletes after you confirm (`--purge-duplicates`).
+  It keeps the best copy of each story — **a row that was pushed to Telegram is
+  never deleted**, since it records something actually delivered. Guards stop it
+  merging things that merely look alike: different ticker symbols
+  (`Torrid (CURV)` vs `Maase (MAAS)` — a generic quote-page template scores
+  0.667), different actors (`Citi downgrades Qifu` vs `BofA cuts Qifu`), and
+  opposite directions (`Fed to hike` vs `Fed to cut`).
 - Exact dedup (SQLite hash per source+URL).
 - **Precision filters**: every source result must really mention one of the
   ticker's Chinese names/subsidiaries (with a smarter matcher that rejects
@@ -437,6 +455,9 @@ python3 news_updater.py --purge-junk      # delete stored junk (never-pushed, im
 python3 news_updater.py --purge-junk=3    # ... with a custom junk bar
 python3 news_updater.py --purge-junk-domains  # delete rows on content-farm/spam domains
 python3 news_updater.py --dry-run --purge-junk-domains  # ... list them, delete nothing
+python3 news_updater.py --purge-duplicates     # delete same-story duplicates (keeps the best copy)
+python3 news_updater.py --dry-run --purge-duplicates   # ... list them, delete nothing
+python3 news_updater.py --purge-duplicates=LX  # ... only for LX
 python3 news_updater.py --purge-macro-noise-dry  # show macro chatter that would go
 python3 news_updater.py --purge-macro-noise      # delete it (never touches pushed rows)
 python3 news_updater.py --translate            # fill in English titles for stored rows

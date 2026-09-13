@@ -39,6 +39,9 @@ New CLI modes:
   --purge-junk-domains   delete stored rows sitting on content-farm/spam
                    domains (the junk-domain gate only stops NEW ones);
                    combine with --dry-run to list them without deleting
+  --purge-duplicates[=TICKER]  delete same-story duplicates from the stored
+                   news, keeping the best copy of each (never deletes a row
+                   that was pushed); --dry-run lists them instead
 
 Reads config_local.json and secrets_local.json (both git-ignored), plus the
 auto-grown company_lookup.json and tavily_usage.json (also git-ignored).
@@ -248,6 +251,20 @@ MACRO_STORE_MAX_PER_RUN = 12
 # this much of their token sets are the SAME story from different outlets.
 STORY_JACCARD_MIN = 0.6
 STORY_CONTAINMENT_MIN = 0.82
+# Duplicate PURGE threshold (browsing hygiene only - never the digest).
+#
+# The live gate above is deliberately strict because it also decides what may
+# occupy a digest seat, where a false positive silently drops real news. The
+# cost of that strictness is that a reworded headline for the same event still
+# lands in the database twice:
+#     "Citi expects Fed to hike in September, cut before mid-2027"
+#     "Citi forecasts September Fed hike, then cuts by 2027"
+#   jaccard 0.400, containment 0.571 -> under both live thresholds, never merged
+# The JPMorgan story from the same batch scores 0.429 at worst, so ~0.55
+# separates "same story reworded" from "different story, same topic".
+# Used only by --purge-duplicates, which runs on stored rows by explicit
+# command, so digest behaviour is untouched.
+DUP_PURGE_SIMILARITY = 0.55
 # How many of a ticker's already-pushed titles the mechanical repeat gate
 # compares a new candidate against.
 PUSH_REPEAT_HISTORY = 160
@@ -1281,6 +1298,221 @@ def _story_rank(item):
         0 if (item.get("published_at") or item.get("date")) else 1,
         0 if item.get("snippet") else 1,
     )
+
+
+# ---------------------------------------------------------------------------
+# Duplicate purge - cleaning same-story copies out of the STORED news
+# ---------------------------------------------------------------------------
+# Antonym pairs that must never be collapsed, however similar the wording.
+# "Fed to hike" and "Fed to cut" share nearly every token but are opposite
+# stories, and deleting one would destroy real news. Only applied when each
+# headline picks ONE side: a headline mentioning both ("hike in September, cut
+# by 2027") has no single polarity, so it does not trigger the guard - which is
+# exactly the Citi case above.
+ANTONYM_PAIRS = (
+    ("hike", "cut"), ("hike", "cuts"), ("hikes", "cut"), ("hikes", "cuts"),
+    ("raise", "cut"), ("raise", "cuts"), ("raises", "cut"), ("raises", "cuts"),
+    ("raise", "lower"), ("raises", "lowers"),
+    ("rise", "fall"), ("rises", "falls"),
+    ("up", "down"),
+    ("beat", "miss"), ("beat", "misses"), ("beats", "miss"), ("beats", "misses"),
+    ("profit", "loss"), ("profits", "losses"),
+    ("surge", "plunge"), ("surges", "plunges"),
+    ("gain", "loss"), ("gains", "losses"),
+    ("upgrade", "downgrade"), ("upgrades", "downgrades"),
+    ("buy", "sell"), ("buys", "sells"),
+    ("加息", "降息"), ("上调", "下调"), ("增长", "下降"),
+    ("盈利", "亏损"), ("买入", "卖出"), ("涨停", "跌停"),
+)
+# Plural forms are listed explicitly rather than stemmed. A trailing-s strip
+# looks harmless until it turns "loss" into "los" and "misses" into "misse",
+# silently disabling the very guard that is supposed to protect real news.
+
+
+def _opposite_polarity(a, b):
+    """True when two token sets state opposite directions of the same thing."""
+    for x, y in ANTONYM_PAIRS:
+        ax, ay = x in a, y in a
+        bx, by = x in b, y in b
+        if (ax + ay == 1) and (bx + by == 1) and (ax != bx):
+            return True
+    return False
+
+
+def _duplicate_similarity(a, b):
+    """max(containment, jaccard): containment catches "same headline, extra
+    words", which is the usual reworded-syndication case."""
+    return max(_containment(a, b), _jaccard(a, b))
+
+
+# Ticker-like symbols: HUIZ, MAAS, CRD.A, NASDAQ. Used to stop template pages
+# merging. A dry run over the live DB showed why this is essential: the titles
+#     "Torrid Holdings Inc. (CURV) Stock Price, News, Quote & History"
+#     "Maase Inc. (MAAS) Stock Price, News, Quote & History"
+# score 0.667 - well over any sane threshold - because the generic Yahoo
+# template supplies nearly every token and the company name is the only thing
+# that varies. Deleting one would destroy a different company's news.
+_SYMBOL_RE = re.compile(r"\b[A-Z]{2,6}(?:\.[A-Z])?\b")
+
+
+def _symbols(title):
+    return set(_SYMBOL_RE.findall(title or ""))
+
+
+def _conflicting_symbols(title_a, title_b):
+    """True when both titles name a symbol and they are DIFFERENT symbols."""
+    sa, sb = _symbols(title_a), _symbols(title_b)
+    return bool(sa and sb and not (sa & sb))
+
+
+# Institutions that ACT in a headline. Two titles naming different actors are
+# different news even when they share the subject and the analyst vocabulary:
+#     "Citi Downgrades Qifu Technology (QFIN) to Sell, Cuts Target Price to $8"
+#     "BofA cuts Qifu Technology stock price target to $11 on earnings outlook"
+# score 0.6+ on the shared subject alone, and merging them would delete a real
+# story. A false block here is harmless (a duplicate is merely kept), so the
+# list is deliberately generous and matched on exact tokens.
+ACTOR_TOKENS = frozenset({
+    "citi", "citigroup", "jpmorgan", "bofa", "goldman", "morgan", "stanley",
+    "ubs", "hsbc", "deutsche", "barclays", "nomura", "jefferies", "wedbush",
+    "piper", "rbc", "mizuho", "macquarie", "bernstein", "cowen", "oppenheimer",
+    "keybanc", "baird", "stifel", "truist", "wells", "fargo", "scotiabank",
+    "fed", "pboc", "ecb", "boj", "csrc", "sec", "imf", "moody", "fitch",
+    "sp", "s&p",
+})
+
+
+def _conflicting_actors(a, b):
+    """True when both token sets name an actor and none in common."""
+    aa, ab = ACTOR_TOKENS & a, ACTOR_TOKENS & b
+    return bool(aa and ab and not (aa & ab))
+
+
+def _dup_pair_matches(row_a, row_b):
+    """Do these two STORED rows describe the same story?
+
+    Every guard is checked against the pair directly - never through a chain of
+    intermediate rows. The first dry run clustered transitively via a seed, so
+    A~B and B~C pulled in A and C even when they were unrelated companies.
+    """
+    title_a, title_b = row_a[4] or "", row_b[4] or ""
+    if _conflicting_symbols(title_a, title_b):
+        return False
+    ta, tb = story_tokens(title_a), story_tokens(title_b)
+    if _opposite_polarity(ta, tb):
+        return False
+    if _conflicting_actors(ta, tb):
+        return False
+    return _duplicate_similarity(ta, tb) >= DUP_PURGE_SIMILARITY
+
+
+# Column order of the rows find_duplicate_groups() works with.
+_DUP_COLS = ("id, ticker, source, lang, "
+             "COALESCE(NULLIF(title_en, ''), title_raw, ''), "
+             "importance, pushed, first_seen, url")
+
+
+def _dup_keep_rank(row):
+    """Lower is better. A PUSHED row is real delivery history and always wins;
+    then importance; then the source-signal order; then the earliest sighting."""
+    _id, _ticker, source, lang, _title, importance, pushed, first_seen, _url = row
+    return (
+        0 if pushed else 1,
+        -(importance if isinstance(importance, int) else 0),
+        STORY_SOURCE_RANK.get(source or "", 50),
+        0 if lang == "zh" else 1,
+        first_seen or "",
+    )
+
+
+def find_duplicate_groups(conn, ticker=None):
+    """Cluster stored rows into same-story groups.
+
+    Returns a list of {"keeper": row, "victims": [rows]}. A row that was PUSHED
+    is never a victim: it records something actually delivered, and deleting it
+    would make the browse view disagree with what was sent. If a cluster holds
+    several pushed rows, all are kept and only the unpushed extras go.
+    """
+    sql = f"SELECT {_DUP_COLS} FROM news"
+    params = ()
+    if ticker:
+        sql += " WHERE ticker=?"
+        params = (ticker,)
+    rows = conn.execute(sql, params).fetchall()
+
+    by_ticker = {}
+    for r in rows:
+        by_ticker.setdefault(r[1], []).append(r)
+
+    groups = []
+    for _tk, items in by_ticker.items():
+        clusters = []
+        for r in items:
+            placed = False
+            for cl in clusters:
+                if _dup_pair_matches(r, cl["seed"]):
+                    cl["rows"].append(r)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append({"seed": r, "rows": [r]})
+        for cl in clusters:
+            if len(cl["rows"]) < 2:
+                continue
+            keeper = min(cl["rows"], key=_dup_keep_rank)
+            # Re-check every candidate against the KEEPER, not against whatever
+            # seed happened to start the cluster: the greedy pass can chain
+            # unrelated rows together, and it is the keeper that survives.
+            victims = [r for r in cl["rows"]
+                       if r is not keeper and not r[6] and _dup_pair_matches(keeper, r)]
+            if victims:
+                groups.append({"keeper": keeper, "victims": victims,
+                               "cluster_size": len(cl["rows"])})
+    return groups
+
+
+def purge_duplicates(conn, ticker=None, dry_run=False):
+    """Delete stored same-story duplicates, keeping the best copy of each.
+
+    Returns (removed_count, groups). With dry_run the connection is only read.
+    """
+    groups = find_duplicate_groups(conn, ticker=ticker)
+    victims = [r for g in groups for r in g["victims"]]
+    if victims and not dry_run:
+        conn.executemany("DELETE FROM news WHERE id=?", [(r[0],) for r in victims])
+        conn.commit()
+    return len(victims), groups
+
+
+def _readonly_db():
+    """The REAL database, opened read-only.
+
+    Needed because _db() returns an empty :memory: database under --no-write,
+    so a "dry run" through it would cheerfully report nothing to do no matter
+    what the real database holds.
+    """
+    return sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True, timeout=30)
+
+
+def _print_duplicate_groups(groups, removed, dry_run):
+    """Human-readable report of what was (or would be) removed."""
+    if not groups:
+        print("  [purge-dups] no same-story duplicates found.")
+        return
+    verb = "would remove" if dry_run else "removed"
+    print(f"  [purge-dups] {len(groups)} duplicate group(s); "
+          f"{verb} {removed} row(s).")
+    for g in groups[:20]:
+        k = g["keeper"]
+        print(f"    keep [{k[1]}/{k[2]}] {(k[4] or '')[:78]}")
+        for v in g["victims"]:
+            print(f"    drop [{v[1]}/{v[2]}] {(v[4] or '')[:78]}")
+    if len(groups) > 20:
+        print(f"    ... and {len(groups) - 20} more group(s)")
+    # Stable machine-readable line for the panel, which sizes the job with a
+    # dry run and then asks the user before deleting anything. Parsing the
+    # prose above would break the moment the wording changed.
+    print(f"  [purge-dups] GROUPS={len(groups)} ROWS={removed}")
 
 
 def dedupe_same_story(items):
@@ -4952,6 +5184,34 @@ def main():
         conn.commit()
         conn.close()
         print(f"  [purge-domains] deleted {len(victims)} row(s).")
+        sys.exit(0)
+
+    if any(a == "--purge-duplicates" or a.startswith("--purge-duplicates=")
+           for a in sys.argv):
+        # Remove same-story copies from the STORED news (the browse view), which
+        # the strict live gate deliberately lets through so it never risks a
+        # digest seat. Keeps the best copy of each story; never deletes a row
+        # that was pushed.
+        #
+        # Scans the REAL database read-only under --no-write, because _db()
+        # would hand back an empty in-memory one and report "nothing to do".
+        ticker_arg = None
+        for a in sys.argv:
+            if a.startswith("--purge-duplicates"):
+                parts = a.split("=", 1)
+                if len(parts) == 2 and parts[1].strip():
+                    ticker_arg = parts[1].strip().upper()
+        if NO_WRITE:
+            scan = _readonly_db()
+            removed, groups = purge_duplicates(scan, ticker=ticker_arg, dry_run=True)
+            scan.close()
+            _print_duplicate_groups(groups, removed, dry_run=True)
+            print("  [purge-dups] --no-write/--dry-run: listed only, nothing deleted.")
+            sys.exit(0)
+        conn = _db()
+        removed, groups = purge_duplicates(conn, ticker=ticker_arg, dry_run=False)
+        conn.close()
+        _print_duplicate_groups(groups, removed, dry_run=False)
         sys.exit(0)
 
     if any(a == "--purge-junk" or a.startswith("--purge-junk=") for a in sys.argv):
