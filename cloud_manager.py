@@ -496,6 +496,15 @@ HTML = """<!DOCTYPE html>
   .badge.ok { background:#14532d; color:#a7f3d0; }
   .badge.err { background:#7c2d12; color:#fecaca; }
   .badge.gray { background:#2a2e38; color:#cbd5e1; }
+  /* Tabs: the page had grown into one long scroll (deep search + 6 steps) */
+  .tabs { display:flex; gap:6px; flex-wrap:wrap; margin:0 0 14px 0; }
+  .tab { background:#232733; color:var(--muted); border:1px solid var(--border);
+         border-bottom:2px solid transparent; border-radius:8px 8px 0 0;
+         padding:9px 14px; font-size:13px; cursor:pointer; }
+  .tab:hover { color:var(--text); }
+  .tab.active { background:var(--card); color:var(--text); font-weight:600;
+                border-bottom-color:var(--accent); }
+  .tabpane { animation:none; }
   .empty { color:var(--muted); text-align:center; padding:24px; font-size:13px; }
   /* Links: the browser default (#0000EE) and :visited (#551A8B) are almost
      invisible on this dark theme - always specify both. */
@@ -512,8 +521,16 @@ HTML = """<!DOCTYPE html>
 <body>
   <h1>📰 PortfolioNewsUpdater — Cloud</h1>
   <div class="sub">Searches SEC (with 6-K/8-K content), Chinese news (乐信/分期乐… via Google News zh, Eastmoney, Tavily, official websites), English news and RSS — translates &amp; scores everything with AI, pushes the top items to Telegram. Runs twice a day at 9:15 ET (pre-open) &amp; 17:00 ET (post-close), auto-adjusted for DST.</div>
+  <div class="tabs" id="tabbar">
+    <button class="tab" data-tab="scan" onclick="showTab('scan')">🔎 Deep search</button>
+    <button class="tab" data-tab="setup" onclick="showTab('setup')">⚙️ Setup &amp; schedule</button>
+    <button class="tab" data-tab="news" onclick="showTab('news')">📰 News &amp; data</button>
+    <button class="tab" data-tab="config" onclick="showTab('config')">🧩 Configuration</button>
+  </div>
+
   <div class="msg" id="msg"></div>
 
+  <div class="tabpane" id="pane-scan" style="display:none">
   <div class="card">
     <h2>🔎 Deep search — any ticker, one-off (nothing is saved)</h2>
     <div class="row" style="margin-bottom:8px">
@@ -530,6 +547,7 @@ HTML = """<!DOCTYPE html>
     <div id="adhocResult"></div>
   </div>
 
+  <div class="tabpane" id="pane-setup" style="display:none">
   <div class="card">
     <h2>1. Connect to Google</h2>
     <div class="status" id="authStatus">Checking...</div>
@@ -553,6 +571,7 @@ HTML = """<!DOCTYPE html>
     <div class="hint">Uses the same free e2-micro VM as your price monitor.</div>
   </div>
 
+  <div class="tabpane" id="pane-config" style="display:none">
   <div class="card">
     <h2>3. Configuration</h2>
     <label>Stocks</label>
@@ -646,6 +665,7 @@ HTML = """<!DOCTYPE html>
     <div class="hint">Sends your stocks, AI settings, and Telegram keys to the cloud server. Keys stay local and on your VM — never shared.</div>
   </div>
 
+  <div class="tabpane" id="pane-news" style="display:none">
   <div class="card">
     <h2>4. Schedule & run history</h2>
     <div class="status" id="cronStatus">—</div>
@@ -685,10 +705,30 @@ HTML = """<!DOCTYPE html>
     <div class="hint">This grows automatically (monthly re-search per ticker; new subsidiaries are alerted on Telegram). "Re-discover now" forces it immediately — costs ~1–2 Tavily searches + 1 AI call per ticker. To override anything, edit the Chinese names JSON in Step 3 — config overrides always win.</div>
   </div>
 
+  </div><!-- /news -->
 <script>
 let tickers = [];
 let news = [];
 function $(id){ return document.getElementById(id); }
+
+// ---- tabs ----
+function showTab(name){
+  for(const p of document.querySelectorAll('.tabpane')){
+    p.style.display = (p.id === 'pane-'+name) ? '' : 'none';
+  }
+  for(const b of document.querySelectorAll('.tab')){
+    b.classList.toggle('active', b.dataset.tab === name);
+  }
+  try { localStorage.setItem('pn_tab', name); } catch(e) {}
+  // Load that tab's data on first visit (the tables start empty).
+  if(name === 'news'){ loadCron(); loadLogs(); }
+}
+function initTabs(){
+  let want = 'scan';
+  try { want = localStorage.getItem('pn_tab') || 'scan'; } catch(e) {}
+  if(!document.getElementById('pane-'+want)) want = 'scan';
+  showTab(want);
+}
 function showMsg(t, type){ const m=$('msg'); m.textContent=t; m.className='msg '+type;
   setTimeout(()=>{ m.className='msg'; }, 8000); }
 
@@ -753,6 +793,7 @@ async function load(){
   window._maxDigest = d.config.max_digest_items || dflt.max_digest_items || 10;
   renderChips();
   refreshStatus(); loadCron(); loadLogs(); loadUsage(); loadEffectiveMeta();
+  initTabs();
 }
 
 // A secret input: show a placeholder when one is stored, and mark it so save()
