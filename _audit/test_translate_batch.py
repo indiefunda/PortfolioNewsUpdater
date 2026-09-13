@@ -27,6 +27,14 @@ rows = conn.execute(
     "AND (title_en IS NULL OR title_en = '' OR title_en = title_raw) "
     "ORDER BY id DESC LIMIT 12").fetchall()
 print(f"rows needing translation (sample of 12): {len(rows)}")
+if not rows:
+    # Nothing to translate is a legitimate outcome, not a failure. This used to
+    # fall through, send an empty HEADLINES list, get "[]" back, and then treat
+    # that empty array as a PARSE ERROR (because `not []` is True) - reporting a
+    # broken translator on a machine with no stored Chinese rows.
+    print("SKIPPED - no stored rows need translation "
+          "(local news.db is empty or already translated)")
+    sys.exit(0)
 
 items = [{"n": i, "title": r["title_raw"]} for i, r in enumerate(rows, 1)]
 prompt = (
@@ -42,7 +50,8 @@ content = nu._chat(base, model, key,
 elapsed = time.time() - t0
 print(f"one batched call: {elapsed:.1f}s, response {len(content or '')} chars")
 parsed = nu._parse_json_array(content) if content else None
-if not parsed:
+if parsed is None:
+    # Only a genuinely unparseable reply is a failure now; [] is a valid answer.
     print("could not parse the reply:")
     print((content or "")[:400])
     sys.exit(1)

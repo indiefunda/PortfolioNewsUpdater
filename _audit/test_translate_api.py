@@ -18,6 +18,12 @@ try:
     print("  got :", data.get("translations"))
     ok = bool(data.get("translations")) and "?" not in (data["translations"][0] or "")
     print("  [%s] UTF-8 round-trip clean" % ("PASS" if ok else "FAIL"))
+    # This printed FAIL and then fell off the end of the script, so the exit
+    # code was 0 and a broken translator looked like a pass.
+    print("RESULT: " + ("PASS - /api/translate returns real English"
+                        if ok else "FAIL - translation missing or garbled"))
+    sys.exit(0 if ok else 1)
 except Exception as exc:
     print("  FAILED:", exc)
+    print("RESULT: FAIL - %s" % exc)
     sys.exit(1)
