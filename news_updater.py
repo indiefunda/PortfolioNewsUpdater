@@ -2,8 +2,9 @@
 """
 PortfolioNewsUpdater - free stock news monitor (v2 - Chinese-first).
 
-Runs on a Google Cloud "Always Free" e2-micro VM. Twice a day (09:15 and
-16:45 ET) it checks the configured tickers for NEW information since the
+Runs on a Google Cloud "Always Free" e2-micro VM. Twice a day, Monday to Friday
+(09:15 and 17:00 ET - the cron entries carry day-of-week 1-5) it checks the
+configured tickers for NEW information since the
 last run - and for Chinese companies it searches CHINESE news sources
 using the company's Chinese name and its subsidiaries (e.g. LX -> 乐信,
 分期乐, 桔子理财), because that is where the real edge is for US-listed

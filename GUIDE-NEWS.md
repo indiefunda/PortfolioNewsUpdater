@@ -24,9 +24,43 @@ Which run a digest came from is printed in its header
 
 The installer puts cron jobs on the VM for both DST seasons and a tiny
 DST-aware guard inside `news_updater.py` makes the out-of-season jobs an
-instant no-op, so exactly **two real runs happen per day**. The old third run
+instant no-op, so exactly **two real runs happen per weekday**. The old third run
 (23:00 ET / Beijing noon) fired at 03:00–04:00 UTC — deep inside peak — and was
 removed purely for AI cost.
+
+> **Weekends are skipped.** The cron entries carry day-of-week `1-5`, so
+> Saturday and Sunday get no runs at all. If you want a weekend run, change
+> `1-5` to `*` in `setup_cloud.sh`'s `build_cron()` and re-run the installer.
+
+## 🔎 Deep search — one-off look at ANY ticker (nothing is saved)
+
+The panel's first tab is for a stock you do **not** track — a quick "what is
+going on with this name lately?":
+
+1. Type any ticker (e.g. `BABA`, `PDD`, `FUTU`) and pick a window (1 / 2.5 / 4 /
+   6 months).
+2. It **discovers that company's Chinese name, brands and overseas entities on
+   the fly** — the same discovery the watchlist uses.
+3. It deep-searches the window across Google News zh + EN, Eastmoney and Tavily,
+   drops anything unrelated, and collapses the same story from multiple sources.
+4. Each article gets an ⭐ importance score, a **▲ positive / ▼ negative /
+   ● neutral** marker, a category and a one-line "what this means".
+5. Finally a short overall read: **bullish / bearish / neutral / mixed**, a
+   confidence 1–10, the dominant themes and the strongest drivers.
+
+**Nothing about a deep search is stored** — no database rows, no saved company
+profile, no dedup memory, no Telegram, and no effect on your watchlist. That is a
+property of the code path, not a setting. It is also available from the CLI:
+
+```bash
+python3 news_updater.py --adhoc-scan=FUTU        # default window
+python3 news_updater.py --adhoc-scan=FUTU:120    # last 4 months
+```
+
+Cost when budgets are available: ~4–6 Tavily credits + ~4 AI calls. If the
+Tavily daily cap is already reached it falls back to the free sources (Google
+News zh + EN, Eastmoney) and costs 0 Tavily credits — still enough to find the
+company and its brands.
 
 ## What it checks (per ticker, per run — only the "delta" since last time)
 
@@ -50,13 +84,15 @@ removed purely for AI cost.
 5. **EXA (neural search)** — *semantic* search: finds pages ABOUT the
    concept, not just containing the keywords. Used three ways: per-ticker
    **big/impact news**, the **macro tier** (semantic — "助贷的生死时刻" style
-   coverage, no regex needed), and **subsidiary discovery** (finds related
-   entities keyword search never surfaces, e.g. 陆金申华 for LU). Free ~1,000
-   searches/month, hard-budgeted (max 32/day, 980/month), skipped for a
-   ticker when free sources already covered it. **Neural search also returns
-   the whole sector**, so every per-ticker EXA result must now really mention
-   the company (or a subsidiary/alias) — everything else is dropped before it
-   is stored or scored.
+   coverage, no regex needed), and **company discovery** (finds related
+   entities keyword search never surfaces, e.g. 陆金申华 for LU, Poni Insurtech
+   for HUIZ). Free ~1,000 searches/month, hard-budgeted (max 32/day,
+   980/month).
+   **Per-ticker EXA news search is OFF by default** (`"exa_per_ticker": true` to
+   turn it on). Measured over 616 stored EXA rows, 610 never mentioned the
+   company: its neural query pulled in the whole sector, so a paid credit per
+   ticker per run bought almost nothing. What still runs is EXA for the
+   **macro tier** and for **discovery**, where it genuinely earns its keep.
 6. **Baidu News** — best-effort Chinese news search (off by default: Baidu
    serves a CAPTCHA to server IPs, so it rarely returns anything — you can
    re-enable it via `sources.baidu`)
@@ -111,16 +147,26 @@ knowledge base in `company_lookup.json` (on the server):
   lookup → AI extraction → written back), then runs the news search with the
   discovered names, subsidiaries and websites.
 - **How often**: every **`lookup_refresh_days`** (default **30** — monthly)
-  each ticker's profile is re-searched for new subsidiaries (~1–2 Tavily
-  searches + 1 AI call per ticker per month). New tickers are discovered on
-  their first run; a failed lookup retries within ~a week.
+  each ticker's profile is re-searched. Budget up to **~5 Tavily searches +
+  ~3 EXA searches + ~3 AI calls per ticker** on a refresh: discovery runs two
+  passes over different query angles (Chinese operations/brands, then overseas
+  entities) and each pass asks the AI twice — once for the profile, once for a
+  brand-only extraction. New tickers are discovered on their first run; a
+  failed lookup retries within ~a week.
+- **Brands, not just registry names**: discovery deliberately prefers the short
+  brand names that headlines use (分期乐, 平安普惠, Poni Insurtech, 富途牛牛) over
+  legal entity names (深圳市分期乐网络科技有限公司), because only the former are
+  useful as search terms. The term budget is 8, and short brand-length names are
+  ranked first.
 - **New-subsidiary alert**: when discovery finds names the lookup didn't
   have (e.g. Temu, LU Global, a Hong Kong broker), you get a **Telegram
   alert** so you know your searches just expanded.
-- **Step 6 in the panel** shows the live lookup (including websites) and has
-  a **"Re-discover subsidiaries now"** button to force an immediate re-search.
-  Step 3 is your explicit override (`ticker_meta`) — it always wins over
-  discovered data. Both views stay in sync on the next run.
+- **The panel** shows the live lookup (including websites) and has a
+  **"Re-discover subsidiaries now"** button to force an immediate re-search.
+  The Configuration tab's names editor shows exactly what is being searched for
+  each ticker — everything is merged (your config **plus** what discovery
+  found), and your entries are tried first. Note that list fields are **unioned**:
+  adding a name via config cannot remove a discovered one.
 
 ## One-time setup
 
@@ -128,17 +174,21 @@ knowledge base in `company_lookup.json` (on the server):
    `https://cloud.google.com/sdk/docs/install` — then reopen your terminal.
 
 2. **Start the panel** (double-click `start_cloud.bat`, or `python cloud_manager.py`).
-   Open **`http://localhost:8001`**.
+   It opens the panel for you — **`http://localhost:8001`**, or 8002/8003 if
+   that port is taken (the launcher reads the real URL from `panel_url.txt`).
+   A second copy refuses to start, so you can never end up with two panels.
 
-3. In the panel:
-   - **Connect to Google** → Authenticate.
-   - **Your server** → **Create/update free server** (creates the free
-     e2-micro VM; re-runs safely if it already exists).
+3. In the panel — it has four tabs: **🔎 Deep search**, **⚙️ Setup & schedule**,
+   **📰 News & data**, **🧩 Configuration**:
+   - **Setup & schedule** → **Connect to Google** → Authenticate.
+   - **Setup & schedule** → **Your server** → **Create/update free server**
+     (creates the free e2-micro VM; re-runs safely if it already exists).
    - **Configuration** → add tickers, pick AI provider, paste Telegram +
      AI keys, and paste your free **Tavily key** (optional but recommended).
-   - **Chinese names (ticker_meta)** → per-ticker JSON with `name_zh`,
-     `aliases_zh`, `subsidiaries_zh`. **This is where the Chinese edge comes
-     from.** Example:
+   - **Configuration** → **Chinese names (ticker_meta)** → per-ticker JSON with
+     `name_zh`, `aliases_zh`, `subsidiaries_zh`. **This is where the Chinese edge
+     comes from.** The **👁 Show what this ticker searches** button fills in
+     everything discovered so far plus your own entries. Example:
      ```json
      {
        "LX": {
@@ -295,15 +345,18 @@ python3 news_updater.py --translate=LX         # only one ticker
   which previously passed through unrelated filler (Heineken buybacks for
   LX), is filtered too.
 - **Semantic dedup folded into the analysis call**: the per-ticker AI call
-  also sees the recent `seen` history and marks recycled / same-event stories
-  (`known_event`) — no separate dedup call, so **half the AI calls** per run.
+  also sees **what has already been SENT to you** and marks recycled /
+  same-event stories (`known_event`) — no separate dedup call, so **half the AI
+  calls** per run.
 - **Recycled news**: news rows and dedup hashes are both kept ~21 days
   (`news_retention_days` / `seen_retention_days`). Inside the window a
   re-publication is recognized and not re-pushed; after the window it is
   treated as fresh again and reaches you — the behavior you asked for.
-  **Keep `seen_retention_days` equal to `news_retention_days`**: the `seen`
-  ledger is also the AI's "already reported" history, so a longer seen window
-  makes the model suppress genuinely new items as "known".
+  The AI's "already reported" history comes from the **`pushed_stories` ledger**
+  (what was actually delivered), not from `seen` (everything ever fetched, ~91%
+  of which was never sent — feeding that to the model made it suppress
+  genuinely new items). `pushed_stories` is pruned at 3× the event window, so
+  `seen_retention_days` no longer affects the model's memory.
 - **Importance floor** (`push_min_importance`, default 4): nothing below it is
   pushed, even in "push everything" mode — kills ⭐1–3 noise.
 - **AI veto**: the AI's per-item `push` flag is honored — it can keep an item
@@ -329,6 +382,8 @@ Every run prunes the DB:
   default **21**), so a recycled re-publication is treated as fresh again
   after the window — while semantic dedup still stops re-pushes *inside* it.
 - `VACUUM` runs automatically when the DB file passes 50 MB.
+- `pushed_stories` (the repeat/event gate's memory) is pruned at 3× the event
+  window (**21 days** by default), so it cannot grow without bound.
 
 ## Tavily budget (free plan: 1,000 searches/month)
 
@@ -347,21 +402,35 @@ allowance unused. Usage is tracked in `tavily_usage.json`.
 
 ```bash
 python3 news_updater.py --force           # run now (bypass schedule guard)
-python3 news_updater.py --force --dry-run  # run but DON'T send Telegram; print digest
+python3 news_updater.py --force --dry-run  # dry run: prints the digest, sends
+                                            # nothing, writes nothing AND makes
+                                            # no paid calls (no Tavily/EXA credits)
 python3 news_updater.py --force --snapshot # real run; if nothing NEW, send a 📊
                                             # snapshot of the current picture instead
-python3 news_updater.py --force --dry-run --no-write  # full test: no DB/lookup/history writes, no Tavily/EXA credits used
+python3 news_updater.py --adhoc-scan=FUTU      # one-off deep search, nothing saved
+python3 news_updater.py --adhoc-scan=FUTU:120  # ... a 4-month window
 python3 news_updater.py --dump-news       # print stored news as JSON (panel browse)
 python3 news_updater.py --dump-news=LX    # ... only for LX
 python3 news_updater.py --dump-lookup     # print the company lookup as JSON (panel)
+python3 news_updater.py --dump-effective-meta  # what is ACTUALLY searched per ticker
 python3 news_updater.py --dump-usage      # print Tavily + EXA usage counters (panel meter)
 python3 news_updater.py --rediscover      # force re-discovery of ALL tickers now
 python3 news_updater.py --rediscover=LU   # ... only for LU
 python3 news_updater.py --purge-junk      # delete stored junk (never-pushed, importance<=2)
 python3 news_updater.py --purge-junk=3    # ... with a custom junk bar
+python3 news_updater.py --purge-macro-noise-dry  # show macro chatter that would go
+python3 news_updater.py --purge-macro-noise      # delete it (never touches pushed rows)
+python3 news_updater.py --translate            # fill in English titles for stored rows
+python3 news_updater.py --translate=LX         # ... only for LX
+python3 news_updater.py --translate-pushed     # ... only rows that were pushed
 python3 news_updater.py --delete-news=LX|Tavily|<hash>         # delete ONE stored row
 python3 news_updater.py --delete-news-pushed=LX|Tavily|<hash>  # ... and forget it was pushed
 ```
+
+> `--dry-run` implies `--no-write`: it opens an in-memory DB, writes no
+> lookup/history/usage files, sends no Telegram **and skips the paid Tavily/EXA
+> searches entirely**, so you can run it as often as you like. Use `--no-write`
+> alone only if you also want a real run's side effects suppressed.
 
 **Deleting one item from the panel (Step 5).** Each row in the stored-news
 table has an ✕ button. It asks for confirmation, then deletes that single row on
@@ -377,13 +446,25 @@ Your **AI key**, **Telegram token**, and **Tavily key** live in
 `secrets_local.json`, which is **git-ignored** — never commit or share it.
 Your **tickers/holdings** live in `config_local.json` (also git-ignored; the
 repo ships a blank `config_local.example.json` template). Runtime data —
-`news.db`, `company_lookup.json`, `tavily_usage.json` — is git-ignored too.
+`news.db`, `company_lookup.json`, `tavily_usage.json`, `exa_usage.json`,
+`news_run_history.json`, `sec_validate.json`, `news_updater.lock`,
+`panel_url.txt` — is git-ignored too.
+
+The panel itself is hardened: it binds to `127.0.0.1` only, rejects any request
+whose `Host` is not localhost or whose `Origin` is cross-site, makes all
+mutating routes POST-only, and `/api/config` returns masked placeholders rather
+than your real keys.
 
 ## Stopping it (if you ever need to)
 
 ```bash
-crontab -l | grep -v news_updater | crontab -
+crontab -l | grep -v news_updater | crontab -          # user crontab
+sudo rm -f /etc/cron.d/news-summer /etc/cron.d/news-winter   # fallback install
 ```
+
+The second line matters if the installer fell back to `/etc/cron.d/` (it does
+when the user crontab is not writable) — the first command alone would leave
+those jobs running.
 
 ## Troubleshooting
 
@@ -394,7 +475,7 @@ crontab -l | grep -v news_updater | crontab -
 | New stock added but no Chinese news appears | Check Step 6 (Company lookup) after the next run — the updater auto-discovers the company's Chinese names/subsidiaries and searches them. You can also add them manually in the Step 3 JSON (overrides always win). |
 | No digest arrives | Click **Run now (test)** and read the output. Check Telegram + AI keys. |
 | Tavily not used | Add your Tavily key (free tier) in the panel and re-upload; the run log shows `Tavily daily/monthly cap reached` or `skipping Tavily (saving credits)` when it's budget-skipped. |
-| Too many/too few items | Adjust `max_items_per_run` / `max_digest_items`, or switch `push_mode` to `score` and raise `push_min_score`. |
+| Too many/too few items | Switch `push_mode` to `score` and raise `push_min_score`, or lower `push_min_importance`/`push_max_per_ticker` (all editable in the panel). `max_items_per_run` and `max_digest_items` have **no panel input** — hand-edit `config_local.json` on the server if you need them. |
 | Out-of-season run skipped | Expected — the DST guard makes the wrong-season cron job a fast no-op. |
 | Manual run skipped | The panel's **Run now (test)** always forces a run (`--force`). |
 

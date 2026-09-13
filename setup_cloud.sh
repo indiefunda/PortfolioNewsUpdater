@@ -7,12 +7,16 @@
 #   bash setup_cloud.sh
 #
 # What it does:
-#   1. Installs Python deps (requests, feedparser, edgartools)
+#   1. Installs Python deps (requests, feedparser, edgartools, tzdata)
 #   2. Installs FOUR DST-aware cron jobs that run news_updater.py
-#      twice a day, pinned to US market time:
+#      twice a day, Monday to Friday, pinned to US market time:
 #        Run 1  09:15 ET - 15 minutes before the 09:30 ET open
 #        Run 2  17:00 ET - one hour after the 16:00 ET close
-#   3. Runs news_updater.py once (--force --dry-run) to confirm it works
+#   3. VERIFIES the deployment WITHOUT running the pipeline. It used to run
+#      `--force --dry-run` "to confirm it works", which was not safe: every
+#      database write is gated on --no-write, so that test marked the items it
+#      would have sent as pushed and swallowed them. Deploys must never consume
+#      news, so this step only checks that the updater imports cleanly.
 #
 # Why a cron job per season? US Eastern time shifts by 1 hour between DST
 # seasons, but cron fires at fixed UTC times. So we install one job
