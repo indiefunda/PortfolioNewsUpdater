@@ -124,18 +124,69 @@ would leak write access to your database. The build now refuses it.
 
 ### Step 5 — Let the VM write to Firestore
 
+**There are TWO gates here, and the second one is the one that actually
+blocks you.** This section originally covered only the first, which cost real
+debugging time.
+
+**Gate 1 — IAM (what the identity may do).**
+
 ```bash
-# 1. Find the VM's service account email:
 gcloud compute instances describe stock-monitor --zone=us-east1-b \
   --format="value(serviceAccounts[0].email)"
-
-# 2. Grant it Firestore access (replace EMAIL with what step 1 printed):
-gcloud projects add-iam-policy-binding keen-wavelet-275120 \
-  --member="serviceAccount:EMAIL" --role="roles/datastore.user"
 ```
 
-`roles/datastore.user` is deliberately narrow — it can read and write documents,
-not manage the project.
+On this project the answer is `609593941215-compute@developer.gserviceaccount.com`
+— the **default Compute Engine service account**. Check what it already has:
+
+```bash
+gcloud projects get-iam-policy keen-wavelet-275120 \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:609593941215-compute@developer.gserviceaccount.com" \
+  --format="value(bindings.role)"
+```
+
+It already holds `roles/editor`, which **includes Firestore read/write**, so no
+role change is needed here. (If yours comes back empty, grant
+`roles/datastore.user` as originally written.)
+
+**Gate 2 — OAuth access scopes (what the token may request).** This is the one
+that bites. A GCE instance gets a fixed set of scopes at creation, and IAM being
+permissive means nothing if the token cannot carry the scope. The default set is:
+
+```
+devstorage.read_only, logging.write, monitoring.write, pubsub,
+service.management.readonly, servicecontrol, trace.append
+```
+
+**No `datastore`.** So every Firestore call fails with:
+
+```
+reason: "ACCESS_TOKEN_SCOPE_INSUFFICIENT"
+```
+
+Fix it by changing the instance's scopes, which **requires stopping the VM**:
+
+```bash
+gcloud compute instances stop stock-monitor --zone=us-east1-b --quiet
+
+gcloud compute instances set-service-account stock-monitor --zone=us-east1-b \
+  --service-account=609593941215-compute@developer.gserviceaccount.com \
+  --scopes=https://www.googleapis.com/auth/datastore,https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/pubsub,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/trace.append
+
+gcloud compute instances start stock-monitor --zone=us-east1-b --quiet
+```
+
+Notes:
+
+- Add `datastore` to the existing list rather than switching to `cloud-platform`.
+  `cloud-platform` is broader than this job needs.
+- **The external IP changes** on restart (it is ephemeral). Nothing in this
+  project depends on the IP — the panel and these docs reach the VM by name — but
+  note the new one if you had it written down.
+- **SSH will prompt about an unknown host key** after the restart. Accept it, or
+  pass `--strict-host-key-checking=no` to `gcloud compute ssh`.
+- Check the time first: the news cron jobs run `1-5` (Mon–Fri) at 13:15/21:00 UTC
+  in summer. A weekend is a free window.
 
 ### Step 6 — Push the archive to Firestore
 
@@ -183,21 +234,23 @@ the archive loads. Bookmark it on your phone's home screen.
 
 ### Keeping it fed (optional, after the first deploy works)
 
-Once the page loads, add one cron line on the VM so the archive stays current.
-**Keep this separate from the four news cron jobs** — a failure here must never
-affect your digest:
+Add **two** cron lines on the VM so the archive stays current. Keep them separate
+from the four news cron jobs — a failure here must never affect your digest:
 
 ```bash
 crontab -e
-# 15 minutes after the 09:15 and 17:00 ET runs (EDT values):
+# ~15 minutes after the two news runs (EDT/UTC values):
 30 13 * * 1-5 cd /home/Achilles && /usr/bin/python3 news_web.py \
   --sync-firebase --project=keen-wavelet-275120 >> news_web.log 2>&1
 15 21 * * 1-5 cd /home/Achilles && /usr/bin/python3 news_web.py \
   --sync-firebase --project=keen-wavelet-275120 >> news_web.log 2>&1
 ```
 
-Add the winter pair too (`30 14` and `15 22`), exactly as `setup_cloud.sh` does
-for the news jobs — cron fires at fixed UTC times, so both seasons need a line.
+**Two lines, not four.** Unlike `news_updater.py`, the sync has no schedule
+guard, so adding the winter pair as well would make it run four times a day. It
+does not need the guard: firing an hour late in winter is irrelevant for a data
+sync, and a repeat sync is nearly free anyway — the manifest means unchanged rows
+are never rewritten, so a no-op sync writes exactly one small document.
 
 ### If something goes wrong
 
@@ -206,7 +259,8 @@ for the news jobs — cron fires at fixed UTC times, so both seasons need a line
 | "Firebase config missing" on the page | `firebase-config.json` is empty or malformed — rebuild with step 7 |
 | Blank page; console says `auth/unauthorized-domain` | Add the domain: Authentication → Settings → **Authorized domains** |
 | "Missing or insufficient permissions" after signing in | Rules not deployed — `firebase deploy --only firestore:rules` |
-| Sync fails with `403 PERMISSION_DENIED` | Step 5 grant missing, or the wrong service-account email |
+| Sync fails with `403 PERMISSION_DENIED` | Step 5 gate 1: no Firestore role on the service account |
+| **Sync fails with `ACCESS_TOKEN_SCOPE_INSUFFICIENT`** | **Step 5 gate 2: the VM's OAuth scopes lack `datastore`. IAM alone is not enough — the instance must be stopped to change scopes** |
 | Sync fails: cannot reach the metadata server | You ran it off the VM. It must run on the GCP VM |
 | Page shows only "Signed out." | Google provider not enabled (step 3) |
 | `firebase: command not found` | Reopen the terminal after `npm install -g` |
