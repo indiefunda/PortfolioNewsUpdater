@@ -212,12 +212,57 @@ for the news jobs — cron fires at fixed UTC times, so both seasons need a line
 | `firebase: command not found` | Reopen the terminal after `npm install -g` |
 | Firestore asks you to upgrade to Blaze | Hosting, Auth and Firestore all have free tiers and this design stays inside them. If it insists, Blaze with a **$0 budget alert** is safe — but check before adding a card |
 
-## Cost
+## Cost — and why "Blaze" does not mean "you get billed"
 
-Firestore free tier (Spark plan): 50k document reads, 20k writes, 1 GiB/day.
-A full sync is ~1,400 writes and happens twice a day, and the page reads 1 tiny
-meta doc on a repeat visit because it caches the rows in `localStorage`. Comfort-
-ably inside the free tier.
+Adding Firebase to a project that already has billing enabled forces the Blaze
+(pay-as-you-go) plan; Firebase cannot put a billed project on Spark. That sounds
+alarming, so here is the part that matters, quoted from the pricing page:
+
+> **"No-cost usage from Spark plan included"** — Blaze keeps the same no-cost
+> tier as Spark, calculated **daily**.
+
+So Blaze is not "you pay per request". It is "you have the free tier, and only
+usage *above* it is billed". The no-cost tier, per project per day:
+
+| Service | No-cost allowance | What this project uses |
+|---|---|---|
+| Firestore document writes | 20,000 / day | ~1,400 on a cold sync, ~1 per sync after (the manifest skips unchanged rows) |
+| Firestore document reads | 50,000 / day | 1 per visit (cached), ~1,400 on a cold load |
+| Firestore document deletes | 20,000 / day | 0 normally |
+| Firestore stored data | 1 GiB | ~1.4 MB — about 0.14% |
+| Hosting data transfer | 360 MB / day | ~15 KB per page load |
+| Hosting storage | 10 GB | under 100 KB |
+| Authentication (Google sign-in) | 50K monthly active users | 1 |
+
+Two things make the write figure small: the sync keeps a manifest, so it only
+writes rows whose content actually changed, and a no-op sync writes just the one
+tiny `meta` document. You would need more than a dozen *full* re-syncs in a day
+to exhaust the write allowance.
+
+The Firebase JavaScript SDK is served from Google's CDN (`gstatic.com`), not from
+your Hosting bucket, so it does not count against the 360 MB/day transfer.
+
+### Confirming it yourself
+
+- **Firestore → Usage** in the Firebase console shows today's reads/writes/deletes
+  against the limits, in real time.
+- **GCP console → Billing → Reports**, filtered to Firestore/Hosting, shows the
+  actual charge — expected to be zero.
+- **Billing → Budgets & alerts**: set a small budget. Be aware this *alerts*; a
+  Google Cloud budget is not a hard spending cap.
+
+### If you would rather not have a payment method involved at all
+
+Two alternatives, both covered earlier in this repo's discussion:
+
+1. **A separate Firebase project with no billing** (true Spark). Free, no card —
+   but the VM's service account belongs to this project, so the VM would need a
+   service-account key file for the new one. That is a long-lived credential on
+   the server, which is exactly what the same-project approach avoids.
+2. **Skip Firebase entirely and use Tailscale** — a private network between the
+   VM and your phone. No cloud database, no card, no Firebase account: Tailscale
+   *is* the authentication. You lose the shareable public link and must install
+   Tailscale on each device. `news_web.py` would need a small `--serve` mode.
 
 ## What was verified, and what was not
 

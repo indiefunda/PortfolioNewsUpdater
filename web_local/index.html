@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Portfolio news</title>
+
+<style>
+  :root{
+    --bg:#0b0d12; --card:#12151c; --border:#232733; --text:#e6e9ef;
+    --muted:#8b93a7; --accent:#4f8cff; --ok:#a7f3d0; --okbg:#14532d;
+    --err:#fecaca; --errbg:#7c2d12; --warn:#fde68a; --warnbg:#78350f;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+    font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-text-size-adjust:100%}
+  a{color:var(--accent)}
+  header{position:sticky;top:0;z-index:5;background:rgba(11,13,18,.97);
+    border-bottom:1px solid var(--border);padding:10px 12px calc(10px + env(safe-area-inset-bottom,0))}
+  h1{margin:0 0 2px;font-size:16px;font-weight:600}
+  .sub{color:var(--muted);font-size:12px}
+  .filters{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}
+  .filters .wide{grid-column:1 / -1}
+  input,select{width:100%;background:var(--card);color:var(--text);
+    border:1px solid var(--border);border-radius:8px;padding:8px;font-size:14px}
+  input[type=search]{-webkit-appearance:none}
+  main{padding:8px 12px 40px}
+  .row{background:var(--card);border:1px solid var(--border);border-radius:10px;
+    padding:10px;margin-bottom:8px;cursor:pointer}
+  .row.pushed{border-left:3px solid var(--okbg)}
+  .meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center;
+    font-size:11px;color:var(--muted);margin-bottom:5px}
+  .tk{font-weight:700;color:var(--text);letter-spacing:.3px}
+  .imp{background:#1d2433;border-radius:6px;padding:1px 6px;font-weight:700;color:var(--text)}
+  .imp.hi{background:var(--okbg);color:var(--ok)}
+  .imp.mid{background:var(--warnbg);color:var(--warn)}
+  .chip{border-radius:10px;padding:1px 7px;font-weight:600}
+  .pos{background:var(--okbg);color:var(--ok)}
+  .neg{background:var(--errbg);color:var(--err)}
+  .neu{background:#2a2e38;color:#cbd5e1}
+  .title{font-size:14px;line-height:1.35}
+  .body{display:none;margin-top:8px;border-top:1px solid var(--border);padding-top:8px}
+  .row.open .body{display:block}
+  .sum{color:#c3cad9;font-size:13px;margin:0 0 8px;white-space:pre-wrap}
+  .raw{color:var(--muted);font-size:12px;margin:0 0 8px;white-space:pre-wrap}
+  .links{display:flex;gap:14px;flex-wrap:wrap;font-size:13px}
+  .empty{color:var(--muted);text-align:center;padding:40px 0}
+  .more{display:block;width:100%;margin:10px 0 0;padding:11px;border-radius:9px;
+    background:var(--card);color:var(--text);border:1px solid var(--border);font-size:14px}
+  #signin{max-width:420px;margin:60px auto;padding:20px;text-align:center}
+  #signin button{padding:11px 18px;border-radius:9px;border:1px solid var(--border);
+    background:var(--card);color:var(--text);font-size:15px;cursor:pointer}
+</style>
+</head>
+<body>
+<header>
+  <h1>Portfolio news</h1>
+  <div class="sub" id="stats">Loading…</div>
+  <div class="filters">
+    <input class="wide" type="search" id="q" placeholder="Search title or summary…" autocomplete="off">
+    <select id="ticker"><option value="">All tickers</option></select>
+    <select id="status">
+      <option value="">Pushed + stored</option>
+      <option value="pushed">Pushed only</option>
+      <option value="stored">Stored only</option>
+    </select>
+    <select id="minImp">
+      <option value="0">Any importance</option>
+      <option value="4">4+</option>
+      <option value="6">6+</option>
+      <option value="8">8+</option>
+    </select>
+    <select id="sentiment">
+      <option value="">Any sentiment</option>
+      <option value="positive">positive</option>
+      <option value="negative">negative</option>
+      <option value="neutral">neutral</option>
+    </select>
+    <select class="wide" id="sort">
+      <option value="newest">Newest first</option>
+      <option value="oldest">Oldest first</option>
+      <option value="importance">Most important first</option>
+    </select>
+  </div>
+</header>
+<main>
+  <div id="list"></div>
+  <button class="more" id="more" style="display:none">Show more</button>
+</main>
+<script>
+// ---- data loader -----------------------------------------------------------
+// Two sources, one page. The hosted build sets window.__GL_FIRESTORE__ to a
+// query function; the static export fetches news.json (or uses the copy
+// embedded below). Everything after this block is source-agnostic.
+var EMBEDDED = {"generated_at": "2026-09-19 10:00:58 EDT", "count": 0, "pushed_count": 0, "tickers": [], "items": []};
+
+async function loadData(){
+  if (typeof window.__GL_FIRESTORE__ === 'function') {
+    return await window.__GL_FIRESTORE__();
+  }
+  if (EMBEDDED) { return EMBEDDED; }
+  var r = await fetch('news.json', {cache:'no-store'});
+  return await r.json();
+}
+
+// ---- state -----------------------------------------------------------------
+var ALL = [], VIEW = [], SHOWN = 0, PAGE = 150;
+var F = {q:'', ticker:'', status:'', minImp:0, sentiment:'', sort:'newest'};
+
+function esc(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+
+function fmtDate(s){
+  // "2026-09-11 17:00:58" -> "09-11 17:00" (no timezone maths; already ET)
+  if (!s || s.length < 16) return s || '';
+  return s.slice(5, 10) + ' ' + s.slice(11, 16);
+}
+
+function impClass(n){
+  if (n == null) return '';
+  if (n >= 8) return 'hi';
+  if (n >= 5) return 'mid';
+  return '';
+}
+
+function sentClass(s){
+  s = String(s || '').toLowerCase();
+  if (s === 'positive' || s === 'bullish') return 'pos';
+  if (s === 'negative' || s === 'bearish') return 'neg';
+  return 'neu';
+}
+
+function match(it){
+  if (F.ticker && it.ticker !== F.ticker) return false;
+  if (F.status === 'pushed' && !it.pushed) return false;
+  if (F.status === 'stored' && it.pushed) return false;
+  if (F.sentiment && String(it.sentiment || '').toLowerCase() !== F.sentiment) return false;
+  if (F.minImp > 0 && (it.importance == null || it.importance < F.minImp)) return false;
+  if (F.q){
+    var hay = ((it.title || '') + ' ' + (it.title_raw || '') + ' ' +
+               (it.summary || '')).toLowerCase();
+    if (hay.indexOf(F.q) === -1) return false;
+  }
+  return true;
+}
+
+function applyFilters(){
+  VIEW = ALL.filter(match);
+  if (F.sort === 'oldest') VIEW.reverse();
+  else if (F.sort === 'importance'){
+    VIEW.sort(function(a,b){
+      var d = (b.importance == null ? -1 : b.importance) - (a.importance == null ? -1 : a.importance);
+      return d !== 0 ? d : String(b.first_seen).localeCompare(String(a.first_seen));
+    });
+  }
+  SHOWN = 0;
+  document.getElementById('list').innerHTML = '';
+  renderMore();
+  updateStats();
+}
+
+function updateStats(){
+  var el = document.getElementById('stats');
+  var pushed = VIEW.filter(function(i){ return i.pushed; }).length;
+  el.textContent = VIEW.length + ' of ' + ALL.length + ' items · ' + pushed +
+    ' pushed · updated ' + (META.generated_at || '');
+}
+
+function rowHtml(it){
+  var links = [];
+  if (it.url) links.push('<a href="' + esc(it.url) + '" target="_blank" rel="noopener">Original</a>');
+  if (it.url && it.lang === 'zh')
+    links.push('<a href="https://translate.google.com/translate?sl=auto&amp;tl=en&amp;u=' +
+      encodeURIComponent(it.url) + '" target="_blank" rel="noopener">Translate</a>');
+  var body = [];
+  if (it.summary) body.push('<p class="sum">' + esc(it.summary) + '</p>');
+  if (it.title_raw && it.title_raw !== it.title)
+    body.push('<p class="raw">' + esc(it.title_raw) + '</p>');
+  if (it.reason) body.push('<p class="raw">Why: ' + esc(it.reason) + '</p>');
+  if (links.length) body.push('<div class="links">' + links.join('') + '</div>');
+
+  return '<div class="row' + (it.pushed ? ' pushed' : '') + '" data-i="' + it.id + '">' +
+    '<div class="meta">' +
+      '<span class="tk">' + esc(it.ticker) + '</span>' +
+      (it.importance != null ? '<span class="imp ' + impClass(it.importance) + '">' + esc(it.importance) + '</span>' : '') +
+      (it.sentiment ? '<span class="chip ' + sentClass(it.sentiment) + '">' + esc(it.sentiment) + '</span>' : '') +
+      '<span>' + esc(fmtDate(it.first_seen)) + '</span>' +
+      '<span>' + esc(it.source) + '</span>' +
+      (it.pushed ? '<span class="chip pos">pushed</span>' : '') +
+    '</div>' +
+    '<div class="title">' + esc(it.title) + '</div>' +
+    (body.length ? '<div class="body">' + body.join('') + '</div>' : '') +
+  '</div>';
+}
+
+function renderMore(){
+  var slice = VIEW.slice(SHOWN, SHOWN + PAGE);
+  if (!slice.length){
+    if (SHOWN === 0)
+      document.getElementById('list').innerHTML = '<div class="empty">Nothing matches these filters.</div>';
+    document.getElementById('more').style.display = 'none';
+    return;
+  }
+  document.getElementById('list').insertAdjacentHTML('beforeend', slice.map(rowHtml).join(''));
+  SHOWN += slice.length;
+  document.getElementById('more').style.display = SHOWN < VIEW.length ? 'block' : 'none';
+  document.getElementById('more').textContent = 'Show more (' + (VIEW.length - SHOWN) + ' left)';
+}
+
+function saveFilters(){
+  try { localStorage.setItem('gl_filters', JSON.stringify(F)); } catch(e){}
+}
+
+function loadFilters(){
+  try {
+    var raw = localStorage.getItem('gl_filters');
+    if (!raw) return;
+    var s = JSON.parse(raw);
+    Object.keys(F).forEach(function(k){ if (s[k] !== undefined) F[k] = s[k]; });
+  } catch(e){}
+}
+
+var META = {generated_at:''};
+var WIRED = false;
+
+// Single entry point for data, whichever source it came from. The hosted build
+// sets window.__GL_HOSTED__ and calls this from its auth module once the user
+// is signed in; the static build calls it from boot() below.
+window.__glSetData = function(data){
+  ALL = (data && data.items) || [];
+  META.generated_at = (data && data.generated_at) || '';
+
+  var sel = document.getElementById('ticker');
+  var have = {};
+  Array.prototype.forEach.call(sel.options, function(o){ have[o.value] = 1; });
+  var tickers = (data && data.tickers) || [];
+  if (!tickers.length){
+    tickers = ALL.map(function(i){ return i.ticker; })
+      .filter(function(t, idx, arr){ return t && arr.indexOf(t) === idx; })
+      .sort();
+  }
+  tickers.forEach(function(t){
+    if (have[t]) return;
+    var o = document.createElement('option');
+    o.value = t; o.textContent = t; sel.appendChild(o);
+  });
+
+  if (!WIRED){ loadFilters(); wire(); WIRED = true; }
+  applyFilters();
+};
+
+function wire(){
+  var ids = ['q','ticker','status','minImp','sentiment','sort'];
+  ids.forEach(function(id){
+    var el = document.getElementById(id);
+    el.value = F[id];
+    var ev = (id === 'q') ? 'input' : 'change';
+    el.addEventListener(ev, function(){
+      F[id] = (id === 'minImp') ? parseInt(el.value,10) || 0 : el.value;
+      saveFilters();
+      clearTimeout(window.__t);
+      window.__t = setTimeout(applyFilters, id === 'q' ? 120 : 0);
+    });
+  });
+  document.getElementById('more').addEventListener('click', renderMore);
+  document.getElementById('list').addEventListener('click', function(ev){
+    var row = ev.target.closest('.row');
+    if (row && !ev.target.closest('a')) row.classList.toggle('open');
+  });
+}
+
+async function boot(){
+  // The hosted build loads data through its own auth module instead.
+  if (window.__GL_HOSTED__) return;
+  var data;
+  try {
+    data = await loadData();
+  } catch(e){
+    document.getElementById('stats').textContent = 'Could not load data: ' + e.message;
+    return;
+  }
+  window.__glSetData(data);
+}
+
+boot();
+</script>
+</body>
+</html>
