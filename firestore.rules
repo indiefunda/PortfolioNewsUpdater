@@ -1,0 +1,31 @@
+rules_version = '2';
+
+// Firestore rules for the hosted news page.
+//
+// The whole reason the data lives in Firestore instead of a public news.json is
+// so that this rule can exist: an auth-gated page over an unprotected file
+// hides only the UI, and anyone with the URL could still fetch the archive.
+//
+// Clients may READ the news and the meta doc once signed in, and may never
+// write. The VM does not go through these rules at all - it writes with an IAM
+// service-account token, which bypasses security rules by design.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /news/{itemId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
+    match /meta/{docId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+
+    // Nothing else is reachable, including any collection added later by
+    // mistake. Default-deny rather than relying on remembering to add a rule.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

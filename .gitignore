@@ -82,3 +82,13 @@ Thumbs.db
 
 # Generated zip packages
 *.zip
+
+# Hosted news page: build output and local sync state (both regenerated)
+web_public/
+web_sync_manifest.json
+.firebase/
+firebase-debug.log
+
+# Firebase web config. Not a secret (it ships inside the page by design) but it
+# is per-project, so it should not be baked into the repository.
+firebase-config.json
