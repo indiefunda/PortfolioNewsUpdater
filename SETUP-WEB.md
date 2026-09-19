@@ -29,99 +29,188 @@ importance + sentiment + pushed filters, full-text search, "show more"
 pagination, empty state on no match, and rows that expand to show the summary,
 the **Chinese original title**, and *Original* / *Translate* links.
 
-## Setup
+## Step-by-step (written for someone who has never opened Firebase)
 
-### 1. Use your EXISTING Google Cloud project
+Firebase is Google's app platform that bolts onto a Google Cloud project. You
+use three parts of it, all with free tiers:
 
-Add Firebase to the same project that runs the VM (`keen-wavelet-275120`). This
-matters: it means the VM's own service account can write to Firestore, so you
-never create a key file.
+| Piece | What it does here |
+|---|---|
+| **Hosting** | serves `index.html` at `https://<project>.web.app` |
+| **Authentication** | the "Sign in with Google" button |
+| **Firestore** | the database the page reads your news from |
 
-Firebase console → **Add project** → choose the existing project.
+> Console labels drift over time. If a button is named slightly differently,
+> look for the same idea — the *order* and the *decisions* below are what matter.
 
-### 2. Create Firestore
+### Step 0 — Try the page first, without Firebase (2 minutes)
 
-Firestore → **Create database** → **Native mode** → pick a region near you.
-(Not "Datastore mode".)
+Do this before investing any time. It proves the page is what you want:
 
-### 3. Turn on Google sign-in
+```bash
+python news_web.py --out=web_local --embed
+start web_local\index.html          # Windows; or just double-click the file
+```
 
-Authentication → **Get started** → Sign-in method → **Google** → Enable.
-Under **Settings → Authorized domains**, `localhost` and your
-`*.web.app` domain are added automatically.
+You get the full view — filters, search, expandable rows. No account, no cloud.
 
-### 4. Register a web app and copy its config
+### Step 1 — Add Firebase to your EXISTING Google Cloud project
 
-Project settings → **Your apps** → **Web** (`</>`) → register → copy the config
-object into a file, e.g. `firebase-config.json`:
+Go to <https://console.firebase.google.com/> and click **Create a project**.
+
+The first field is the project name and it has a **dropdown**. Open it and
+**select `keen-wavelet-275120`** — do not type a new name.
+
+This is the whole reason the setup is simple: Firebase attaches to the project
+your VM already lives in, so the VM's own service account can write to Firestore
+and **no key file ever exists on the server**. Create a separate project and
+you'd have to download and guard a credentials file instead.
+
+Next: Google Analytics → **turn it off** (not needed). Then **Create project**.
+
+**Check it worked:** the project picker in the top bar says
+`keen-wavelet-275120`.
+
+### Step 2 — Create the Firestore database
+
+Left sidebar → **Build** → **Firestore Database** → **Create database**.
+
+- **Location:** choose **`us-east1`** (same region as your VM).
+  ⚠️ **This is permanent.** It cannot be changed later without deleting the
+  database.
+- **Security rules:** choose **Production mode**. Do *not* choose "test mode" —
+  test mode leaves the database open to anyone for 30 days.
+
+**Check it worked:** the Firestore page shows an empty **Data** tab.
+
+### Step 3 — Turn on Google sign-in
+
+Left sidebar → **Build** → **Authentication** → **Get started**.
+
+Go to the **Sign-in method** tab → click **Google** → toggle **Enable** → pick a
+support email → **Save**.
+
+**Check it worked:** Google shows as *Enabled* in the list.
+
+### Step 4 — Register a web app and copy its config
+
+1. Gear icon (top-left) → **Project settings** → **General** tab.
+2. Scroll to **Your apps** → click the **`</>`** (Web) button.
+3. Nickname: `news-reader`. **Leave "Also set up Firebase Hosting" UNCHECKED** —
+   we deploy from a config file instead, and ticking it creates a setup we don't
+   want.
+4. **Register app**.
+5. It shows a block of code beginning `const firebaseConfig = {`. Copy **just
+   the `{ ... }` object** into a new file `firebase-config.json` in this folder:
 
 ```json
 {
   "apiKey": "AIza...",
-  "authDomain": "your-project.firebaseapp.com",
-  "projectId": "your-project",
-  "appId": "1:123:web:abc",
-  "storageBucket": "your-project.appspot.com",
-  "messagingSenderId": "123"
+  "authDomain": "keen-wavelet-275120.firebaseapp.com",
+  "projectId": "keen-wavelet-275120",
+  "appId": "1:1234567890:web:abcdef"
 }
 ```
 
-These values are **public by design** — they ship in the page. Access is
-controlled by the Firestore rules, not by hiding the config.
+The other keys it shows (`storageBucket`, `messagingSenderId`) are harmless —
+include them or not.
 
-### 5. Let the VM write to Firestore
+This config is **public by design**; it ships inside the page. Access is
+controlled by the Firestore rules, not by hiding these values.
+
+⚠️ Do **not** paste a **service-account** key here. That is a different file with
+`"type": "service_account"` and a `private_key`, and putting it in a web page
+would leak write access to your database. The build now refuses it.
+
+### Step 5 — Let the VM write to Firestore
 
 ```bash
-# The VM's service account email:
+# 1. Find the VM's service account email:
 gcloud compute instances describe stock-monitor --zone=us-east1-b \
-  --format='value(serviceAccounts[0].email)'
+  --format="value(serviceAccounts[0].email)"
 
-# Grant it Firestore write access:
+# 2. Grant it Firestore access (replace EMAIL with what step 1 printed):
 gcloud projects add-iam-policy-binding keen-wavelet-275120 \
-  --member="serviceAccount:THE_EMAIL_FROM_ABOVE" \
-  --role="roles/datastore.user"
+  --member="serviceAccount:EMAIL" --role="roles/datastore.user"
 ```
 
-### 6. Deploy the rules and the page
+`roles/datastore.user` is deliberately narrow — it can read and write documents,
+not manage the project.
+
+### Step 6 — Push the archive to Firestore
+
+Run this **on the VM** (it reads the VM's own metadata server for credentials):
 
 ```bash
-npm install -g firebase-tools
-firebase login
-firebase use keen-wavelet-275120
-
-# Build the hosted page (no news.json — the data lives in Firestore):
-python3 news_web.py --out=web_public --hosted --firebase-config=firebase-config.json
-
-firebase deploy --only firestore:rules,hosting
-```
-
-`firebase deploy` prints your URL, something like
-`https://your-project.web.app`. Open it, sign in with Google, and the archive
-loads.
-
-### 7. Keep it fed from the VM
-
-```bash
-# On the VM: push the archive to Firestore, then check it worked
 python3 news_web.py --sync-firebase --project=keen-wavelet-275120 --dry-run
+```
+
+Expect a line like `1396 row(s): 1396 to write, 0 to delete, 0 unchanged`. The
+dry run needs no credentials and writes nothing. Then do it for real:
+
+```bash
 python3 news_web.py --sync-firebase --project=keen-wavelet-275120
 ```
 
-Add one cron line so it runs shortly after each news run. **Keep this separate
-from the four news cron jobs** — a failure here must not affect your digest:
+**Check it worked:** Firestore → **Data** shows a `news` collection with ~1,400
+documents and a `meta` collection with one `status` document.
+
+### Step 7 — Install the Firebase CLI and deploy
+
+On your Windows machine:
+
+```bash
+npm install -g firebase-tools
+firebase login          # opens a browser; use the same Google account
+firebase --version      # sanity check
+```
+
+Then, in this project folder:
+
+```bash
+python news_web.py --out=web_public --hosted --firebase-config=firebase-config.json
+firebase deploy --only firestore:rules,hosting
+```
+
+`.firebaserc` is already committed, so `firebase deploy` knows which project to
+use — no `firebase init` and no `firebase use` needed. The command prints your
+Hosting URL when it finishes.
+
+### Step 8 — Open it
+
+Go to `https://keen-wavelet-275120.web.app`, click **Sign in with Google**, and
+the archive loads. Bookmark it on your phone's home screen.
+
+### Keeping it fed (optional, after the first deploy works)
+
+Once the page loads, add one cron line on the VM so the archive stays current.
+**Keep this separate from the four news cron jobs** — a failure here must never
+affect your digest:
 
 ```bash
 crontab -e
-# 15 minutes after the 09:15 and 17:00 ET runs (EDT values shown):
+# 15 minutes after the 09:15 and 17:00 ET runs (EDT values):
 30 13 * * 1-5 cd /home/Achilles && /usr/bin/python3 news_web.py \
   --sync-firebase --project=keen-wavelet-275120 >> news_web.log 2>&1
 15 21 * * 1-5 cd /home/Achilles && /usr/bin/python3 news_web.py \
   --sync-firebase --project=keen-wavelet-275120 >> news_web.log 2>&1
 ```
 
-(These are the same DST-aware summer/winter pairs the installer uses — see
-`setup_cloud.sh`. Add the winter pair too, `30 14` and `15 22`, exactly as it
-does for the news jobs.)
+Add the winter pair too (`30 14` and `15 22`), exactly as `setup_cloud.sh` does
+for the news jobs — cron fires at fixed UTC times, so both seasons need a line.
+
+### If something goes wrong
+
+| Symptom | Cause and fix |
+|---|---|
+| "Firebase config missing" on the page | `firebase-config.json` is empty or malformed — rebuild with step 7 |
+| Blank page; console says `auth/unauthorized-domain` | Add the domain: Authentication → Settings → **Authorized domains** |
+| "Missing or insufficient permissions" after signing in | Rules not deployed — `firebase deploy --only firestore:rules` |
+| Sync fails with `403 PERMISSION_DENIED` | Step 5 grant missing, or the wrong service-account email |
+| Sync fails: cannot reach the metadata server | You ran it off the VM. It must run on the GCP VM |
+| Page shows only "Signed out." | Google provider not enabled (step 3) |
+| `firebase: command not found` | Reopen the terminal after `npm install -g` |
+| Firestore asks you to upgrade to Blaze | Hosting, Auth and Firestore all have free tiers and this design stays inside them. If it insists, Blaze with a **$0 budget alert** is safe — but check before adding a card |
 
 ## Cost
 

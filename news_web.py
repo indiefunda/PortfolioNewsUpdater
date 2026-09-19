@@ -406,6 +406,30 @@ HOSTED_HEAD = """<script>
 </script>
 <script type="module" src="firebase-boot.js"></script>"""
 
+# The keys the Firebase SDK cannot start without. Checked up front because a
+# wrong paste (the admin SDK's service-account JSON, or a config missing appId)
+# otherwise produces a blank page with no useful error in the browser.
+FIREBASE_REQUIRED = ("apiKey", "authDomain", "projectId", "appId")
+
+
+def validate_firebase_config(cfg):
+    """Raise a readable error rather than shipping a page that cannot boot."""
+    if not isinstance(cfg, dict):
+        raise SystemExit("firebase config must be a JSON object")
+    if "type" in cfg and "private_key" in cfg:
+        raise SystemExit(
+            "that looks like a SERVICE ACCOUNT key, not a web app config.\n"
+            "  Download it from: Project settings -> Your apps -> Web app -> "
+            "SDK setup and configuration -> Config.\n"
+            "  A service-account key must never be placed in a web page.")
+    missing = [k for k in FIREBASE_REQUIRED if not cfg.get(k)]
+    if missing:
+        raise SystemExit(
+            f"firebase config is missing {', '.join(missing)}.\n"
+            "  Copy the whole `firebaseConfig` object from Project settings -> "
+            "Your apps -> Web.")
+    return cfg
+
 
 def export(db_path, out_dir, embed=False, hosted=False, firebase_config=None):
     """Write the site. Returns (path, count).
@@ -426,7 +450,7 @@ def export(db_path, out_dir, embed=False, hosted=False, firebase_config=None):
                              "Firebase console gives you for a web app)")
         head = HOSTED_HEAD.replace(
             "__FIREBASE_CONFIG__",
-            json.dumps(firebase_config, ensure_ascii=False))
+            json.dumps(validate_firebase_config(firebase_config), ensure_ascii=False))
         src = os.path.join(BASE_DIR, "web", "firebase-boot.js")
         with open(src, encoding="utf-8") as fh:
             boot = fh.read()
