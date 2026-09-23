@@ -75,6 +75,9 @@ _audit/*.log
 !_audit/verify_docs.py
 !_audit/schedule_sim.py
 !_audit/test_*.py
+!_audit/verify_deployed_site.py
+!_audit/diagnose_hosted_page.py
+!_audit/cdp_probe.js
 
 # OS
 Thumbs.db

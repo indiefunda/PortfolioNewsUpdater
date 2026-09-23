@@ -318,35 +318,52 @@ Two alternatives, both covered earlier in this repo's discussion:
    *is* the authentication. You lose the shareable public link and must install
    Tailscale on each device. `news_web.py` would need a small `--serve` mode.
 
-## What was verified, and what was not
+## Status: deployed and live
 
-**Verified offline:**
-- the static export, filters, search, pagination and row expansion, in a real
-  headless browser against the real 1,396-row archive
-- the pinned Firebase CDN version resolves and exports every symbol the
-  bootstrap imports (`_audit/test_hosted_build.py`)
-- the hosted build contains no `news.json`, sets `__GL_HOSTED__` before the page
-  script runs, and refuses to build without a config
-- the sync's `--dry-run` can be run with no credentials and changes nothing
+`https://keen-wavelet-275120.web.app` is up. What is actually confirmed:
 
-**Not verified — needs your project:** the Firestore reads and writes, and the
-Google sign-in round trip. Those cannot be tested without a real Firebase
-project. Once you have completed steps 1–6, run:
+**Verified — the live site:**
+- `index.html` and `firebase-boot.js` both serve 200 with correct content types
+- the page carries the config, sets `__GL_HOSTED__`, and embeds **no** data
+  (12 KB — the whole archive lives in Firestore)
+- the three security headers from `firebase.json` are present
+- **anonymous access is refused: `403` on both `news` and `meta`** — the rules
+  really are doing the work, not just hiding the UI
+- **the sign-in gate renders**: after a real 15-second wait the page reports
+  `signinGate: true`, `signInButton: true`, `stats: "Signed out."` and a visible
+  "Sign in with Google" button
 
-```bash
-python3 news_web.py --sync-firebase --project=YOUR_PROJECT --dry-run   # expect N to write
-python3 news_web.py --sync-firebase --project=YOUR_PROJECT             # then the real sync
-```
+**Verified — the data path:**
+- the sync committed **850 rows + 1 meta document** (851 operations, in two
+  batches of the 500 the API allows)
+- read back over REST: `meta/status` says `count 850, pushed 86`, and an
+  aggregate count confirms **850 documents** in `news`
+- a repeat sync is a **no-op**: `0 to write, 0 to delete, 850 unchanged`, one
+  operation committed
+- the sync is on cron, twice daily, alongside the untouched news jobs
 
-and tell me what the page does — I'll fix whatever it needs.
+**Still not verified:** the Google sign-in round trip and the authenticated read,
+because they need a human to complete an OAuth consent screen. Everything up to
+that boundary is confirmed.
+
+### A trap worth recording
+
+Do **not** test this page with Chrome's `--virtual-time-budget`. Firebase Auth
+resolves its initial state via IndexedDB and timers, and virtual time breaks
+that: `onAuthStateChanged` never fires and the page appears permanently stuck on
+"Loading…" with no error. That is a **false negative** — I chased it for a while
+before switching to `_audit/cdp_probe.js`, which drives a real clock over the
+DevTools protocol. Use that instead.
 
 ## Security notes
 
 - The rules are **default-deny**: `news` and `meta` are readable when signed in,
   nothing else is reachable, and no client can ever write.
 - The VM writes with an IAM service-account token, which bypasses rules by
-  design. Protect that by keeping the VM's service account scoped — `roles/
-  datastore.user`, not Editor.
+  design. Note that this project's VM service account holds the GCP default
+  `roles/editor`, which is broader than this job needs — narrowing it to
+  `roles/datastore.user` would be a genuine hardening step, but check nothing
+  else on the VM relies on `editor` first.
 - The page is read-only. There is no delete, no "run now", no config upload —
   those stay in the local panel where they belong.
 - If you later want the phone to *act* (mark read, delete), that needs new
