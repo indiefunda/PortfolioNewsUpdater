@@ -34,7 +34,8 @@ if (!cfg || !cfg.apiKey) {
 
   // Loaded lazily so a page that only ever shows the sign-in gate does not pay
   // for the auth + firestore bundles.
-  const [{ getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged },
+  const [{ getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect,
+           getRedirectResult, signOut, onAuthStateChanged },
          { getFirestore, collection, getDocs, doc, getDoc }] = await Promise.all([
     import(`${CDN}/firebase-auth.js`),
     import(`${CDN}/firebase-firestore.js`),
@@ -43,6 +44,75 @@ if (!cfg || !cfg.apiKey) {
   const auth = getAuth(app);
   const db = getFirestore(app);
   const CACHE_KEY = 'gl_cache_v1';
+
+  // Complete a sign-in that came back via redirect. Must run on every load:
+  // the redirect flow leaves the result here, not in the promise that started it.
+  getRedirectResult(auth).catch((e) => {
+    // 'auth/no-auth-event' is normal when simply loading the page.
+    if (e && e.code && e.code !== 'auth/no-auth-event') {
+      say('Sign-in failed: ' + (e.code || e.message));
+      const hint = document.getElementById('gl-hint');
+      if (hint) hint.textContent = describeAuthError(e);
+    }
+  });
+
+  /**
+   * Sign in, preferring the popup but falling back to a full-page redirect.
+   *
+   * The popup flow needs the popup and this page to share storage so the result
+   * can be handed back. Browsers that partition storage or block third-party
+   * cookies (Edge/Chrome with strict tracking prevention, Brave, Safari) break
+   * that handshake: the login SUCCEEDS inside the popup, the result never
+   * reaches this page, and Firebase surfaces it as
+   * `auth/popup-closed-by-user` - which reads like the user closed the window,
+   * so it looks like a browser bug rather than a storage-policy one.
+   *
+   * The redirect flow has no such dependency, so it is the fallback.
+   */
+  function wireSignIn(auth, GoogleAuthProvider, signInWithPopup, signInWithRedirect) {
+    const btn = document.getElementById('gl-signin');
+    const hint = document.getElementById('gl-hint');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      const provider = new GoogleAuthProvider();
+      provider.setCustomParameters({ prompt: 'select_account' });
+      try {
+        await signInWithPopup(auth, provider);
+        // onAuthStateChanged takes it from here.
+      } catch (e) {
+        if (hint) hint.textContent = describeAuthError(e);
+        say('Popup sign-in failed (' + (e.code || 'error') + ') - trying redirect...');
+        try {
+          await signInWithRedirect(auth, provider);
+        } catch (e2) {
+          btn.disabled = false;
+          say('Sign-in failed: ' + (e2.code || e2.message));
+          if (hint) hint.textContent = describeAuthError(e2);
+        }
+      }
+    });
+  }
+
+  /** Turn an auth error code into something worth reading. */
+  function describeAuthError(e) {
+    const code = (e && e.code) || '';
+    if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+      return 'The popup could not hand the result back to this page, which usually '
+        + 'means your browser is blocking third-party cookies or partitioning '
+        + 'storage for this site. The redirect sign-in above avoids that. If it '
+        + 'still fails, allow cookies for keen-wavelet-275120.web.app and '
+        + 'keen-wavelet-275120.firebaseapp.com and try again.';
+    }
+    if (code === 'auth/unauthorized-domain') {
+      return 'This domain is not in the Firebase authorised-domains list. Add it '
+        + 'under Authentication then Settings then Authorized domains.';
+    }
+    if (code === 'auth/network-request-failed') {
+      return 'A network request failed - check the connection and try again.';
+    }
+    return '';
+  }
 
   function readCache() {
     try { return JSON.parse(localStorage.getItem(CACHE_KEY) || 'null'); }
@@ -94,15 +164,11 @@ if (!cfg || !cfg.apiKey) {
     if (!user) {
       gate(
         '<p>Sign in to read the archive.</p>' +
-        '<button id="gl-signin">Sign in with Google</button>'
+        '<button id="gl-signin">Sign in with Google</button>' +
+        '<p id="gl-hint" style="font-size:12px;color:#8b93a7;margin-top:14px"></p>'
       );
       say('Signed out.');
-      const btn = document.getElementById('gl-signin');
-      if (btn) btn.addEventListener('click', () => {
-        signInWithPopup(auth, new GoogleAuthProvider()).catch((e) => {
-          say('Sign-in failed: ' + e.message);
-        });
-      });
+      wireSignIn(auth, GoogleAuthProvider, signInWithPopup, signInWithRedirect);
       return;
     }
 

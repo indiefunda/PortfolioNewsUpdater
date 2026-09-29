@@ -39,6 +39,11 @@ print("=" * 74)
 ver = re.search(r'FIREBASE_VERSION\s*=\s*"([^"]+)"', boot_src).group(1)
 print(f"  pinned Firebase version: {ver}")
 
+# Syntax check the bootstrap itself, as a module.
+syntax = subprocess.run(["node", "--check", BOOT], capture_output=True, text=True)
+check("firebase-boot.js parses", syntax.returncode == 0,
+      (syntax.stderr or "").strip()[:160])
+
 # A static import specifier must be a string literal; a template literal there
 # is a SyntaxError that only shows up in a browser.
 static_imports = re.findall(r'^import\s+.*?from\s+(.+?);', boot_src, re.M)
@@ -56,7 +61,10 @@ try {{
   const app = await import(`${{CDN}}/firebase-app.js`);
   out.push('firebase-app: ' + (typeof app.initializeApp === 'function' ? 'OK' : 'MISSING initializeApp'));
   const auth = await import(`${{CDN}}/firebase-auth.js`);
-  const need = ['getAuth','GoogleAuthProvider','signInWithPopup','signOut','onAuthStateChanged'];
+  // signInWithRedirect / getRedirectResult are the fallback for browsers where
+  // the popup handshake cannot complete (storage partitioning, third-party
+  // cookies blocked) - which shows up as "popup-closed-by-user".
+  const need = ['getAuth','GoogleAuthProvider','signInWithPopup','signInWithRedirect','getRedirectResult','signOut','onAuthStateChanged'];
   out.push('firebase-auth: ' + need.filter(n => typeof auth[n] === 'function').length + '/' + need.length + ' exports');
   const fs = await import(`${{CDN}}/firebase-firestore.js`);
   const need2 = ['getFirestore','collection','getDocs','doc','getDoc'];
@@ -79,7 +87,8 @@ body = (m.group(1) if m else "").strip()
 print("  " + body.replace("\n", "\n  "))
 
 check("firebase-app.js resolved", "firebase-app: OK" in body)
-check("firebase-auth.js exports all 5 used symbols", "firebase-auth: 5/5" in body)
+check("firebase-auth.js exports all 7 used symbols", "firebase-auth: 7/7" in body,
+      [l for l in body.splitlines() if "firebase-auth" in l][:1])
 check("firebase-firestore.js exports all 5 used symbols",
       "firebase-firestore: 5/5" in body)
 
