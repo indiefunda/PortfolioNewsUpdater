@@ -263,8 +263,39 @@ are never rewritten, so a no-op sync writes exactly one small document.
 | **Sync fails with `ACCESS_TOKEN_SCOPE_INSUFFICIENT`** | **Step 5 gate 2: the VM's OAuth scopes lack `datastore`. IAM alone is not enough — the instance must be stopped to change scopes** |
 | Sync fails: cannot reach the metadata server | You ran it off the VM. It must run on the GCP VM |
 | Page shows only "Signed out." | Google provider not enabled (step 3) |
+| **Sign-in fails with `auth/popup-closed-by-user` even though Google login worked** | **See "When the popup sign-in fails" below. The code is misleading — it does not mean the window was closed** |
 | `firebase: command not found` | Reopen the terminal after `npm install -g` |
 | Firestore asks you to upgrade to Blaze | Hosting, Auth and Firestore all have free tiers and this design stays inside them. If it insists, Blaze with a **$0 budget alert** is safe — but check before adding a card |
+
+### When the popup sign-in fails (`auth/popup-closed-by-user`)
+
+Reported in practice: login succeeded, then "sign in failed — Error auth popup
+closed by user", and switching browser made it work. That is the expected shape
+of this problem.
+
+The popup flow needs the popup and the opener page to **share storage** so the
+result can be handed back. Browsers that partition storage or block third-party
+cookies — Edge and Chrome with strict tracking prevention, Brave, Safari —
+break that handshake. Google authenticates you correctly inside the popup; the
+credential simply never reaches the page. The SDK sees no result, assumes the
+window was closed, and reports `popup-closed-by-user`.
+
+The page therefore **falls back to `signInWithRedirect`** automatically, which
+has no opener/popup dependency: during the redirect the auth domain *is* the
+top-level site, so its storage is not partitioned. You briefly leave the page
+and come back signed in.
+
+If it still fails after that:
+
+1. Allow cookies for **both** `PROJECT.web.app` **and**
+   `PROJECT.firebaseapp.com`. The second is easy to miss and is where the auth
+   round trip actually happens.
+2. Or use a browser without strict tracking prevention for this site.
+
+> **Note for the digest link.** It opens in whatever your **default** browser is,
+> so a browser that blocks third-party storage is the one that matters. If the
+> redirect fallback does not rescue it, either relax that browser for these two
+> domains or make the digest link open somewhere else.
 
 ## Cost — and why "Blaze" does not mean "you get billed"
 
