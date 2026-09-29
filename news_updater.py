@@ -4078,11 +4078,11 @@ def format_global_markets(items):
         return None
     lines = ["🌍 GLOBAL MARKETS — systemic US/global items", ""]
     for it in items:
-        title = it.get("title_en") or it.get("title", "")
+        title = _tg_esc(it.get("title_en") or it.get("title", ""))
         pub = (it.get("published_at") or _normalize_pub(it.get("date", "")) or "")
-        lines.append(f"• {title}" + (f" 📅{pub[:10]}" if pub else ""))
+        lines.append(f"• {title}" + (f" 📅{_tg_esc(pub[:10])}" if pub else ""))
         if it.get("impact"):
-            lines.append(f"    → {it['impact']}")
+            lines.append(f"    → {_tg_esc(it['impact'])}")
         append_source_lines(lines, it)
         lines.append("")
     return "\n".join(lines)
@@ -4098,14 +4098,14 @@ def format_sector_watch(items):
         return None
     lines = ["🏭 SECTOR CONTEXT — industry news, not company-specific", ""]
     for it in items:
-        title = it.get("title_en") or it.get("title", "")
-        ticker = it.get("ticker", "")
+        title = _tg_esc(it.get("title_en") or it.get("title", ""))
+        ticker = _tg_esc(it.get("ticker", ""))
         pub = (it.get("published_at") or _normalize_pub(it.get("date", "")) or "")
-        lines.append(f"• [{ticker}] {title}" + (f" 📅{pub[:10]}" if pub else ""))
+        lines.append(f"• [{ticker}] {title}" + (f" 📅{_tg_esc(pub[:10])}" if pub else ""))
         if it.get("summary"):
-            lines.append(f"    {it['summary']}")
+            lines.append(f"    {_tg_esc(it['summary'])}")
         if it.get("impact"):
-            lines.append(f"    → {it['impact']}")
+            lines.append(f"    → {_tg_esc(it['impact'])}")
         append_source_lines(lines, it)
         lines.append("")
     return "\n".join(lines)
@@ -4744,13 +4744,13 @@ def format_macro(items):
         return None
     lines = ["📢 CHINA MACRO — big policy/market news", ""]
     for it in items:
-        title = it.get("title_en") or it.get("title", "")
-        tag = macro_tag(f"{it.get('title', '')} {it.get('snippet', '')}")
+        title = _tg_esc(it.get("title_en") or it.get("title", ""))
+        tag = _tg_esc(macro_tag(f"{it.get('title', '')} {it.get('snippet', '')}"))
         pub = (it.get("published_at")
                or _normalize_pub(it.get("date", "")) or "")
-        lines.append(f"• [{tag}] {title}" + (f" 📅{pub[:10]}" if pub else ""))
+        lines.append(f"• [{tag}] {title}" + (f" 📅{_tg_esc(pub[:10])}" if pub else ""))
         if it.get("impact"):
-            lines.append(f"    → {it['impact']}")
+            lines.append(f"    → {_tg_esc(it['impact'])}")
         append_source_lines(lines, it)
         lines.append("")
     return "\n".join(lines)
@@ -4821,14 +4821,14 @@ def build_snapshot(conn, hours=24, limit=10):
         return None
     lines = ["📊 Manual snapshot — most important items (last 24h)", ""]
     for ticker, title, importance, category, impact, url, lang, raw in rows:
-        header = f"• [{ticker}] {title}"
+        header = f"• [{_tg_esc(ticker)}] {_tg_esc(title)}"
         if importance:
             header += f" ⭐{importance}"
         if category:
-            header += f" ({category})"
+            header += f" ({_tg_esc(category)})"
         lines.append(header)
         if impact:
-            lines.append(f"    → {impact}")
+            lines.append(f"    → {_tg_esc(impact)}")
         append_source_lines(lines, {"url": url, "lang": lang, "title_raw": raw})
         lines.append("")
     return "\n".join(lines)
@@ -4868,20 +4868,49 @@ def _split_message(message):
     return chunks
 
 
-def send_telegram(token, chat_id, message):
+def send_telegram(token, chat_id, message, parse_mode=None):
+    """Send a digest. Returns (ok, mode) where mode is 'html' or 'plain'.
+
+    Sent as HTML so links carry a short label instead of a 150-character URL.
+    If Telegram rejects the markup (a 400 "can't parse entities"), the chunk is
+    re-sent as PLAIN TEXT with the links expanded back to bare URLs - Telegram
+    auto-links those, so a formatting mistake degrades the digest rather than
+    silencing it. A digest that never arrives because of an escaping bug would
+    be far worse than one with an ugly link.
+    """
     if not token or not chat_id:
-        return False
+        return False, "plain"
     url = TELEGRAM_API.format(token=token)
-    chunks = _split_message(message)
+    mode = parse_mode if parse_mode is not None else TELEGRAM_PARSE_MODE
+    used_plain = False
     ok = True
-    for chunk in chunks:
-        try:
-            resp = requests.post(url, data={"chat_id": chat_id, "text": chunk}, timeout=15)
-            resp.raise_for_status()
-        except Exception as exc:
-            ok = False
-            print(f"  [error] Telegram send failed: {exc}", file=sys.stderr)
-    return ok
+    for chunk in _split_message(message):
+        sent = False
+        if mode:
+            try:
+                resp = requests.post(url, timeout=15, data={
+                    "chat_id": chat_id, "text": chunk, "parse_mode": mode,
+                    "disable_web_page_preview": "true"})
+                resp.raise_for_status()
+                sent = True
+            except Exception as exc:
+                body = ""
+                try:
+                    body = (exc.response.text or "")[:200] if exc.response is not None else ""
+                except Exception:
+                    body = ""
+                print(f"  [warn] Telegram rejected {mode} markup, falling back to "
+                      f"plain text: {exc} {body}", file=sys.stderr)
+        if not sent:
+            used_plain = True
+            try:
+                resp = requests.post(url, timeout=15, data={
+                    "chat_id": chat_id, "text": html_to_plain(chunk)})
+                resp.raise_for_status()
+            except Exception as exc:
+                ok = False
+                print(f"  [error] Telegram send failed: {exc}", file=sys.stderr)
+    return ok, ("plain" if used_plain else "html")
 
 
 def _item_is_chinese(item):
@@ -4905,6 +4934,51 @@ def _translate_url(url):
             + urllib.parse.quote(url, safe=""))
 
 
+# ---------------------------------------------------------------------------
+# Telegram HTML formatting
+# ---------------------------------------------------------------------------
+# Telegram auto-links a bare http(s) URL in plain text, so links worked before
+# this - but a translate URL is ~150 characters and there is one per Chinese
+# item, so a digest was mostly URL. HTML mode lets each link carry a short label
+# instead.
+#
+# HTML rather than MarkdownV2 on purpose: HTML needs only three characters
+# escaped (&, <, >), while MarkdownV2 requires escaping a long list of
+# punctuation and rejects the ENTIRE message if one is missed. News titles are
+# full of '&', '-' and '.', so MarkdownV2 would be a standing hazard.
+TELEGRAM_PARSE_MODE = "HTML"
+
+
+def _tg_esc(value):
+    """Escape text for Telegram's HTML parse_mode. Order matters: & first."""
+    return (str(value if value is not None else "")
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _tg_link(url, label):
+    """An explicit clickable link with a short label."""
+    return f'<a href="{_tg_esc(url)}">{_tg_esc(label)}</a>'
+
+
+def _short_host(url):
+    """Hostname for a link label, so the source is visible without the full URL."""
+    try:
+        host = urllib.parse.urlparse(url or "").hostname or ""
+    except ValueError:
+        host = ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def html_to_plain(text):
+    """Render an HTML digest as plain text.
+
+    Used as a fallback if Telegram rejects the HTML: a bare URL is still
+    auto-linked, so a formatting bug degrades the digest instead of stopping it.
+    """
+    text = re.sub(r'<a href="([^"]*)"[^>]*>(.*?)</a>', r"\2: \1", text, flags=re.S)
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
 def append_source_lines(lines, item, indent="    "):
     """The item's link, plus an English translation link for Chinese sources.
 
@@ -4916,9 +4990,12 @@ def append_source_lines(lines, item, indent="    "):
     url = (item.get("url") or "").strip()
     if not url:
         return
-    lines.append(f"{indent}{url}")
+    host = _short_host(url)
+    label = f"📄 {host}" if host else "📄 Read"
+    parts = [_tg_link(url, label)]
     if _item_is_chinese(item):
-        lines.append(f"{indent}🔤 English: {_translate_url(url)}")
+        parts.append(_tg_link(_translate_url(url), "🔤 English"))
+    lines.append(indent + " · ".join(parts))
 
 
 def format_digest(filtered, ticker_count, stored_count=0, run_label=None,
@@ -4928,14 +5005,16 @@ def format_digest(filtered, ticker_count, stored_count=0, run_label=None,
     # Name the run so it is obvious WHICH digest this is: the 09:15 ET read
     # (pre-open) or the 17:00 ET read (one hour after the close).
     suffix = f" · {run_label}" if run_label and run_label != "manual" else ""
-    lines = [f"📰 Portfolio News Digest ({ticker_count} ticker(s)){suffix}", ""]
+    lines = [f"📰 Portfolio News Digest ({ticker_count} ticker(s)){_tg_esc(suffix)}", ""]
     for item in filtered:
         ticker = item.get("ticker", "")
-        title = item.get("title_en") or item.get("title", "")
-        reason = item.get("reason", "")
-        category = item.get("category", "")
+        # Everything interpolated here is attacker-adjacent (it comes from
+        # scraped pages), so it must be escaped for HTML parse_mode.
+        title = _tg_esc(item.get("title_en") or item.get("title", ""))
+        reason = _tg_esc(item.get("reason", ""))
+        category = _tg_esc(item.get("category", ""))
         importance = item.get("importance")
-        header = f"• [{ticker}] {title}"
+        header = f"• [{_tg_esc(ticker)}] {title}"
         if category:
             header += f"  ({category})"
         if importance:
@@ -4945,12 +5024,12 @@ def format_digest(filtered, ticker_count, stored_count=0, run_label=None,
         pub = (item.get("published_at")
                or _normalize_pub(item.get("date", "")) or "")
         if pub:
-            header += f" 📅{pub[:10]}"
+            header += f" 📅{_tg_esc(pub[:10])}"
         lines.append(header)
         if reason:
             lines.append(f"    {reason}")
         if item.get("impact"):
-            lines.append(f"    → {item['impact']}")
+            lines.append(f"    → {_tg_esc(item['impact'])}")
         append_source_lines(lines, item)
         lines.append("")
     if stored_count > 0:
@@ -4960,7 +5039,7 @@ def format_digest(filtered, ticker_count, stored_count=0, run_label=None,
         web = (web_url or "").strip().rstrip("/")
         if web:
             lines.append(f"…and {stored_count} more stored, not pushed. "
-                         f"Read them all: {web}")
+                         f"{_tg_link(web, 'Read them all →')}")
         else:
             lines.append(f"…and {stored_count} more item(s) stored (not pushed).")
     return "\n".join(lines)
@@ -6013,7 +6092,7 @@ def main():
                     print("=" * 60)
             elif token and chat_id:
                 for name, msg in extra_digests:
-                    if not send_telegram(token, chat_id, msg):
+                    if not send_telegram(token, chat_id, msg)[0]:
                         record["alerts_failed"] = \
                             record.get("alerts_failed", []) + [name.lower()]
                     else:
@@ -6021,7 +6100,7 @@ def main():
         elif snapshot and token and chat_id and not dry_run:
             # Manual run with nothing new: deliver the current picture instead.
             snap_msg = build_snapshot(conn)
-            if snap_msg and send_telegram(token, chat_id, snap_msg):
+            if snap_msg and send_telegram(token, chat_id, snap_msg)[0]:
                 print("  Manual snapshot sent (nothing new since last run - current picture).")
             elif snap_msg:
                 record["alerts_failed"] = record.get("alerts_failed", []) + ["snapshot"]
@@ -6099,7 +6178,7 @@ def main():
         elif token and chat_id:
             sent_any = False
             for name, msg in digests:
-                if send_telegram(token, chat_id, msg):
+                if send_telegram(token, chat_id, msg)[0]:
                     sent_any = True
                 else:
                     record["alerts_failed"] = \
@@ -6113,7 +6192,7 @@ def main():
     elif snapshot and token and chat_id and not dry_run:
         # Manual run with nothing push-worthy: deliver the current picture.
         snap_msg = build_snapshot(conn)
-        if snap_msg and send_telegram(token, chat_id, snap_msg):
+        if snap_msg and send_telegram(token, chat_id, snap_msg)[0]:
             print("  Manual snapshot sent (nothing push-worthy - current picture).")
         elif snap_msg:
             record["alerts_failed"] = record.get("alerts_failed", []) + ["snapshot"]

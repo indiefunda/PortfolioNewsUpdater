@@ -314,19 +314,28 @@ Every stored item carries an English title (the AI translates it), shown above
 the original Chinese line in the Stored-news table. Three ways to handle
 Chinese:
 
-* **In the Telegram digest** — a Chinese item now carries a second link under the
-  original, so the digest is no longer a dead end:
+* **In the Telegram digest** — a Chinese item carries **tappable labelled
+  links**, not bare URLs:
   ```
   • [LX] Lexin Q2 net profit falls 80% ... (earnings) ⭐8 📅2026-09-11
       → bearish, funding tightening
-      https://finance.sina.com.cn/stock/2026-09-11/doc-1.shtml
-      🔤 English: https://translate.google.com/translate?sl=auto&tl=en&u=...
+      📄 finance.sina.com.cn · 🔤 English
   ```
-  The digest shows the AI's *English* title but links to the *original* page;
-  for a Chinese source that lands you on text you cannot read. The translate
-  link fixes that, and it is emitted for every section (macro, sector, global
-  markets, the per-stock digest). Detection uses `lang`, falling back to CJK
-  characters in the raw title, so it still works on rows with no `lang`.
+  *📄 finance.sina.com.cn* opens the original, *🔤 English* opens it through
+  Google Translate. The digest shows the AI's *English* title but links to the
+  *original* page; for a Chinese source that lands you on text you cannot read,
+  which is what made it feel like a dead end. Emitted for every section (macro,
+  sector, global markets, the per-stock digest). Detection uses `lang`, falling
+  back to CJK characters in the raw title, so rows with no `lang` still get it.
+
+  The digest is sent with Telegram's **HTML** parse mode so links can carry a
+  short label — a translate URL is ~150 characters and there is one per Chinese
+  item, so bare URLs made the message mostly URL. HTML was chosen over
+  MarkdownV2 because it only needs `&`, `<` and `>` escaped, while MarkdownV2
+  requires escaping a long list of punctuation and rejects the **entire**
+  message if one is missed. If Telegram ever does reject the markup, the chunk
+  is automatically re-sent as plain text with the URLs expanded, so a formatting
+  bug degrades the digest instead of silencing it.
 * **Automatically** — the per-ticker AI call translates as it scores, so
   anything that reaches the digest is already English. A run also back-fills
   English titles for stored items that missed the AI (a busy run trims to
