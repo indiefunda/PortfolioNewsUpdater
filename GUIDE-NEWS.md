@@ -351,6 +351,25 @@ Chinese:
 Cost is negligible: one batched call translates ~12–25 headlines in a single
 request (~17s measured), using your own AI key on the server.
 
+### The links open in Telegram's own browser — turn it off
+
+Telegram added an **in-app browser** in July 2024, and it opens links from chats
+inside the messenger. That browser handles the Google Translate redirect badly,
+so tapping **🔤 English** appears to do nothing. The links themselves are fine —
+the same URL works in a normal browser.
+
+**No link can force this.** Telegram decides how to open its own links; the fix
+is a client setting, and it applies to every link you tap in Telegram, not just
+these.
+
+**Android** — Settings → **Chat Settings** → turn the **In-App Browser** toggle
+**off**. Links then open in your device's default browser.
+
+**iOS** — Settings → **Data and Storage** → **Other** → **Open Links in** → pick
+the browser you want.
+
+For a one-off, long-press the link and choose *Open in browser* / *Copy link*.
+
 ```bash
 python3 news_updater.py --translate            # back-fill up to 200 stored rows
 python3 news_updater.py --translate=50         # ... a specific number
