@@ -42,6 +42,8 @@ OFFLINE = [
     ("py", "test_crash_record.py", []),
     ("py", "test_purge_duplicates.py", []),
     ("py", "test_hosted_build.py", []),
+    ("py", "test_digest_links.py", []),
+    ("py", "test_web_url_params.py", []),
     ("py", "test_schedule.py", []),
     ("py", "schedule_sim.py", []),
     ("py", "check_panel_js.py", []),

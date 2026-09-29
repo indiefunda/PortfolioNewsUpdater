@@ -13,6 +13,12 @@ secrets_local.json
 
 # Personal config (contains YOUR tickers / holdings - never commit)
 config_local.json
+# Suffixed copies matter too. An exact-name rule does NOT match
+# config_local.json.before-weburl, and a backup file like that was briefly
+# staged for commit because a script here writes it before editing the config.
+config_local.json.*
+secrets_local.json.*
+*.before-*
 
 # Runtime data
 news.db

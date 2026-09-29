@@ -4083,8 +4083,7 @@ def format_global_markets(items):
         lines.append(f"• {title}" + (f" 📅{pub[:10]}" if pub else ""))
         if it.get("impact"):
             lines.append(f"    → {it['impact']}")
-        if it.get("url"):
-            lines.append(f"    {it['url']}")
+        append_source_lines(lines, it)
         lines.append("")
     return "\n".join(lines)
 
@@ -4107,8 +4106,7 @@ def format_sector_watch(items):
             lines.append(f"    {it['summary']}")
         if it.get("impact"):
             lines.append(f"    → {it['impact']}")
-        if it.get("url"):
-            lines.append(f"    {it['url']}")
+        append_source_lines(lines, it)
         lines.append("")
     return "\n".join(lines)
 
@@ -4753,8 +4751,7 @@ def format_macro(items):
         lines.append(f"• [{tag}] {title}" + (f" 📅{pub[:10]}" if pub else ""))
         if it.get("impact"):
             lines.append(f"    → {it['impact']}")
-        if it.get("url"):
-            lines.append(f"    {it['url']}")
+        append_source_lines(lines, it)
         lines.append("")
     return "\n".join(lines)
 
@@ -4817,13 +4814,13 @@ def build_snapshot(conn, hours=24, limit=10):
     cutoff = (datetime.now(EASTERN) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     rows = conn.execute(
         "SELECT ticker, COALESCE(NULLIF(title_en,''), title_raw), importance, "
-        "category, impact, url FROM news WHERE first_seen >= ? "
+        "category, impact, url, lang, title_raw FROM news WHERE first_seen >= ? "
         "AND importance IS NOT NULL ORDER BY importance DESC, first_seen DESC LIMIT ?",
         (cutoff, limit)).fetchall()
     if not rows:
         return None
     lines = ["📊 Manual snapshot — most important items (last 24h)", ""]
-    for ticker, title, importance, category, impact, url in rows:
+    for ticker, title, importance, category, impact, url, lang, raw in rows:
         header = f"• [{ticker}] {title}"
         if importance:
             header += f" ⭐{importance}"
@@ -4832,8 +4829,7 @@ def build_snapshot(conn, hours=24, limit=10):
         lines.append(header)
         if impact:
             lines.append(f"    → {impact}")
-        if url:
-            lines.append(f"    {url}")
+        append_source_lines(lines, {"url": url, "lang": lang, "title_raw": raw})
         lines.append("")
     return "\n".join(lines)
 
@@ -4888,7 +4884,45 @@ def send_telegram(token, chat_id, message):
     return ok
 
 
-def format_digest(filtered, ticker_count, stored_count=0, run_label=None):
+def _item_is_chinese(item):
+    """True when the source article is Chinese.
+
+    Checked two ways because `lang` is not always populated (macro rows and
+    older rows can lack it): the stored flag first, then the raw title, which is
+    what actually decides whether the reader will land on text they can't read.
+    """
+    if str(item.get("lang") or "").lower() == "zh":
+        return True
+    raw = item.get("title_raw") or item.get("title") or ""
+    return any("\u4e00" <= ch <= "\u9fff" for ch in raw)
+
+
+def _translate_url(url):
+    """Google Translate link for an article, matching the web page's link."""
+    if not url:
+        return ""
+    return ("https://translate.google.com/translate?sl=auto&tl=en&u="
+            + urllib.parse.quote(url, safe=""))
+
+
+def append_source_lines(lines, item, indent="    "):
+    """The item's link, plus an English translation link for Chinese sources.
+
+    The digest shows the AI's English title but links to the ORIGINAL page. For
+    a Chinese source that drops the reader onto text they cannot read, which is
+    what made the digest feel like a dead end. The web page already offers this
+    translate link; the digest should not be worse than the web page.
+    """
+    url = (item.get("url") or "").strip()
+    if not url:
+        return
+    lines.append(f"{indent}{url}")
+    if _item_is_chinese(item):
+        lines.append(f"{indent}🔤 English: {_translate_url(url)}")
+
+
+def format_digest(filtered, ticker_count, stored_count=0, run_label=None,
+                  web_url=""):
     if not filtered:
         return None
     # Name the run so it is obvious WHICH digest this is: the 09:15 ET read
@@ -4898,7 +4932,6 @@ def format_digest(filtered, ticker_count, stored_count=0, run_label=None):
     for item in filtered:
         ticker = item.get("ticker", "")
         title = item.get("title_en") or item.get("title", "")
-        url = item.get("url", "")
         reason = item.get("reason", "")
         category = item.get("category", "")
         importance = item.get("importance")
@@ -4918,11 +4951,18 @@ def format_digest(filtered, ticker_count, stored_count=0, run_label=None):
             lines.append(f"    {reason}")
         if item.get("impact"):
             lines.append(f"    → {item['impact']}")
-        if url:
-            lines.append(f"    {url}")
+        append_source_lines(lines, item)
         lines.append("")
     if stored_count > 0:
-        lines.append(f"…and {stored_count} more item(s) stored — see panel Step 5.")
+        # A count with nowhere to go is a dead end: the archive is only useful
+        # if it can be opened. Falls back to a plain count when no web view is
+        # configured, rather than pointing at a local panel step.
+        web = (web_url or "").strip().rstrip("/")
+        if web:
+            lines.append(f"…and {stored_count} more stored, not pushed. "
+                         f"Read them all: {web}")
+        else:
+            lines.append(f"…and {stored_count} more item(s) stored (not pushed).")
     return "\n".join(lines)
 
 
@@ -6034,7 +6074,8 @@ def main():
 
     digest = format_digest(pushed, len(tickers),
                            stored_count=len(all_new) - len(pushed),
-                           run_label=_run_label(start_time)) if pushed else None
+                           run_label=_run_label(start_time),
+                           web_url=config.get("web_url", "")) if pushed else None
     # Every section that has content: macro -> global markets -> the per-stock
     # digest -> optional sector context (so the stock items stay the headline).
     digests = []

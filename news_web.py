@@ -305,6 +305,21 @@ function saveFilters(){
   try { localStorage.setItem('gl_filters', JSON.stringify(F)); } catch(e){}
 }
 
+// Filters can also come from the URL, so a link (for example from a Telegram
+// digest) lands on a useful view instead of the unfiltered list. Applied AFTER
+// the saved filters so the link wins.
+function applyUrlParams(){
+  try {
+    var p = new URLSearchParams(window.location.search);
+    if (p.get('ticker'))    F.ticker = String(p.get('ticker')).toUpperCase();
+    if (p.get('q'))         F.q = p.get('q');
+    if (p.get('minImp'))    F.minImp = parseInt(p.get('minImp'), 10) || 0;
+    if (p.get('sentiment')) F.sentiment = String(p.get('sentiment')).toLowerCase();
+    if (p.get('status'))    F.status = p.get('status');
+    if (p.get('sort'))      F.sort = p.get('sort');
+  } catch(e){ /* no URLSearchParams: keep the stored filters */ }
+}
+
 function loadFilters(){
   try {
     var raw = localStorage.getItem('gl_filters');
@@ -339,7 +354,7 @@ window.__glSetData = function(data){
     o.value = t; o.textContent = t; sel.appendChild(o);
   });
 
-  if (!WIRED){ loadFilters(); wire(); WIRED = true; }
+  if (!WIRED){ loadFilters(); applyUrlParams(); wire(); WIRED = true; }
   applyFilters();
 };
 

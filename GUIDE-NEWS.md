@@ -314,6 +314,19 @@ Every stored item carries an English title (the AI translates it), shown above
 the original Chinese line in the Stored-news table. Three ways to handle
 Chinese:
 
+* **In the Telegram digest** — a Chinese item now carries a second link under the
+  original, so the digest is no longer a dead end:
+  ```
+  • [LX] Lexin Q2 net profit falls 80% ... (earnings) ⭐8 📅2026-09-11
+      → bearish, funding tightening
+      https://finance.sina.com.cn/stock/2026-09-11/doc-1.shtml
+      🔤 English: https://translate.google.com/translate?sl=auto&tl=en&u=...
+  ```
+  The digest shows the AI's *English* title but links to the *original* page;
+  for a Chinese source that lands you on text you cannot read. The translate
+  link fixes that, and it is emitted for every section (macro, sector, global
+  markets, the per-stock digest). Detection uses `lang`, falling back to CJK
+  characters in the raw title, so it still works on rows with no `lang`.
 * **Automatically** — the per-ticker AI call translates as it scores, so
   anything that reaches the digest is already English. A run also back-fills
   English titles for stored items that missed the AI (a busy run trims to
@@ -407,6 +420,51 @@ python3 news_updater.py --translate=LX         # only one ticker
   heavily by the AI.
 - Digests are **split into ≤4,000-char messages** so long Google News URLs
   never make Telegram drop the whole digest.
+
+## Opening the archive from your phone (the `web_url` setting)
+
+The digest ends with a count of items that were **stored but not pushed** — the
+ones the AI judged below the push bar. That count used to be a dead end.
+
+Set **`web_url`** to the read-only web view (see `SETUP-WEB.md`) and the line
+becomes a link:
+
+```
+…and 14 more stored, not pushed. Read them all: https://your-project.web.app
+```
+
+Leave `web_url` empty and you get a plain count instead — no broken link, no
+reference to a local panel step. It is set in the panel's **Configuration** tab
+(under the push settings) or directly in `config_local.json`:
+
+```json
+"web_url": "https://keen-wavelet-275120.web.app"
+```
+
+**Set it in the panel, not just on the server.** The panel's `config_local.json`
+is the source of truth and is uploaded to the VM; editing only the VM's copy gets
+silently reverted the next time you click *Upload config to server*.
+
+### Filtering the view from a link
+
+The web page reads filters from the query string, so you can bookmark - or paste
+into Telegram - a specific slice of the archive:
+
+```
+https://your-project.web.app/?ticker=LX&minImp=6&sort=importance
+```
+
+| Parameter | Values |
+|---|---|
+| `ticker` | any ticker in the archive, e.g. `LX` |
+| `minImp` | importance floor: `4`, `6`, `8` |
+| `sentiment` | `positive`, `negative`, `neutral` |
+| `status` | `pushed` or `stored` |
+| `sort` | `newest`, `oldest`, `importance` |
+| `q` | free text over titles and summaries |
+
+URL parameters win over whatever was last saved in your browser, so a shared
+link always shows exactly what it says.
 
 ## Rolling database (always ~3 weeks of news)
 

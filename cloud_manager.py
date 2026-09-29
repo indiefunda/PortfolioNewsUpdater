@@ -68,6 +68,10 @@ DEFAULT_CONFIG = {
     "push_min_score": 7,
     "push_min_importance": 4,
     "push_max_per_ticker": 2,
+    # The read-only web view of the archive (see SETUP-WEB.md). When set, the
+    # digest's "N more stored, not pushed" line links here instead of dead-ending,
+    # and it is the URL you open on your phone. Empty = no link, plain count.
+    "web_url": "",
     # Nothing published longer ago than this is ever pushed (stored only), no
     # matter how the AI scored it - this is the "I already read this days ago"
     # guard for recycled coverage. Regulatory items are exempt. 0 disables.
@@ -652,6 +656,12 @@ HTML = """<!DOCTYPE html>
     </div>
     <div class="row">
       <div style="flex:1">
+        <label>Web view URL (linked from the digest; blank = no link)</label>
+        <input id="webUrl" type="url" placeholder="https://your-project.web.app">
+      </div>
+    </div>
+    <div class="row">
+      <div style="flex:1">
         <label>News retention (days, rolling)</label>
         <input id="retentionDays" type="number" min="1" value="21">
       </div>
@@ -819,6 +829,7 @@ async function load(){
   $('pushMinScore').value = d.config.push_min_score || dflt.push_min_score || 7;
   $('pushMinImportance').value = d.config.push_min_importance || dflt.push_min_importance || 4;
   $('pushMaxPerTicker').value = d.config.push_max_per_ticker || dflt.push_max_per_ticker || 2;
+  $('webUrl').value = d.config.web_url || dflt.web_url || '';
   $('retentionDays').value = d.config.news_retention_days || dflt.news_retention_days || 21;
   $('tavilyDaily').value = d.config.tavily_max_daily_searches || dflt.tavily_max_daily_searches || 30;
   $('tavilyMonthly').value = d.config.tavily_max_monthly_searches || dflt.tavily_max_monthly_searches || 900;
@@ -923,6 +934,7 @@ async function uploadConfig(){
     push_mode: $('pushMode').value, push_min_score: parseInt($('pushMinScore').value)||7,
     push_min_importance: parseInt($('pushMinImportance').value)||4,
     push_max_per_ticker: parseInt($('pushMaxPerTicker').value)||2,
+    web_url: ($('webUrl').value||'').trim(),
     news_retention_days: parseInt($('retentionDays').value)||21,
     tavily_max_daily_searches: parseInt($('tavilyDaily').value)||30,
     tavily_max_monthly_searches: parseInt($('tavilyMonthly').value)||900,
@@ -2050,6 +2062,10 @@ class Handler(BaseHTTPRequestHandler):
                         cfg[key] = int(data[key])
                     except (TypeError, ValueError):
                         pass
+            # Strings, so they need their own handling rather than the int loop.
+            # An absent key keeps the existing value; an empty one clears it.
+            if "web_url" in data:
+                cfg["web_url"] = str(data.get("web_url") or "").strip()
             # Secrets: ONLY overwrite a key the request actually carries.
             # `data.get(key, "")` used to erase any field the browser did not
             # send - and since the panel fills these inputs from /api/config, a

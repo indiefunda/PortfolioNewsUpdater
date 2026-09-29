@@ -13,6 +13,7 @@
   "push_min_score": 7,
   "push_min_importance": 4,
   "push_max_per_ticker": 2,
+  "web_url": "",
   "tavily_max_daily_searches": 30,
   "tavily_max_monthly_searches": 900,
   "tavily_min_free_items": 4,
