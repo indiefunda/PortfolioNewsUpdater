@@ -1121,25 +1121,47 @@ def is_chinese(text):
     return bool(text and CJK_RE.search(text))
 
 
-# Characters that commonly continue a 2-char CJK term into an UNRELATED word
-# (e.g. "元保" inside "元保险" or "美元保证金" - 保 continued by 险/证/金).
-# A 2-char term followed by one of these is treated as a coincidental
-# substring, not a real company mention.
-CONTINUATION_BLOCK = set("险证金单券押汇据费额契担票据息利收付")
+# A 2-character CJK company name is only a REAL mention when it sits at a
+# boundary. Otherwise it is a coincidental substring of an unrelated word:
+#   "1.47亿元保偏光纤"   -> 元保 = 元(from 亿元) + 保(from 保偏)  -> junk
+#   "80美元保护套"        -> 元保 = 元(from 美元) + 保(from 保护套) -> junk
+#   "智元保持断层式领先"  -> 元保 = 元 + 保(from 保持)            -> junk
+# A mention counts when the character BEFORE is not CJK (start / punctuation /
+# space), or is a common connector (与元保合作), or the character AFTER is not
+# CJK, or is a legitimate name continuation (元保科技 / 元保保险 / 元保集团).
+# A DIGIT before it is always part of a number phrase ("600元保险" = 600-yuan
+# insurance), so that never counts.
+NAME_PREFIXES = set("与和及由为被向从在据是对给跟同了将已拟欲再又称说报"
+                    "，。、；：）」】)(")
+NAME_CONTINUATIONS = set("保险科技集团控股信息服务网络数据金服有限公司银行经纪"
+                         "平台商城贷支付理财国际香港中国证券投资资产管理")
+# Currency / measure characters that turn a leading 元 into a money phrase
+# ("美<元保>证金" = USD deposit, "亿<元保>偏光纤" = billion-yuan PM fiber).
+UNIT_PREFIXES = set("美欧港日加澳亿万")
 
 
 def _term_in_text(term, text):
     """
-    Does 'term' appear in 'text' as a real mention (not a coincidental
-    substring)? For 2-char CJK terms we reject matches where the character
-    right after the term extends it into a different common word.
+    Does 'term' appear in 'text' as a REAL mention (not a coincidental
+    substring)? Long (>=3 char) and ASCII terms are specific enough to use a
+    plain substring test; 2-character CJK terms need the boundary rule above.
     """
     if not term or not text:
         return False
+    n = len(term)
+    if n >= 3 or not is_chinese(term):
+        return term in text
     idx = text.find(term)
     while idx >= 0:
-        after = text[idx + len(term):idx + len(term) + 1]
-        if not (len(term) == 2 and is_chinese(term) and after and after in CONTINUATION_BLOCK):
+        before = text[idx - 1] if idx > 0 else ""
+        after = text[idx + n:idx + n + 1]
+        # Part of a number/money phrase, not a company name.
+        if before.isdigit() or (term[:1] in "元角分" and before in UNIT_PREFIXES):
+            idx = text.find(term, idx + 1)
+            continue
+        if (not before) or (not is_chinese(before)) or (before in NAME_PREFIXES) \
+                or (not after) or (not is_chinese(after)) \
+                or (after in NAME_CONTINUATIONS):
             return True
         idx = text.find(term, idx + 1)
     return False
@@ -3924,6 +3946,25 @@ FOREIGN_CENTRAL_BANK_PATTERNS = [
 FOREIGN_SUBJECT_PATTERNS = FOREIGN_CENTRAL_BANK_PATTERNS + [
     r"美国财政部", r"美国国债", r"美债", r"华尔街", r"标普500",
     r"纳斯达克", r"道琼斯", r"美股",
+    # Broad country/region list. Without this, a headline naming a central bank
+    # the list above does not name ("匈牙利央行降息25个基点") read as China macro
+    # just because it contains 央行 + 降息. Hong Kong / Macau / Taiwan are
+    # deliberately absent: they are China-adjacent and their news is relevant
+    # to these ADRs.
+    r"美国", r"欧洲", r"欧元区", r"欧盟", r"日本", r"英国", r"德国", r"法国",
+    r"意大利", r"西班牙", r"葡萄牙", r"爱尔兰", r"荷兰", r"比利时", r"卢森堡",
+    r"奥地利", r"瑞士", r"瑞典", r"挪威", r"丹麦", r"芬兰", r"冰岛", r"波兰",
+    r"捷克", r"斯洛伐克", r"匈牙利", r"罗马尼亚", r"保加利亚", r"希腊",
+    r"克罗地亚", r"斯洛文尼亚", r"塞尔维亚", r"乌克兰", r"俄罗斯", r"白俄罗斯",
+    r"土耳其", r"格鲁吉亚", r"亚美尼亚", r"阿塞拜疆", r"哈萨克斯坦",
+    r"乌兹别克斯坦", r"以色列", r"沙特", r"阿联酋", r"卡塔尔", r"科威特",
+    r"巴林", r"阿曼", r"伊朗", r"伊拉克", r"埃及", r"南非", r"尼日利亚",
+    r"肯尼亚", r"摩洛哥", r"突尼斯", r"阿尔及利亚", r"巴西", r"墨西哥",
+    r"阿根廷", r"智利", r"哥伦比亚", r"秘鲁", r"委内瑞拉", r"乌拉圭",
+    r"巴拉圭", r"玻利维亚", r"厄瓜多尔", r"印度", r"巴基斯坦", r"孟加拉",
+    r"斯里兰卡", r"尼泊尔", r"泰国", r"越南", r"菲律宾", r"马来西亚",
+    r"新加坡", r"印度尼西亚", r"印尼", r"文莱", r"柬埔寨", r"老挝", r"缅甸",
+    r"蒙古", r"韩国", r"朝鲜", r"澳大利亚", r"新西兰", r"加拿大", r"斐济",
 ]
 # Strong, specific CHINA-policy anchors. One of these is enough to make a
 # headline count as China macro on its own.
@@ -3952,9 +3993,15 @@ STRONG_MACRO_PATTERNS = [
 # 欧洲央行 / 英国央行 / 日本央行, so including it made ECB and BoE headlines look
 # like China stories. Foreign bank names (美联储/欧洲央行/...) are likewise never
 # anchors.
+#
+# NOTE: the generic rate-move words (降息 / 降准 / 逆回购) are also NOT anchors.
+# They appear in every country's rate headlines, so treating them as China
+# anchors made "匈牙利央行降息25个基点" a China-macro item. They still count as
+# one of the two hits in macro_score for a headline with no foreign subject
+# ("央行降准").
 CHINA_ANCHOR_PATTERNS = [
-    r"中国央行", r"中国人民银行", r"人民银行", r"降息", r"降准", r"LPR",
-    r"贷款市场报价利率", r"MLF", r"逆回购", r"存款准备金",
+    r"中国央行", r"中国人民银行", r"人民银行", r"LPR",
+    r"贷款市场报价利率", r"MLF", r"存款准备金",
     # A China index is a China story even though its name contains 纳斯达克.
     r"中国金龙", r"中概股",
 ]
