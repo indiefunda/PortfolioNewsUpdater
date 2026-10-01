@@ -1133,8 +1133,13 @@ def is_chinese(text):
 # insurance), so that never counts.
 NAME_PREFIXES = set("与和及由为被向从在据是对给跟同了将已拟欲再又称说报"
                     "，。、；：）」】)(")
-NAME_CONTINUATIONS = set("保险科技集团控股信息服务网络数据金服有限公司银行经纪"
-                         "平台商城贷支付理财国际香港中国证券投资资产管理")
+# Only the FIRST character of each legitimate continuation word belongs here:
+# 保(保险) 科(科技) 集(集团) 控(控股) 信(信息) 服(服务) 网(网络) 数(数据)
+# 金(金服/金融) 有(有限) 公(公司) 银(银行) 经(经纪) 平(平台) 商(商城) 贷
+# 支(支付) 理(理财) 国(国际) 香(香港) 中(中国) 证(证券) 投(投资) 资(资产)
+# 管(管理) 融(金融). Including later characters (息, 务, 络...) would accept a
+# coincidental match: "音乐信息" would look like 乐信 + 息.
+NAME_CONTINUATIONS = set("保科集控信服网数金有公银经平商贷支理国香中证投资管融")
 # Currency / measure characters that turn a leading 元 into a money phrase
 # ("美<元保>证金" = USD deposit, "亿<元保>偏光纤" = billion-yuan PM fiber).
 UNIT_PREFIXES = set("美欧港日加澳亿万")
