@@ -1176,6 +1176,18 @@ def strip_tags(text):
     return html.unescape(re.sub(r"<[^>]+>", "", text or "")).strip()
 
 
+# Wire items are formatted "SUBJECT：detail" - "美联储卡什卡利：不清楚利率需要提高
+# 到什么水平". The same subject filing three entries in one run is ONE story for
+# a reader, so only the first per subject is kept (the caller tracks the set).
+WIRE_SUBJECT_RE = re.compile(r"^\s*([^：:，。；！？\s]{3,14})[：:]")
+
+
+def wire_subject_key(text):
+    """Speaker/subject prefix of a wire item ('' when there is none)."""
+    m = WIRE_SUBJECT_RE.match(text or "")
+    return m.group(1).strip() if m else ""
+
+
 def _normalize_pub(s, naive_tz=EASTERN):
     """ISO-ish string for the DB, or ''."""
     dt = _parse_pub(s, naive_tz=naive_tz)
@@ -4245,6 +4257,7 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
                 raw_items.append(item)
             set_last_fetched(conn, "MACRO", "ExaMacro", now_utc_str)
     seen_keys = set()
+    subjects_seen = set()
     candidates = []
     for it in raw_items:
         # Same hard freshness backstop as the per-ticker path: a macro wire/
@@ -4260,6 +4273,14 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
         # of them also showed up with no importance at all.
         if market_noise(hay):
             continue
+        # Same speaker, same run -> one story. Three "美联储卡什卡利：..." wire
+        # entries are three different ids, so the id check below cannot catch
+        # them; the subject prefix does.
+        subject = wire_subject_key(it.get("title", ""))
+        if subject:
+            if subject in subjects_seen:
+                continue
+            subjects_seen.add(subject)
         key = (it["source"], it["id"])
         if key in seen_keys:
             continue
@@ -5900,6 +5921,7 @@ def main():
                 wire is a firehose of everything, so this filter is what makes
                 it per-ticker."""
                 out = []
+                subjects = set()
                 for r in raw:
                     hay = f"{r.get('title', '')} {r.get('snippet', '')}"
                     # Macro / global-markets items have their own sections -
@@ -5908,6 +5930,13 @@ def main():
                         continue
                     if not any(_term_in_text(t, hay) for t in terms):
                         continue
+                    # Same speaker filing several wire entries ("乐信CEO：...")
+                    # is one story for this ticker - keep the first only.
+                    subject = wire_subject_key(r.get("title", ""))
+                    if subject:
+                        if subject in subjects:
+                            continue
+                        subjects.add(subject)
                     it = dict(r)
                     it["source"] = src
                     out.append(it)
