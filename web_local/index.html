@@ -239,6 +239,7 @@ window.__glSetData = function(data){
   var have = {};
   Array.prototype.forEach.call(sel.options, function(o){ have[o.value] = 1; });
   var tickers = (data && data.tickers) || [];
+  var configured = (data && data.configured_tickers) || [];
   if (!tickers.length){
     tickers = ALL.map(function(i){ return i.ticker; })
       .filter(function(t, idx, arr){ return t && arr.indexOf(t) === idx; })
@@ -247,7 +248,9 @@ window.__glSetData = function(data){
   tickers.forEach(function(t){
     if (have[t]) return;
     var o = document.createElement('option');
-    o.value = t; o.textContent = t; sel.appendChild(o);
+    o.value = t;
+    o.textContent = (configured.length && configured.indexOf(t) === -1) ? (t + ' (old)') : t;
+    sel.appendChild(o);
   });
 
   if (!WIRED){ loadFilters(); wire(); WIRED = true; }

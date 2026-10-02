@@ -149,15 +149,30 @@ if (!cfg || !cfg.apiKey) {
       // Rules or offline: fall through and just fetch the collection.
     }
 
+    // The option list must start from the CONFIGURED tickers (the meta doc
+    // carries them): a stock the user just added has no news rows yet, so
+    // building the dropdown from the items alone hides it - and a removed
+    // holding must not look current, so the page labels those " (old)".
+    const configured = (meta && Array.isArray(meta.tickers)) ? meta.tickers : [];
+    const unionTickers = function (rows) {
+      const set = {};
+      configured.forEach(function (t) { if (t) set[t] = 1; });
+      (rows || []).forEach(function (i) { if (i && i.ticker) set[i.ticker] = 1; });
+      return Object.keys(set).sort();
+    };
+
     if (cached && meta && cached.generated_at === meta.generated_at) {
-      window.__glSetData({ items: cached.items, generated_at: cached.generated_at });
+      window.__glSetData({ items: cached.items, generated_at: cached.generated_at,
+                           tickers: unionTickers(cached.items),
+                           configured_tickers: configured });
       return;
     }
 
     const items = await fetchAll();
     const generated_at = (meta && meta.generated_at) || new Date().toISOString();
     writeCache({ generated_at, items });
-    window.__glSetData({ items, generated_at });
+    window.__glSetData({ items, generated_at, tickers: unionTickers(items),
+                         configured_tickers: configured });
   }
 
   onAuthStateChanged(auth, async (user) => {

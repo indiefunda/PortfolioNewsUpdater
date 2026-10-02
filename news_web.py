@@ -67,14 +67,52 @@ def read_items(db_path):
     return [dict(r) for r in rows]
 
 
-def build_payload(items):
+CONFIG_NAME = "config_local.json"
+
+
+def configured_tickers(db_path=None):
+    """The CURRENT portfolio, from the config file.
+
+    The payload's ticker list used to be derived from the rows in news.db alone.
+    That meant a just-added stock could not be selected in the dropdown until its
+    first news arrived, while a REMOVED stock lingered for the whole 3-week
+    retention - the dropdown only ever offered "old" names. The list now starts
+    from the configured tickers and adds any ticker that still has stored rows
+    (the page marks those as old).
+    """
+    candidates = []
+    if db_path:
+        candidates.append(os.path.join(
+            os.path.dirname(os.path.abspath(db_path)), CONFIG_NAME))
+    candidates.append(os.path.join(BASE_DIR, CONFIG_NAME))
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except Exception:
+            continue
+        out = []
+        for t in (cfg.get("tickers") or []):
+            t = str(t).strip().upper()
+            if t and t not in out:
+                out.append(t)
+        return out
+    return []
+
+
+def build_payload(items, configured=None):
     """The JSON the page consumes. Kept small: only fields the UI renders."""
-    tickers = sorted({i["ticker"] for i in items if i["ticker"]})
+    item_tickers = {i["ticker"] for i in items if i["ticker"]}
+    configured = [t for t in (configured or []) if t]
+    tickers = sorted(item_tickers | set(configured))
     return {
         "generated_at": datetime.now(EASTERN).strftime("%Y-%m-%d %H:%M:%S %Z"),
         "count": len(items),
         "pushed_count": sum(1 for i in items if i["pushed"]),
         "tickers": tickers,
+        # The current config, so the page can tell a live ticker from one that
+        # only still has rows (a removed holding).
+        "configured_tickers": configured,
         "items": items,
     }
 
@@ -343,6 +381,7 @@ window.__glSetData = function(data){
   var have = {};
   Array.prototype.forEach.call(sel.options, function(o){ have[o.value] = 1; });
   var tickers = (data && data.tickers) || [];
+  var configured = (data && data.configured_tickers) || [];
   if (!tickers.length){
     tickers = ALL.map(function(i){ return i.ticker; })
       .filter(function(t, idx, arr){ return t && arr.indexOf(t) === idx; })
@@ -351,7 +390,9 @@ window.__glSetData = function(data){
   tickers.forEach(function(t){
     if (have[t]) return;
     var o = document.createElement('option');
-    o.value = t; o.textContent = t; sel.appendChild(o);
+    o.value = t;
+    o.textContent = (configured.length && configured.indexOf(t) === -1) ? (t + ' (old)') : t;
+    sel.appendChild(o);
   });
 
   if (!WIRED){ loadFilters(); applyUrlParams(); wire(); WIRED = true; }
@@ -455,7 +496,7 @@ def export(db_path, out_dir, embed=False, hosted=False, firebase_config=None):
     if not os.path.exists(db_path):
         raise SystemExit(f"database not found: {db_path}")
     items = read_items(db_path)
-    payload = build_payload(items)
+    payload = build_payload(items, configured_tickers(db_path))
     os.makedirs(out_dir, exist_ok=True)
 
     head = ""
@@ -528,6 +569,8 @@ def _fs_value(v):
         return {"booleanValue": v}
     if isinstance(v, int):
         return {"integerValue": str(v)}
+    if isinstance(v, (list, tuple)):
+        return {"arrayValue": {"values": [_fs_value(x) for x in v]}}
     return {"stringValue": str(v)}
 
 
@@ -573,10 +616,13 @@ def sync_firestore(db_path, project, dry_run=False):
                for k in previous if k not in wanted]
 
     # One tiny meta doc so the page can tell whether its cache is stale with a
-    # single read instead of re-fetching every row on every visit.
+    # single read instead of re-fetching every row on every visit. It also
+    # carries the CONFIGURED tickers: the page's dropdown must offer a stock the
+    # user just added, which by definition has no news rows yet.
     meta = {"generated_at": datetime.now(EASTERN).strftime("%Y-%m-%d %H:%M:%S %Z"),
             "count": len(items),
-            "pushed_count": sum(1 for i in items if i["pushed"])}
+            "pushed_count": sum(1 for i in items if i["pushed"]),
+            "tickers": configured_tickers(db_path)}
     writes.append({"update": {
         "name": f"projects/{project}/databases/(default)/documents/meta/status",
         "fields": {k: _fs_value(v) for k, v in meta.items()}}})
