@@ -1310,7 +1310,7 @@ def strip_tags(text):
 # Wire items are formatted "SUBJECT：detail" - "美联储卡什卡利：不清楚利率需要提高
 # 到什么水平". The same subject filing three entries in one run is ONE story for
 # a reader, so only the first per subject is kept (the caller tracks the set).
-WIRE_SUBJECT_RE = re.compile(r"^\s*([^：:，。；！？\s]{3,14})[：:]")
+WIRE_SUBJECT_RE = re.compile(r"^\s*([^：:，。；！？\s]{2,14})[：:]")
 
 
 def wire_subject_key(text):
@@ -4226,13 +4226,18 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
                 "source": it.get("source", ""),
                 "lang": it.get("lang", "en"),
                 "title": it.get("title", ""),
-                "url": it.get("url", ""),
+                # NO url. Google News wraps every link in a ~600-800 character
+                # opaque id, and nothing in the requested schema uses it: on a
+                # 40-item run that was 15k characters (~4-5k tokens) of pure
+                # waste on the one call that dominates the bill. The model
+                # matches on title/snippet anyway.
+                "host": _domain_of(it.get("url", ""))[:60],
                 # Original publish date (ET, '' if undated) - lets the model
                 # recognize RECYCLED old stories and veto them (known_event).
                 "published": it.get("published_at") or _normalize_pub(it.get("date", "")),
             }
             if it.get("snippet"):
-                entry["snippet"] = it["snippet"][:200]
+                entry["snippet"] = it["snippet"][:160]
             lines.append(entry)
         # Folded semantic dedup: show what has already been seen for this
         # ticker so the model can flag recycled/same-event stories
@@ -4846,14 +4851,15 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
         # of them also showed up with no importance at all.
         if market_noise(hay):
             continue
-        # Same speaker, same run -> one story. Three "美联储卡什卡利：..." wire
-        # entries are three different ids, so the id check below cannot catch
-        # them; the subject prefix does.
+        # Same speaker, same run -> one story, but keyed PER SOURCE: the two wires
+        # often carry different remarks from the same ministry, and one shared set
+        # silently collapsed them into a single item.
         subject = wire_subject_key(it.get("title", ""))
         if subject:
-            if subject in subjects_seen:
+            subj_key = (it.get("source", ""), subject)
+            if subj_key in subjects_seen:
                 continue
-            subjects_seen.add(subject)
+            subjects_seen.add(subj_key)
         key = (it["source"], it["id"])
         if key in seen_keys:
             continue
@@ -6507,7 +6513,12 @@ def main():
             # sources (GoogleNewsZH/Eastmoney/Baidu) already covered this
             # ticker this run, plus daily/monthly caps enforced inside.
             if src_on("tavily"):
-                free_count = sum(1 for it in all_new if it.get("ticker") == ticker)
+                # Count only items THIS run found: rescued orphans are re-queued
+                # from previous runs, and letting them satisfy the "free sources
+                # already covered it" test silently skipped the paid searches
+                # (run history showed rescued_items 8 on a single run).
+                free_count = sum(1 for it in all_new
+                                 if it.get("ticker") == ticker and not it.get("rescued"))
                 min_free = _cfg_int(config, "tavily_min_free_items", TAVILY_MIN_FREE_ITEMS)
                 if free_count >= min_free:
                     print(f"  {ticker}: free sources already found {free_count} "
@@ -6623,7 +6634,8 @@ def main():
         #      finds differently-worded big news.
         if src_on("exa") and secrets.get("exa_api_key") \
                 and config.get("exa_per_ticker", EXA_PER_TICKER_DEFAULT):
-            free_count = sum(1 for it in all_new if it.get("ticker") == ticker)
+            free_count = sum(1 for it in all_new
+                             if it.get("ticker") == ticker and not it.get("rescued"))
             exa_min_free = _cfg_int(config, "exa_min_free_items", EXA_MIN_FREE_ITEMS)
             if free_count >= exa_min_free:
                 print(f"  {ticker}: free sources already found {free_count} item(s) "
@@ -6884,8 +6896,17 @@ def main():
                                                sorted(reasons.items(),
                                                       key=lambda kv: -kv[1])) + ".")
 
+    # The "and N more stored" number comes from the DATABASE, not from all_new:
+    # items trimmed by the per-run cap and same-story copies were inserted but
+    # never entered all_new, so the old arithmetic understated the archive.
+    try:
+        stored_count = conn.execute(
+            "SELECT COUNT(*) FROM news WHERE pushed=0 AND first_seen >= ?",
+            (run_start,)).fetchone()[0]
+    except sqlite3.Error:
+        stored_count = max(0, len(all_new) - len(pushed))
     digest = format_digest(pushed, len(tickers),
-                           stored_count=len(all_new) - len(pushed),
+                           stored_count=stored_count,
                            run_label=_run_label(start_time),
                            web_url=config.get("web_url", "")) if pushed else None
     # Every section that has content: macro -> global markets -> the per-stock
