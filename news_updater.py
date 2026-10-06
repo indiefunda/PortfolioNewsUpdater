@@ -1286,6 +1286,43 @@ def story_tokens(title):
     return tokens
 
 
+def normalize_title(title):
+    """
+    Comparable form of a headline: drop a trailing ' - publisher' suffix, then
+    all punctuation and whitespace, lowercased. The SAME story syndicated to two
+    outlets ("… - 新浪财经" / "… - East Money") collapses to one key, which the
+    per-source seen hash (source + url + title) cannot do because the URL and
+    often the title differ slightly.
+    """
+    t = re.split(r"\s+[-–—|]\s+", str(title or ""))[0]
+    return re.sub(r"[\s\W_]+", "", t, flags=re.UNICODE).lower()[:80]
+
+
+# How far back the same-title guard looks. A story re-published under a new URL
+# within this window is not stored again (the digest gates are separate).
+SAME_TITLE_WINDOW_HOURS = 72
+
+
+def recent_stored_titles(conn, ticker, hours=SAME_TITLE_WINDOW_HOURS):
+    """Normalized titles (raw AND translated) already stored for this ticker."""
+    if conn is None:
+        return set()
+    cutoff = (datetime.now(EASTERN) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        rows = conn.execute(
+            "SELECT title_raw, title_en FROM news WHERE ticker=? AND first_seen >= ?",
+            (ticker, cutoff)).fetchall()
+    except sqlite3.Error:
+        return set()
+    out = set()
+    for raw, en in rows:
+        for value in (raw, en):
+            key = normalize_title(value)
+            if key:
+                out.add(key)
+    return out
+
+
 def _jaccard(a, b):
     if not a or not b:
         return 0.0
@@ -1737,8 +1774,13 @@ def passes_relevance(item, meta, resolved):
     # mention: the news is about the stock's own business, not its sector.
     if mentions_company(hay, resolved.get("subsidiary_names") or []):
         return "company"
+    # The ticker must appear in the TITLE. Matching it anywhere in the page text
+    # let one- and two-letter symbols collide with ordinary words in a noisy
+    # excerpt ("lx", "lu", "yb"), which is how unrelated pages were classified
+    # as being about the company.
     ticker = str(item.get("ticker") or "").lower()
-    if ticker and re.search(r"(?<![a-z0-9])" + re.escape(ticker) + r"(?![a-z0-9])", hay):
+    title_l = str(item.get("title") or "").lower()
+    if ticker and re.search(r"(?<![a-z0-9])" + re.escape(ticker) + r"(?![a-z0-9])", title_l):
         return "company"
     for domain in resolved["domains"]:
         if domain and domain in hay:
@@ -1772,6 +1814,11 @@ def ingest_items(conn, all_new, source, items, ticker, since_dt, max_age_hours,
     """
     accepted = 0
     rep = report if report is not None else {}
+    # Normalized titles already stored for this ticker (recent window), so the
+    # SAME story arriving again under a new URL is not stored a second time.
+    # Looked up once per source per ticker and extended as we accept items, so
+    # duplicates inside one batch are caught too.
+    stored_titles = recent_stored_titles(conn, ticker)
 
     def bump(key):
         rep[key] = rep.get(key, 0) + 1
@@ -1797,6 +1844,12 @@ def ingest_items(conn, all_new, source, items, ticker, since_dt, max_age_hours,
                     bump("sector_off")
                     continue
                 item["_sector"] = True
+        title_key = normalize_title(item.get("title", ""))
+        if title_key and title_key in stored_titles:
+            bump("same_title")
+            continue
+        if title_key:
+            stored_titles.add(title_key)
         item["published_at"] = _normalize_pub(item.get("date", ""))
         if run_start:
             item["first_seen"] = run_start
@@ -1933,6 +1986,62 @@ def build_en_terms(meta):
                     continue
                 terms.append(v)
     return terms[:5]
+
+
+# Words too generic to identify a company on their own when used as a stem
+# ("China" from China Automotive Systems, "Up" from Up Fintech).
+GENERIC_NAME_WORDS = {
+    "china", "chinese", "global", "new", "the", "up", "group", "holdings",
+    "holding", "technology", "technologies", "tech", "systems", "system",
+    "financial", "finance", "international", "inc", "ltd", "corp",
+    "corporation", "company", "limited", "services", "service", "digital",
+}
+# A headline carrying one of these is CORPORATE news about whoever it names, so
+# a bare brand-stem match is trustworthy.
+CORPORATE_CONTEXT_WORDS = (
+    "report", "reports", "reported", "announce", "announces", "announced",
+    "earnings", "results", "revenue", "profit", "loss", "guidance", "outlook",
+    "quarter", "quarterly", "fiscal", "q1", "q2", "q3", "q4", "shares", "stock",
+    "ceo", "cfo", "dividend", "buyback", "acquisition", "merger", "ipo",
+    "regulator", "regulatory", "penalty", "fine", "investigation", "license",
+    "delisting", "lawsuit", "partnership", "launch", "expands", "expansion",
+)
+
+
+def company_stems(terms):
+    """Distinctive first words of multi-word company names, e.g.
+    'LexinFintech Holdings' -> 'lexinfintech'. Headlines usually use the brand
+    form, so the full legal name alone under-matches."""
+    out = set()
+    for t in terms or []:
+        t = str(t or "").strip()
+        if not t or is_chinese(t) or " " not in t:
+            continue
+        first = t.split()[0].lower()
+        if len(first) >= 5 and first not in GENERIC_NAME_WORDS:
+            out.add(first)
+    return out
+
+
+def tavily_term_match(title, terms, stems=None):
+    """
+    Is this headline about the company? A full search term matches by substring;
+    a bare brand stem only counts alongside a corporate-context word. That keeps
+    'LexinFintech posts Q2 results' (stem + results) while dropping
+    'Yuanbao app official download' (stem, no corporate news) and anything that
+    merely happens to appear in Tavily's page excerpt.
+    """
+    if any(_term_in_text(t, title) for t in (terms or [])):
+        return True
+    if stems is None:
+        stems = company_stems(terms)
+    if not stems:
+        return False
+    low = str(title or "").lower()
+    if not any(s in low for s in stems):
+        return False
+    return any(re.search(r"(?<![a-z])" + re.escape(w) + r"(?![a-z])", low)
+               for w in CORPORATE_CONTEXT_WORDS)
 
 
 def load_lookup():
@@ -3275,6 +3384,7 @@ def fetch_tavily(query, secrets, config, since_dt=None, limit=8, topic="news",
             _write_json(TAVILY_USAGE_FILE, usage)
         items = []
         junk = 0
+        stems = company_stems(terms)
         for r in data.get("results", []) or []:
             title = (r.get("title") or "").strip()
             url = r.get("url", "") or ""
@@ -3284,11 +3394,16 @@ def fetch_tavily(query, secrets, config, since_dt=None, limit=8, topic="news",
                 junk += 1
                 continue
             content = (r.get("content") or "")[:300]
-            # Precision filter (news path only): drop results that mention
-            # none of the ticker's terms - kills Tavily's off-topic filler.
+            # Precision filter (news path only): drop results whose TITLE is not
+            # about the company. Eastmoney and Baidu already filter on the
+            # title; Tavily was the outlier that also matched its page-content
+            # excerpt, and that excerpt is noisy page furniture (nav links,
+            # sidebars, unrelated tickers) - which is how rows about a
+            # completely different company reached the database. The brand-stem
+            # fallback in tavily_term_match keeps legitimate headlines that use
+            # the short name instead of the full legal one.
             if terms:
-                hay = f"{title} {content}"
-                if not any(_term_in_text(t, hay) for t in terms):
+                if not tavily_term_match(title, terms, stems):
                     continue
             date = r.get("published_date", "") or ""
             pub_dt = _parse_pub(date)
