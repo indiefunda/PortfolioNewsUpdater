@@ -146,6 +146,9 @@ LOOKUP_REFRESH_DAYS = 30
 # f.text()); without it, enrichment silently fails. Replace with your own
 # contact email if you prefer.
 SEC_IDENTITY = "PortfolioNewsUpdater personal-use news monitor news@example.com"
+# SEC requests made with plain `requests` (the exhibit fetch) need the same
+# descriptive User-Agent the fair-access policy asks for.
+SEC_USER_AGENT = SEC_IDENTITY
 
 # Eastmoney (东方财富) search API - public JSONP endpoint used to search
 # Chinese financial news by company name (works for US-listed Chinese
@@ -254,6 +257,11 @@ GLOBAL_MARKETS_MAX_PER_RUN = 2
 # score (they showed as "—" in the panel). Everything not stored is simply not
 # seen again, so the DB stays a record of notable macro news.
 MACRO_STORE_MAX_PER_RUN = 12
+# Minimum AI score for an item to occupy a CHINA MACRO seat. The macro section
+# is pushed in addition to the digest seats and was never floor-capped, so a
+# routine item scored 4 used to take one of its three places. Configurable:
+# macro_min_importance; 0 disables the floor.
+MACRO_MIN_IMPORTANCE = 6
 # Near-duplicate detection: two items for the same ticker whose titles share
 # this much of their token sets are the SAME story from different outlets.
 STORY_JACCARD_MIN = 0.6
@@ -2955,6 +2963,56 @@ def _extract_sec_substance(form, text):
     return "", ""
 
 
+def fetch_sec_exhibit_text(filing_url, max_chars=3000, timeout=20):
+    """
+    Press-release text (EX-99.x) from a filing folder, via the folder's
+    index.json. Returns '' when there is nothing usable.
+
+    The SEC requires a descriptive User-Agent; edgartools is NOT used here on
+    purpose, so this keeps working even when its local cache is unavailable
+    (which is also a silent failure mode of the primary-document path).
+    """
+    if not filing_url:
+        return ""
+    base = filing_url.rstrip("/")
+    # Callers pass either the filing FOLDER or an …-index.htm page (EDGAR's
+    # browse-edgar links point at the index page), so drop a trailing document
+    # name before asking for the folder's index.json.
+    if base.lower().endswith((".htm", ".html", ".txt")):
+        base = base.rsplit("/", 1)[0]
+    try:
+        resp = requests.get(base + "/index.json",
+                            headers={"User-Agent": SEC_USER_AGENT}, timeout=timeout)
+        resp.raise_for_status()
+        items = ((resp.json() or {}).get("directory") or {}).get("item") or []
+    except Exception:
+        return ""
+    names = [str(it.get("name") or "") for it in items]
+
+    def _usable(n):
+        low = n.lower()
+        return low.endswith((".htm", ".html", ".txt"))
+
+    # Prefer the press-release exhibit, then any document that is not the index
+    # or a rendered cover page.
+    picks = [n for n in names if _usable(n) and re.search(r"ex[-_]?99", n, re.I)]
+    if not picks:
+        picks = [n for n in names if _usable(n)
+                 and not re.search(r"(^|[-_])(index|R\d+|0000\d*)", n, re.I)]
+    for name in picks[:2]:
+        try:
+            doc = requests.get(f"{base}/{name}",
+                               headers={"User-Agent": SEC_USER_AGENT}, timeout=timeout)
+            doc.raise_for_status()
+            text = re.sub(r"\s+", " ", strip_tags(doc.text)).strip()
+        except Exception:
+            continue
+        # A cover page is short; the press release is not.
+        if len(text) > 200:
+            return text[:max_chars]
+    return ""
+
+
 def fetch_sec_filings(ticker, since_dt, conn=None):
     """
     SEC filings for this ticker filed since since_dt, using edgartools.
@@ -3003,6 +3061,18 @@ def fetch_sec_filings(ticker, since_dt, conn=None):
                 try:
                     text = f.text()
                     suffix, snippet = _extract_sec_substance(form, text)
+                    # The substance of an ADR 6-K is in EXHIBIT 99.x (the press
+                    # release): the primary document is a cover page + an
+                    # "Exhibit 99.1" line + a signature, and it usually does NOT
+                    # contain the "INFORMATION CONTAINED IN THIS REPORT" heading
+                    # the extractor looks for (verified on two real QFIN 6-Ks).
+                    # Without this, every 6-K reached the AI as a bare "form
+                    # filed <date>" with an empty snippet.
+                    if not snippet and form in ("6-K", "6-K/A", "8-K", "8-K/A") and url:
+                        exhibit = fetch_sec_exhibit_text(url)
+                        if exhibit:
+                            snippet = exhibit[:300]
+                            suffix = exhibit[:130]
                     if suffix:
                         title = f"{company_name} - {form}: {suffix}"
                 except Exception as exc:
@@ -3617,8 +3687,7 @@ def fetch_tavily(query, secrets, config, since_dt=None, limit=8, topic="news",
 # filter. Only the few items that match ever reach the AI (one tiny batched
 # call per run). This is how "huge Chinese news" gets delivered without
 # burning tokens on everything else.
-MACRO_KEYWORDS = [
-    # Monetary policy
+MACRO_KEYWORDS = [    # Monetary policy
     r"降息", r"加息", r"降准", r"LPR", r"贷款市场报价利率", r"中期借贷便利|MLF",
     r"逆回购", r"存款准备金", r"货币政策", r"利率下调|下调利率|降低利率",
     # China-policy anchors. These are what let a China headline read as macro:
@@ -4624,6 +4693,15 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
             print("  [warn] macro: EXA macro search failed - NOT advancing delta.")
         else:
             for it in res:
+                # EXA is semantically pre-filtered, but it was the ONE path that
+                # skipped the tier gate entirely: a result that is neither China
+                # macro nor systemic-global could take one of the three "must
+                # know" seats. It still gets no keyword gate of its own (that is
+                # the point of a semantic query) - just the same tier test every
+                # other macro candidate passes.
+                hay = f"{it.get('title', '')} {it.get('snippet', '')}"
+                if not wanted(hay):
+                    continue
                 item = dict(it)
                 item["ticker"] = "MACRO"
                 item["source"] = "ExaMacro"
@@ -5171,6 +5249,16 @@ def analyze_macro(macro_items, config, secrets, conn, run_start, pseudo="MACRO")
         # scored 3 must not occupy a seat.
         if pseudo == "GLOBAL":
             ranked = [it for it in ranked if (it.get("importance") or 0) >= 5]
+        else:
+            # The China-macro tier had NO floor: it is always pushed (never
+            # floor-capped) on top of the digest's seats, so a routine item the
+            # model scored 4 took one of the three "must know" places. A real
+            # floor is what makes the section signal rather than filler.
+            macro_floor = _cfg_int(config, "macro_min_importance",
+                                   MACRO_MIN_IMPORTANCE)
+            if macro_floor > 0:
+                ranked = [it for it in ranked
+                          if (it.get("importance") or 0) >= macro_floor]
         return ranked[:cap]
     # Zero-AI fallback: raw Chinese + English tag, always pushed (capped).
     for it in macro_items:
@@ -5643,7 +5731,7 @@ def push_decision_counts(enriched):
 # ---------------------------------------------------------------------------
 # Schedule guard
 # ---------------------------------------------------------------------------
-# Two runs a day, pinned to US market time. Both are deliberately placed
+# Three runs a day, pinned to US market time. All are deliberately placed
 # OUTSIDE DeepSeek's peak-pricing windows (01:00-04:00 / 06:00-10:00 UTC
 # Mon-Fri, when API tokens cost DOUBLE). Verified for both DST seasons:
 #
@@ -5651,21 +5739,27 @@ def push_decision_counts(enriched):
 #                                                   14:15 UTC (EST, winter)
 #   Run 2  17:00 ET (one hour after the 16:00 close) -> 21:00 UTC (EDT)
 #                                                      22:00 UTC (EST)
+#   Run 3  19:00 ET (= 07:00 Beijing, the Chinese pre-open news morning)
+#                                                  -> 23:00 UTC (EDT)
+#                                                     00:00 UTC (EST)
 #
-# All four land off-peak, so every AI call is billed at half price. cron
-# fires at fixed UTC times and installs BOTH seasons' jobs (see setup_cloud.sh);
-# the guard below makes the out-of-season job an instant no-op, so exactly two
-# real runs happen per day. The old third run at 23:00 ET (= 03:00/04:00 UTC,
-# deep inside the peak window) was removed purely for AI cost.
-SCHEDULE_RUN_TIMES = (dtime(9, 15), dtime(17, 0))
+# Run 3 exists because Chinese news breaks during the Asian session; without it
+# nothing is read between 17:00 ET and 09:15 ET the next morning (~16 h). 19:00
+# ET is the sweet spot: it is the Chinese pre-open window AND off-peak in both
+# seasons, so it costs half price. (The older 23:00 ET third run was removed for
+# cost because 23:00 ET = 03:00/04:00 UTC sits INSIDE the peak window.)
+#
+# cron fires at fixed UTC times and installs BOTH seasons' jobs (see
+# setup_cloud.sh); the guard below makes the out-of-season job an instant no-op,
+# so exactly three real runs happen per day.
+SCHEDULE_RUN_TIMES = (dtime(9, 15), dtime(17, 0), dtime(19, 0))
 SCHEDULE_TOLERANCE_MIN = 5
 
-# Label shown in the digest header so it is obvious WHICH run delivered it:
-# the 09:15 ET run is the pre-open read, the 17:00 ET run is the post-close
-# read (one hour after the 16:00 ET close).
+# Label shown in the digest header so it is obvious WHICH run delivered it.
 SCHEDULE_LABELS = {
     dtime(9, 15): "pre-open",
     dtime(17, 0): "post-close",
+    dtime(19, 0): "asia-open",
 }
 
 
@@ -5690,7 +5784,7 @@ def _schedule_guard(now_et):
         if delta <= SCHEDULE_TOLERANCE_MIN * 60:
             return
     print(f"[{now_et.strftime('%Y-%m-%d %H:%M %Z')}] "
-          f"Outside scheduled times (9:15 / 17:00 ET) - skipping.")
+          f"Outside scheduled times (9:15 / 17:00 / 19:00 ET) - skipping.")
     sys.exit(0)
 
 

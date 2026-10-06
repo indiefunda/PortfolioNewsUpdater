@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Verify the cron slots + schedule guard produce exactly two runs per day in
+"""Verify the cron slots + schedule guard produce exactly three runs per day in
 each DST season, and that every real slot is off-peak for DeepSeek."""
 import importlib.util
 import sys
@@ -15,7 +15,8 @@ spec.loader.exec_module(nu)
 
 UTC = ZoneInfo("UTC")
 PEAK = [(1, 4), (6, 10)]           # DeepSeek double-price windows (UTC, Mon-Fri)
-CRON_SLOTS = [(13, 15), (21, 0), (14, 15), (22, 0)]   # what cron now fires
+CRON_SLOTS = [(13, 15), (21, 0), (23, 0), (14, 15), (22, 0), (0, 0)]   # what cron now fires
+EXPECTED_RUNS_PER_DAY = 3
 
 print("cron slots (UTC) -> behavior")
 print("-" * 72)
@@ -39,9 +40,9 @@ for season, month, day in (("EDT", 7, 1), ("EST", 1, 1)):
         print(f"  {season} {hh:02d}:{mm:02d} UTC = {now.strftime('%H:%M')} ET "
               f"-> {mark:5s} {'(peak pricing!)' if peak else ''}")
     print(f"  {season}: real runs = {real}")
-    if len(real) != 2:
+    if len(real) != EXPECTED_RUNS_PER_DAY:
         fail += 1
-        print(f"  {season}: FAIL - expected exactly 2 runs, got {len(real)}")
+        print(f"  {season}: FAIL - expected exactly {EXPECTED_RUNS_PER_DAY} runs, got {len(real)}")
     print()
 
 print("=" * 72)
@@ -63,7 +64,7 @@ for label, month, day in (("EDT week", 7, 6), ("EST week", 1, 5)):
                 fired += 1
                 if any(lo <= hh < hi for lo, hi in PEAK):
                     peak_fired += 1
-    expected = 2 * 5                # two runs x five weekdays
+    expected = EXPECTED_RUNS_PER_DAY * 5     # three runs x five weekdays
     good = fired == expected and peak_fired == 0
     if not good:
         fail += 1

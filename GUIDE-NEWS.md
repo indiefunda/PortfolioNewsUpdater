@@ -2,7 +2,7 @@
 
 Searches your tickers for **new** SEC filings, **Chinese** news (Google News
 zh-CN, Eastmoney, Sina/Eastmoney 7x24 wires, Tavily), English news, and RSS
-items **twice a day**. Everything found is stored in a SQLite news
+items **three times a day**. Everything found is stored in a SQLite news
 database (rolling ~3 weeks), translated to English and scored 1–10 by
 **DeepSeek AI**; only the **top items by importance** are pushed to your
 Telegram. Runs on the same **free** Google Cloud VM as your price monitor,
@@ -14,13 +14,17 @@ so it costs **$0** for VM/network/storage.
 |-----|-------------------|------------------|------------------|
 | 1 | **09:15 ET** (15 min before the 09:30 open) | 13:15 | 14:15 |
 | 2 | **17:00 ET** (one hour after the 16:00 close) | 21:00 | 22:00 |
+| 3 | **19:00 ET** (= **07:00 Beijing**, the Chinese pre-open news morning) | 23:00 | 00:00 |
 
-All four UTC times sit **outside DeepSeek's peak-pricing windows**
+All six UTC times sit **outside DeepSeek's peak-pricing windows**
 (01:00–04:00 & 06:00–10:00 UTC Mon–Fri — tokens cost **double** there), so
-**every AI call is billed at the half price** in both seasons.
+**every AI call is billed at the half price** in both seasons. Run 3 exists
+because Chinese news breaks during the Asian session: without it nothing was
+read between 17:00 ET and 09:15 ET the next morning (~16 h).
 
 Which run a digest came from is printed in its header
-(`📰 Portfolio News Digest (6 ticker(s)) · pre-open` / `· post-close`).
+(`📰 Portfolio News Digest (6 ticker(s)) · pre-open` / `· post-close` /
+`· asia-open`).
 
 The installer puts cron jobs on the VM for both DST seasons and a tiny
 DST-aware guard inside `news_updater.py` makes the out-of-season jobs an

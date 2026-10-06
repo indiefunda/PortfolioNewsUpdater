@@ -7,8 +7,8 @@ real-time news wires**, **EXA neural search**, Tavily) using each company's
 **Chinese name and its brands/subsidiaries** (e.g. LX → 乐信/分期乐/Fenqile, plus
 their official websites), stores everything in a small database, translates + scores it with AI (with a
 "what this means" impact sentence), and pushes only the most important items
-to Telegram — **twice a day, Monday to Friday**, pinned to US market time
-(DST-aware): **09:15 ET** before the open and **17:00 ET** an hour after the
+to Telegram — **three times a day, Monday to Friday**, pinned to US market time
+(DST-aware): **09:15 ET** before the open, **17:00 ET** an hour after the
 close, both deliberately placed **outside DeepSeek's peak-priced hours** so
 every AI call costs half price. (Weekends are skipped — cron is Mon–Fri.)
 
