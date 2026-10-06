@@ -1683,7 +1683,10 @@ class Handler(BaseHTTPRequestHandler):
             "compute", "ssh", "--zone", zone, VM_NAME,
             "--command", f"cd {home} && python3 news_updater.py --dump-effective-meta "
                          f"2>/dev/null || echo '{{}}'",
-            "--quiet"], timeout=90)
+            # Read-only on the VM now (no discovery, no credits), so this is
+            # fast; the old 90 s limit used to cut off a discovery run that kept
+            # spending remotely after the panel gave up.
+            "--quiet"], timeout=180)
         if not ok:
             self._send_json({"ok": False, "error": (err or "SSH failed").strip()[:300]})
             return

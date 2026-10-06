@@ -56,6 +56,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 import time
 import urllib.parse
 from datetime import datetime, time as dtime, timedelta
@@ -122,6 +123,12 @@ RUN_HISTORY_LIMIT = 200
 NEWS_RETENTION_DAYS = 21
 SEEN_RETENTION_DAYS = 21
 DB_SIZE_LIMIT_BYTES = 50 * 1024 * 1024  # 50 MB
+# Content-aware junk purge, applied by prune_db on every run: a stored row that
+# was never pushed and scored at or below this bar is deleted once it is older
+# than the grace window (so the panel keeps showing what just arrived). 0 turns
+# it off. The manual --purge-junk command remains for a one-off cleanup.
+JUNK_IMPORTANCE_MAX = 2
+JUNK_GRACE_HOURS = 36
 
 # The company knowledge base: per-ticker Chinese/local names, aliases and
 # subsidiaries (e.g. LX -> 乐信 + 分期乐 + Fenqile + Indonesia companies).
@@ -251,8 +258,7 @@ MACRO_STORE_MAX_PER_RUN = 12
 # this much of their token sets are the SAME story from different outlets.
 STORY_JACCARD_MIN = 0.6
 STORY_CONTAINMENT_MIN = 0.82
-# Duplicate PURGE threshold (browsing hygiene only - never the digest).
-#
+# Duplicate PURGE threshold (browsing hygiene only - never the digest).#
 # The live gate above is deliberately strict because it also decides what may
 # occupy a digest seat, where a false positive silently drops real news. The
 # cost of that strictness is that a reworded headline for the same event still
@@ -358,13 +364,27 @@ def _read_json(path, default):
 
 
 def _write_json(path, data):
-    """Atomic write: write to a temp file, then os.replace (never corrupts
-    the target if the process dies mid-write - protects the lookup file and
-    the usage tracker from turning into garbage that silently resets state)."""
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+    """Atomic write: unique temp file, then os.replace.
+
+    The temp name MUST be unique. It used to be a fixed "<path>.tmp", and three
+    paths can write the same file (the cron run, --rediscover and the panel's
+    read-only introspection): two writers sharing that name can publish each
+    other's half-written buffer, and _read_json swallows the parse error and
+    returns {} - which silently resets company_lookup.json and re-buys discovery
+    for every ticker. cloud_manager._write_json already uses mkstemp for exactly
+    this reason."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-write-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _cfg_int(config, key, default):
@@ -857,6 +877,35 @@ def mark_pushed(conn, item, pushed):
     conn.commit()
 
 
+def persist_push_state(conn, pending, delivered, now=None):
+    """
+    Write delivery state ONLY for the sections Telegram actually accepted.
+
+    'pending' maps a section name -> (all_items, pushed_subset). Each group's
+    rows are written (1 for the subset, 0 for the rest) but only when that
+    section was really delivered; a failed or unsent section leaves every row
+    un-pushed so the next run can deliver it, and only delivered items enter the
+    repeat/event ledger.
+
+    This used to run BEFORE the send, so a Telegram failure (bad token, 429, a
+    timeout - send_telegram has no retry) or a kill mid-run silently swallowed
+    that window: the rows were marked pushed, the ledger suppressed the story
+    for 7-21 days, and the run still reported sent_items as if it had arrived.
+    Returns the number of items that were really sent.
+    """
+    sent = 0
+    for name, pair in (pending or {}).items():
+        group, subset = pair if pair else ([], [])
+        ok = name in (delivered or set())
+        chosen = {id(it) for it in (subset or [])}
+        for it in (group or []):
+            mark_pushed(conn, it, bool(ok and id(it) in chosen))
+        if ok and subset:
+            record_pushed_stories(conn, subset, now=now)
+            sent += len(subset)
+    return sent
+
+
 def list_news(conn, ticker=None, limit=300):
     """Return stored news (last ~3 weeks) as a list of dicts for browsing.
 
@@ -1038,6 +1087,23 @@ def prune_db(conn):
         cur = conn.execute("DELETE FROM pushed_stories WHERE pushed_at < ?",
                            (cutoff_pushed,))
         rows_deleted += cur.rowcount
+        # Content-aware junk purge: a low-scored row that was never pushed has no
+        # value in a browsable archive - it is exactly the "why is this in my
+        # database?" class. Age-based pruning alone kept it for the full 21 days.
+        # Rows younger than the grace window are kept so the panel still shows
+        # what just arrived.
+        if JUNK_IMPORTANCE_MAX > 0:
+            junk_cutoff = (datetime.now(EASTERN)
+                           - timedelta(hours=JUNK_GRACE_HOURS)) \
+                .strftime("%Y-%m-%d %H:%M:%S")
+            cur = conn.execute(
+                "DELETE FROM news WHERE pushed=0 AND importance IS NOT NULL "
+                "AND importance <= ? AND first_seen < ?",
+                (JUNK_IMPORTANCE_MAX, junk_cutoff))
+            if cur.rowcount:
+                print(f"  [prune] removed {cur.rowcount} low-value stored row(s) "
+                      f"(never pushed, importance <= {JUNK_IMPORTANCE_MAX}).")
+            rows_deleted += cur.rowcount
         conn.commit()
 
         if os.path.exists(DB_FILE) and os.path.getsize(DB_FILE) > DB_SIZE_LIMIT_BYTES:
@@ -1372,13 +1438,19 @@ def _same_story(a, b):
     Are two token sets the same story (a re-report, a syndicated copy, a
     different outlet's headline for one event)? Containment catches the
     "same headline, one with extra words" case that Jaccard alone misses.
-    Very short token sets are only trusted when one fully contains the other,
-    so unrelated three-word headlines cannot collapse.
+
+    TINY sets must be IDENTICAL. The previous rule used containment >= 0.999
+    whenever either side had fewer than three tokens, and containment divides by
+    the SMALLER set - so a one-token headline matched anything containing that
+    token. After _TITLE_NOISE_RE and the stopword list strip "results"/"report"/
+    "announces"/years, real headlines shrink to a single token, and a replay of
+    167 stored LX headlines collapsed 40 of them, including a Citi downgrade, an
+    insider RSU exercise and a 6-K - none of which is a duplicate of the others.
     """
     if not a or not b:
         return False
     if min(len(a), len(b)) < 3:
-        return _containment(a, b) >= 0.999
+        return a == b
     if _containment(a, b) >= STORY_CONTAINMENT_MIN:
         return True
     return _jaccard(a, b) >= STORY_JACCARD_MIN
@@ -1889,12 +1961,22 @@ def ingest_items(conn, all_new, source, items, ticker, since_dt, max_age_hours,
         item["published_at"] = _normalize_pub(item.get("date", ""))
         if run_start:
             item["first_seen"] = run_start
+        # The junk-host gate checks BOTH the link and the origin outlet: for a
+        # Google News item the link is an opaque news.google.com/rss/articles/...
+        # wrapper, so a content farm was only visible in `origin`. And it runs
+        # HERE, before the seen mark: previously insert_news rejected the row
+        # after mark_seen had already committed, leaving a hash that blocked the
+        # real article forever (and an item that was pushable yet absent from the
+        # browser).
+        if is_junk_host(item.get("url", "")) or is_junk_host(item.get("origin", "")):
+            bump("junk_host")
+            continue
         if not is_new(conn, ticker, item["source"], item["id"], item["title"]):
             bump("already_seen")
             continue
+        insert_news(conn, item)
         mark_seen(conn, ticker, item["source"], item["id"], item["title"],
                   item.get("url", ""))
-        insert_news(conn, item)
         if sector_items is not None and item.get("_sector"):
             sector_items.append(item)
             bump("sector_kept")
@@ -2719,7 +2801,8 @@ def discover_company(ticker, config, secrets, existing=None, persist=True):
     return lookup.get(ticker, entry)
 
 
-def ensure_company_meta(ticker, config, secrets, force=False, persist=True):
+def ensure_company_meta(ticker, config, secrets, force=False, persist=True,
+                        allow_discovery=True):
     """
     The per-startup entry point: look the ticker up in company_lookup.json
     (seeded from config ticker_meta), run discovery when it is missing,
@@ -2763,6 +2846,15 @@ def ensure_company_meta(ticker, config, secrets, force=False, persist=True):
         # don't burn Tavily credits re-searching every single run.
         if not force and (stale or (sparse and not attempted)):
             needs_discovery = True
+
+    if needs_discovery and not allow_discovery:
+        # Read-only introspection (--dump-effective-meta, used by the panel's
+        # Configuration tab): resolve what is KNOWN without spending EXA/Tavily
+        # credits or AI calls on discovery. Discovery belongs behind the explicit
+        # "Re-discover subsidiaries" action.
+        needs_discovery = False
+        print(f"  [lookup] {ticker}: read-only mode - using the stored profile "
+              f"(no discovery, no credits).")
 
     if needs_discovery:
         print(f"  [lookup] {ticker}: {'FORCED ' if force else ''}"
@@ -3845,6 +3937,13 @@ def _is_retryable(resp):
 
 def _chat(base, model, key, system, user, timeout=60):
     """One chat completion call with retry for transient failures."""
+    # --no-write (and therefore --dry-run) must not SPEND either. Tavily and EXA
+    # already refuse, but the AI call did not, so the "free" test command was the
+    # most expensive thing in the system - while GUIDE-NEWS.md promised it makes
+    # no paid calls. Returning None puts the caller on its fail-closed path.
+    if NO_WRITE:
+        print("  [ai] --no-write/--dry-run: skipping the AI call (no tokens used).")
+        return None
     url = base.rstrip("/") + "/chat/completions"
     payload = {
         "model": model,
@@ -4118,11 +4217,18 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
                     by_num[int(obj.get("number"))] = obj
                 except Exception:
                     continue
-        # Intra-batch dedup: if the AI marked item N as a duplicate of an
-        # EARLIER item in the same batch (same event, different URL/source),
-        # we still translate/store it, but flag is_dup so it never gets
-        # pushed. Chains resolve naturally: only items whose duplicate_of is
-        # already a kept (non-dup) item are dropped.
+        # FAIL CLOSED. If the AI answered nothing usable (outage, timeout after
+        # its retries, or a truncated response to a large batch), every item used
+        # to take the `obj = {}` defaults - importance 5 and push=True - which
+        # pass the floor of 4, so an outage pushed up to 10 unscored headlines
+        # AND wrote them into the repeat/event ledger, hiding the better coverage
+        # that followed. Unscored now means un-pushable: nothing is sent, the
+        # rows are still stored for browsing, and the next run retries.
+        ai_failed = not by_num
+        if ai_failed:
+            print(f"  [warn] AI analysis {ticker}: no usable response - storing "
+                  f"{len(ticker_items)} item(s) WITHOUT pushing them.",
+                  file=sys.stderr)
         kept_nums = set()
         for i, it in enumerate(ticker_items, 1):
             obj = by_num.get(i, {})
@@ -4142,8 +4248,14 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
             except Exception:
                 it["importance"] = 5
             it["sentiment"] = str(obj.get("sentiment") or "neutral").strip()
-            it["push"] = bool(obj.get("push", True))
-            it["reason"] = str(obj.get("reason") or "").strip()
+            if ai_failed:
+                # No usable AI response: unscored means UN-PUSHABLE (see above).
+                it["importance"] = 1
+                it["push"] = False
+                it["reason"] = "AI analysis unavailable - stored only"
+            else:
+                it["push"] = bool(obj.get("push", True))
+                it["reason"] = str(obj.get("reason") or "").strip()
             it["impact"] = str(obj.get("impact") or "").strip()
             it["is_known"] = bool(obj.get("known_event", False))
             enriched.append(it)
@@ -5422,12 +5534,20 @@ def select_push_items(enriched, config, conn=None, now=None):
     # Regulatory force-push: subsidiary penalties / regulatory action is the
     # core alpha - a code-level override so it is never buried by 1-10 scoring.
     # Computed BEFORE the age gate because regulatory items are exempt from it.
+    #
+    # ACTION words only, matched against the RAW headline. The old pattern also
+    # matched the AI's English translation and included bare topic words
+    # (监管 "regulation", 调查 - which also means "survey", and regulat), so any
+    # generic supervision story was forced to importance 8. Live example: a page
+    # titled "ayondo - my Community, my social investment network" was boosted to
+    # 8 and pushed because its translated title mentioned a fraud investigation.
     reg_pattern = re.compile(
-        r"(处罚|罚款|立案|约谈|调查|退市|监管|违规|delist|fraud|investigat|penalt|enforcement|regulat)",
-        re.IGNORECASE)
+        r"(行政处罚|处罚|罚款|没收|立案|被约谈|约谈|责令|整改|退市|摘牌|"
+        r"监管函|警示函|违规|"
+        r"\bdelist\w*|\bfines?\b|\bfined\b|\bpenalt\w*|\bfraud\b|\bindict\w*|"
+        r"enforcement action)", re.IGNORECASE)
     for it in unique:
-        hay = f"{it.get('title', '')} {it.get('title_en', '')}"
-        if reg_pattern.search(hay):
+        if reg_pattern.search(str(it.get("title") or "")):
             it["_regulatory"] = True
             it["importance"] = max(it.get("importance") or 0, 8)
             if it.get("category") in (None, "", "other"):
@@ -5446,10 +5566,12 @@ def select_push_items(enriched, config, conn=None, now=None):
 
     # (3) Repeat gate: has this STORY - or the corporate EVENT behind it -
     #     already been pushed for this ticker?
+    #
+    #     Regulatory items are exempt from the AGE gate (a penalty is news
+    #     whenever it surfaces) but NOT from this one: the old exemption let the
+    #     same regulatory-looking story be pushed run after run.
     if conn is not None:
         for it in unique:
-            if it.get("_regulatory"):
-                continue
             if _story_already_pushed(conn, it, now, event_window_days=event_window):
                 it["_repeat"] = True
         unique = [it for it in unique if not it.get("_repeat")]
@@ -5761,7 +5883,12 @@ def main():
                        if str(x).strip()]
             for t in tickers:
                 try:
-                    meta = ensure_company_meta(t, config, secrets)
+                    # persist=False + allow_discovery=False: introspection must
+                    # not write company_lookup.json, and must never spend EXA /
+                    # Tavily credits or AI calls (the panel calls this whenever
+                    # the Configuration tab is opened).
+                    meta = ensure_company_meta(t, config, secrets, persist=False,
+                                               allow_discovery=False)
                 except Exception as exc:
                     out[t] = {"error": str(exc)}
                     continue
@@ -6297,18 +6424,20 @@ def main():
     for it in macro_items:
         it["_tier"] = news_tier(f"{it.get('title', '')} {it.get('snippet', '')}")
     macro_core = [it for it in macro_items if it.get("_tier") == "macro"]
-    # Global items are stored under the "GLOBAL" pseudo-ticker.
-    global_items = []
-    for it in macro_items:
-        if it.get("_tier") == "global":
-            g = dict(it)
-            g["ticker"] = "GLOBAL"
-            global_items.append(g)
+    # Global items stay on the "MACRO" pseudo-ticker they were STORED under:
+    # relabelling the copies to "GLOBAL" made every later write (update_news_ai,
+    # mark_pushed) match zero rows, so those items kept importance IS NULL
+    # forever and were re-queued by rescue_orphans. The tier is passed to
+    # analyze_macro(pseudo=...) instead.
+    global_items = [it for it in macro_items if it.get("_tier") == "global"]
+
+    # Delivery state is DEFERRED until we know what Telegram accepted (see
+    # persist_push_state at the end of the run).
+    pending = {}
 
     macro_pushed = analyze_macro(macro_core, config, secrets, conn, run_start,
                                  pseudo="MACRO") if macro_core else []
-    for it in macro_core:
-        mark_pushed(conn, it, it in macro_pushed)
+    pending["CHINA MACRO"] = (macro_core, macro_pushed)
     if macro_core:
         print(f"  {len(macro_core)} China macro item(s) -> {len(macro_pushed)} "
               f"pushed (the 'must know' tier).")
@@ -6317,16 +6446,13 @@ def main():
     if global_items and config.get("global_markets", GLOBAL_MARKETS_DEFAULT):
         global_pushed = analyze_macro(global_items, config, secrets, conn,
                                       run_start, pseudo="GLOBAL")
-        for it in global_items:
-            mark_pushed(conn, it, it in global_pushed)
         print(f"  {len(global_items)} global-markets item(s) -> "
               f"{len(global_pushed)} pushed.")
     elif global_items:
-        for it in global_items:
-            mark_pushed(conn, it, False)
         print(f"  {len(global_items)} global-markets item(s) stored, not pushed "
               f"(global_markets is OFF - enable it in the panel if you want a "
               f"GLOBAL MARKETS section).")
+    pending["GLOBAL MARKETS"] = (global_items, global_pushed)
 
     macro_digest = format_macro(macro_pushed)
     global_digest = format_global_markets(global_pushed)
@@ -6335,9 +6461,8 @@ def main():
     sector_pushed = collect_sector_watch(sector_report, conn, config, secrets,
                                          run_start, meta_map=effective_meta) \
         if any(sector_report.values()) else []
-    for items in (sector_report or {}).values():
-        for it in items:
-            mark_pushed(conn, it, it in sector_pushed)
+    sector_all = [it for items in (sector_report or {}).values() for it in items]
+    pending["SECTOR CONTEXT"] = (sector_all, sector_pushed)
     if sector_pushed:
         print(f"  {len(sector_pushed)} sector-context item(s) pushed "
               f"(sector_watch is ON).")
@@ -6475,11 +6600,9 @@ def main():
         pushed = select_push_items(enriched, config, conn=conn, now=start_time)
         for it in enriched:
             update_news_ai(conn, it)
-        for it in enriched:
-            mark_pushed(conn, it, it in pushed)
-        # Remember what actually went out - the repeat gate reads this next run.
-        record_pushed_stories(conn, pushed, now=start_time)
-        record["sent_items"] = len(pushed)
+        # Delivery state is deferred to persist_push_state() once we know which
+        # sections Telegram accepted.
+        pending["DIGEST"] = (enriched, pushed)
         floor = _cfg_int(config, "push_min_importance", 4)
         max_digest = _cfg_int(config, "max_digest_items", 10)
         max_per_ticker = max(1, _cfg_int(config, "push_max_per_ticker", 2))
@@ -6508,6 +6631,7 @@ def main():
     if sector_digest:
         digests.append(("SECTOR CONTEXT", sector_digest))
 
+    delivered = set()
     if digests:
         if dry_run:
             for name, msg in digests:
@@ -6517,19 +6641,28 @@ def main():
                 print(msg)
                 print("=" * 60)
         elif token and chat_id:
-            sent_any = False
             for name, msg in digests:
                 if send_telegram(token, chat_id, msg)[0]:
-                    sent_any = True
+                    delivered.add(name)
                 else:
                     record["alerts_failed"] = \
                         record.get("alerts_failed", []) + [name.lower()]
-            if sent_any:
+                    print(f"  [warn] Telegram rejected the {name} section - its "
+                          f"items stay un-pushed and will be retried next run.",
+                          file=sys.stderr)
+            if delivered:
                 print(f"  Digest sent (macro {len(macro_pushed)} + global "
                       f"{len(global_pushed)} + regular {len(pushed)} + sector "
-                      f"{len(sector_pushed)} item(s)).")
+                      f"{len(sector_pushed)} item(s)); {len(delivered)}/"
+                      f"{len(digests)} section(s) delivered.")
+            elif record.get("alerts_failed"):
+                record["status"] = "error"
+                record["error"] = ("Telegram delivery failed: "
+                                   + ", ".join(record["alerts_failed"]))
         else:
-            print("  Digest ready but Telegram not configured.")
+            print("  Digest ready but Telegram is NOT configured - nothing was "
+                  "delivered, so nothing is marked as pushed (set the bot token "
+                  "and chat id in the panel's Configuration tab).")
     elif snapshot and token and chat_id and not dry_run:
         # Manual run with nothing push-worthy: deliver the current picture.
         snap_msg = build_snapshot(conn)
@@ -6551,6 +6684,13 @@ def main():
             print("  (snapshot: nothing notable in the last 24h)")
     else:
         print("  No items to push - nothing sent.")
+
+    # ---- persist delivery state: only what Telegram actually accepted ----
+    sent_count = persist_push_state(conn, pending, delivered, now=start_time)
+    record["sent_items"] = sent_count
+    if pending and not delivered and not dry_run and token and chat_id:
+        print(f"  NOTE: nothing was delivered, so all {sum(len(g) for g, _ in pending.values())} "
+              f"candidate item(s) stay un-pushed and will be retried next run.")
 
     conn.close()
     record["duration_sec"] = round((datetime.now(EASTERN) - start_time).total_seconds(), 2)
