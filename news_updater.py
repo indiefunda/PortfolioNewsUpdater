@@ -4021,6 +4021,11 @@ CHINA_ANCHOR_PATTERNS = [
     r"贷款市场报价利率", r"MLF", r"存款准备金",
     # A China index is a China story even though its name contains 纳斯达克.
     r"中国金龙", r"中概股",
+    # Unambiguous China markers. They matter because the generic rate words are
+    # NOT anchors: "央行降息 美联储加息预期降温 人民币汇率走强" is still a China
+    # story (人民币), while "匈牙利央行降息25个基点" has none of these and stays
+    # out of the China section.
+    r"人民币", r"A股", r"沪深", r"上证", r"深证", r"创业板", r"科创板",
 ]
 
 

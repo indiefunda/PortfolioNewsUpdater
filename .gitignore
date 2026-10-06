@@ -33,6 +33,7 @@ exa_usage.json
 company_lookup.json
 sec_validate.json
 panel_url.txt
+web_url.txt
 news_updater.lock
 *.log
 *.tmp

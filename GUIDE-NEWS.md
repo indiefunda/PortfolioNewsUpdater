@@ -469,6 +469,20 @@ reference to a local panel step. It is set in the panel's **Configuration** tab
 "web_url": "https://keen-wavelet-275120.web.app"
 ```
 
+### Finding the link again (three easy ways)
+
+`web_url` is the **first key** in `config_local.json`, so it is the first thing
+you see when the file opens. You should not need to open the file at all:
+
+| Way | What it does |
+|-----|--------------|
+| **Panel header** | The **🌐 Open news web app** button (top of the panel, on every tab) opens the page; **📋 Copy link** copies it; the address is printed right next to them |
+| **`web_url.txt`** | A one-line file in the project folder with just the address — written by the panel at startup and on every config upload (`type web_url.txt`) |
+| **`open_web.cmd`** | Double-click it to open the page. It reads `web_url.txt`, falling back to the config; `python open_web.py --print` just prints the link |
+
+If the button says no link is set, the config has an empty `web_url` — paste the
+address into the panel's Configuration tab once and it is remembered everywhere.
+
 **Set it in the panel, not just on the server.** The panel's `config_local.json`
 is the source of truth and is uploaded to the VM; editing only the VM's copy gets
 silently reverted the next time you click *Upload config to server*.

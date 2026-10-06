@@ -65,8 +65,7 @@ still used for the macro tier and for company discovery.)
    (**http://localhost:8001**; if that port is taken it uses 8002/8003 and the
    launcher opens the right one — a second copy refuses to start, so there is
    never more than one panel).
-5. In the panel — it is split into four tabs:
-   - **🔎 Deep search** — a one-off scan of any ticker. Nothing is saved; this
+5. In the panel — it is split into four tabs:   - **🔎 Deep search** — a one-off scan of any ticker. Nothing is saved; this
      is the tab it opens on.
    - **⚙️ Setup & schedule** — **Connect to Google** → Authenticate, then
      **Your server** → **Create/update free server** (creates the free VM and
@@ -81,6 +80,12 @@ still used for the macro tier and for company discovery.)
    updater auto-discovers each company's Chinese name, subsidiaries and
    websites, and alerts you on Telegram when it finds new ones. In Step 5 every
    stored row has an ✕ to delete it (with confirmation) if it is not useful.
+
+**Opening the hosted news page:** set `web_url` in the panel's Configuration tab
+once, then use the **🌐 Open news web app** button at the top of the panel — or
+double-click **`open_web.cmd`**. The address is also kept on its own line in
+`web_url.txt` and is the **first key** of `config_local.json`, so it is easy to
+find without digging through the config.
 
 > Your personal `config_local.json` (tickers/holdings) is created by the
 > panel on first upload and is **git-ignored — never committed**. For local

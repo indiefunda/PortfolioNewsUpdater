@@ -34,6 +34,9 @@ PORT = 8001
 # Written at startup with the URL the panel actually bound to, so the launcher
 # opens THIS panel rather than whatever else is listening on the default port.
 PANEL_URL_FILE = "panel_url.txt"
+# The hosted news page's address, as its own one-line file: the link is easy to
+# lose inside the ~40-key config, and this is what open_web.cmd reads.
+WEB_URL_FILE = "web_url.txt"
 
 # VM defaults (reuse the same free VM as the price monitor)
 VM_NAME = "stock-monitor"
@@ -216,6 +219,22 @@ def load_secrets():
 
 def save_config(cfg): _write_json(CONFIG_FILE, cfg)
 def save_secrets(sec): _write_json(SECRETS_FILE, sec)
+
+
+def write_web_url_file(url, base_dir=None):
+    """Mirror the news-page link into web_url.txt (one line).
+
+    The link lives in config_local.json, which is a long file; losing it there is
+    easy. This file, next to panel_url.txt, is what open_web.cmd reads and what
+    the panel prints at startup. Returns True when written.
+    """
+    path = os.path.join(base_dir or BASE_DIR, WEB_URL_FILE)
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(str(url or "").strip())
+        return True
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +554,11 @@ HTML = """<!DOCTYPE html>
 </head>
 <body>
   <h1>📰 PortfolioNewsUpdater — Cloud</h1>
+  <div class="row" style="margin:4px 0 8px">
+    <button class="btn-ok" id="webAppBtn" onclick="openWebApp()">🌐 Open news web app</button>
+    <button class="btn-ghost" onclick="copyWebUrl()">📋 Copy link</button>
+    <span class="status" id="webAppUrl" style="margin-bottom:0;flex:1">—</span>
+  </div>
   <div class="sub">Searches SEC (with 6-K/8-K content), Chinese news (乐信/分期乐… via Google News zh, Eastmoney, Tavily, official websites), English news and RSS — translates &amp; scores everything with AI, pushes the top items to Telegram. Runs twice a day at 9:15 ET (pre-open) &amp; 17:00 ET (post-close), auto-adjusted for DST.</div>
   <div class="tabs" id="tabbar">
     <button class="tab" data-tab="scan" onclick="showTab('scan')">🔎 Deep search</button>
@@ -768,6 +792,28 @@ function initTabs(){
 function showMsg(t, type){ const m=$('msg'); m.textContent=t; m.className='msg '+type;
   setTimeout(()=>{ m.className='msg'; }, 8000); }
 
+// The web-app link lives in the config (web_url) and in web_url.txt. These keep
+// it one click away instead of buried among ~40 config keys.
+let WEB_URL = '';
+function setWebUrl(u){
+  WEB_URL = String(u || '').trim();
+  const b = $('webAppBtn');
+  if (b) b.disabled = !WEB_URL;
+  $('webAppUrl').textContent = WEB_URL || 'No web app link set - add it in the Configuration tab (Web view URL), or in config_local.json as the first key';
+}
+function openWebApp(){
+  if (!WEB_URL){ showMsg('No web app link set yet - paste it into Configuration -> Web view URL.','err'); return; }
+  window.open(WEB_URL, '_blank', 'noopener');
+}
+function copyWebUrl(){
+  if (!WEB_URL){ showMsg('No web app link set yet.','err'); return; }
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(WEB_URL).then(
+      () => showMsg('Copied: ' + WEB_URL, 'ok'),
+      () => showMsg(WEB_URL, 'ok'));
+  } else { showMsg(WEB_URL, 'ok'); }
+}
+
 function renderChips(){ const el=$('chips'); el.innerHTML='';
   tickers.forEach(t=>{ const c=document.createElement('span'); c.className='chip';
     c.innerHTML=t+' <button onclick="removeTicker(\\''+t+'\\')">&times;</button>'; el.appendChild(c); }); }
@@ -830,6 +876,7 @@ async function load(){
   $('pushMinImportance').value = d.config.push_min_importance || dflt.push_min_importance || 4;
   $('pushMaxPerTicker').value = d.config.push_max_per_ticker || dflt.push_max_per_ticker || 2;
   $('webUrl').value = d.config.web_url || dflt.web_url || '';
+  setWebUrl($('webUrl').value);
   $('retentionDays').value = d.config.news_retention_days || dflt.news_retention_days || 21;
   $('tavilyDaily').value = d.config.tavily_max_daily_searches || dflt.tavily_max_daily_searches || 30;
   $('tavilyMonthly').value = d.config.tavily_max_monthly_searches || dflt.tavily_max_monthly_searches || 900;
@@ -945,6 +992,7 @@ async function uploadConfig(){
     lookup_refresh_days: 30,
   });
   $('log').textContent = d.output || '';
+  setWebUrl($('webUrl').value);
   showMsg(d.ok ? '✅ Config uploaded!' : '❌ '+d.error, d.ok?'ok':'err');
   loadCron(); loadNews(); }
 
@@ -2066,6 +2114,7 @@ class Handler(BaseHTTPRequestHandler):
             # An absent key keeps the existing value; an empty one clears it.
             if "web_url" in data:
                 cfg["web_url"] = str(data.get("web_url") or "").strip()
+                write_web_url_file(cfg["web_url"])
             # Secrets: ONLY overwrite a key the request actually carries.
             # `data.get(key, "")` used to erase any field the browser did not
             # send - and since the panel fills these inputs from /api/config, a
@@ -2169,6 +2218,17 @@ def main():
     except OSError:
         pass
     print(f"PortfolioNewsUpdater panel: {url}")
+    # Keep the news-page link easy to find: write it beside panel_url.txt at
+    # every start, so it survives even if the config is edited by hand.
+    try:
+        web = str(load_config().get("web_url") or "").strip()
+        if web:
+            write_web_url_file(web)
+            print(f"News web app: {web}   (also in {WEB_URL_FILE})")
+        else:
+            print(f"No news-page link set yet - add \"web_url\" to config_local.json.")
+    except Exception:
+        pass
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()
