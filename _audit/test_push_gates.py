@@ -111,7 +111,11 @@ repeats = [
 for label, title, url in repeats:
     it = {"ticker": "HUIZ", "source": "Exa", "title": title, "url": url,
           "title_en": title, "importance": 9, "push": True, "category": "earnings",
-          "lang": "en", "_story_tokens": nu.story_tokens(title)}
+          "lang": "en", "_story_tokens": nu.story_tokens(title),
+          # A date is REQUIRED now: an item with no usable publish date is
+          # stored but never pushed (it cannot be checked for freshness), which
+          # would otherwise mask the repeat gate this check is about.
+          "published_at": datetime.now(nu.EASTERN).strftime("%Y-%m-%d %H:%M:%S")}
     out = nu.select_push_items([it], cfg, conn=conn)
     ok = not out and it.get("_repeat")
     if not ok:

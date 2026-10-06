@@ -1349,6 +1349,20 @@ async function loadLogs(){
     if(r.error){
       rows += '<tr class="detail"><td colspan="6">'+escapeHtml(r.error)+'</td></tr>';
     }
+    // Per-source detail: "ran / 0 new" is otherwise indistinguishable from a
+    // quiet day, so show what each source actually contributed and flag the ones
+    // that have been silent for several runs.
+    const stats = r.source_stats || {};
+    const names = Object.keys(stats);
+    if(names.length){
+      const parts = names.map(n => n + ' ' + (stats[n].kept||0) + '/' + (stats[n].fetched||0) +
+        (stats[n].failed ? ' (' + stats[n].failed + ' failed)' : ''));
+      rows += '<tr class="detail"><td colspan="6" style="font-size:12px;color:#8b93a7">sources: '+
+        escapeHtml(parts.join(' · '))+'</td></tr>';
+    }
+    for(const w of (r.source_warnings || [])){
+      rows += '<tr class="detail"><td colspan="6" style="color:#f87171">⚠️ '+escapeHtml(w)+'</td></tr>';
+    }
   }
   wrap.innerHTML = '<div class="tablewrap"><table><thead><tr><th>Time (ET)</th><th>Status</th><th>Tickers</th><th>New</th><th>Sent</th><th>Duration</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
 }
@@ -1623,7 +1637,7 @@ class Handler(BaseHTTPRequestHandler):
             return False, "", why
         home = get_vm_home(zone)
         out, err = "", ""
-        files = ["news_updater.py", "requirements.txt", "setup_cloud.sh",
+        files = ["news_updater.py", "news_web.py", "requirements.txt", "setup_cloud.sh",
                  "config_local.json", "secrets_local.json"]
         for f in files:
             src = os.path.join(BASE_DIR, f)

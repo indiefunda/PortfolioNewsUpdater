@@ -234,23 +234,30 @@ the archive loads. Bookmark it on your phone's home screen.
 
 ### Keeping it fed (optional, after the first deploy works)
 
-Add **two** cron lines on the VM so the archive stays current. Keep them separate
-from the four news cron jobs — a failure here must never affect your digest:
+Add **DST-aware** cron lines on the VM so the archive stays current. Keep them
+separate from the news cron jobs — a failure here must never affect your digest:
 
 ```bash
 crontab -e
-# ~15 minutes after the two news runs (EDT/UTC values):
-30 13 * * 1-5 cd /home/Achilles && /usr/bin/python3 news_web.py \
-  --sync-firebase --project=keen-wavelet-275120 >> news_web.log 2>&1
-15 21 * * 1-5 cd /home/Achilles && /usr/bin/python3 news_web.py \
-  --sync-firebase --project=keen-wavelet-275120 >> news_web.log 2>&1
+# 15 minutes after each news run, in BOTH seasons (the out-of-season line is a
+# no-op because the news run it follows did nothing). This replaces the earlier
+# two-line version, which was NOT DST-aware and INVERTED in winter: in EST
+# 13:30/21:15 UTC are 08:30/16:15 ET, i.e. BEFORE the 09:15/17:00 ET news runs,
+# so the archive always mirrored the previous run and the last run of the day
+# only appeared the next morning - the page the digest links to was missing
+# exactly the items in the digest.
+30 13 * * 1-5 cd /home/Achilles && /usr/bin/python3 news_web.py --sync-firebase --project=keen-wavelet-275120 >> news_web.log 2>&1
+30 14 * * 1-5 cd /home/Achilles && /usr/bin/python3 news_web.py --sync-firebase --project=keen-wavelet-275120 >> news_web.log 2>&1
+15 21 * * 1-5 cd /home/Achilles && /usr/bin/python3 news_web.py --sync-firebase --project=keen-wavelet-275120 >> news_web.log 2>&1
+15 22 * * 1-5 cd /home/Achilles && /usr/bin/python3 news_web.py --sync-firebase --project=keen-wavelet-275120 >> news_web.log 2>&1
+15 23 * * 1-5 cd /home/Achilles && /usr/bin/python3 news_web.py --sync-firebase --project=keen-wavelet-275120 >> news_web.log 2>&1
+15  0 * * 1-5 cd /home/Achilles && /usr/bin/python3 news_web.py --sync-firebase --project=keen-wavelet-275120 >> news_web.log 2>&1
 ```
 
-**Two lines, not four.** Unlike `news_updater.py`, the sync has no schedule
-guard, so adding the winter pair as well would make it run four times a day. It
-does not need the guard: firing an hour late in winter is irrelevant for a data
-sync, and a repeat sync is nearly free anyway — the manifest means unchanged rows
-are never rewritten, so a no-op sync writes exactly one small document.
+**Six lines** (the 09:15, 17:00 and 19:00 ET runs, in both EDT and EST). The
+sync has no schedule guard of its own, so it simply follows whichever news run
+actually happened; a redundant sync is nearly free because the manifest means
+unchanged rows are never rewritten.
 
 ### If something goes wrong
 

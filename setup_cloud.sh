@@ -200,6 +200,30 @@ else
 fi
 rm -f "$TMPCRON"
 
+# --- 3b. Bound the log files ------------------------------------------------
+#
+# The cron jobs append with ">> $LOG 2>&1" and nothing rotated them: on the free
+# tier's disk a chatty failure path grows the file forever, and the end state is
+# ugly (SQLite writes start failing and the panel shows a stale run history with
+# no explanation). logrotate keeps the last few weeks and truncates in place, so
+# the running cron keeps appending to the same inode.
+if command -v logrotate >/dev/null 2>&1 || sudo test -d /etc/logrotate.d; then
+  sudo tee /etc/logrotate.d/news-updater >/dev/null <<'LOGROTATE'
+# PortfolioNewsUpdater: keep the run logs bounded (installed by setup_cloud.sh).
+/home/*/news_updater.log /home/*/news_web.log {
+    weekly
+    rotate 4
+    size 5M
+    missingok
+    notifempty
+    copytruncate
+}
+LOGROTATE
+  echo "  ✅ logrotate rule installed (/etc/logrotate.d/news-updater)"
+else
+  echo "  ⚠️  logrotate not available - logs are not rotated (install logrotate)"
+fi
+
 # Report what is actually installed, and whether the daemon will run it.
 echo "  Installed job(s):"
 "$CRONTAB" -l 2>/dev/null | "$GREP" -F 'news_updater' || echo "  (user crontab: none)"

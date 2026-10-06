@@ -432,6 +432,39 @@ def append_run_record(record):
         print(f"  [error] could not write run history: {exc}", file=sys.stderr)
 
 
+# How many consecutive empty runs before a source is called broken rather than
+# quiet. A source returning nothing looks identical to a quiet news day, and a
+# source that has been silently empty for weeks shows green badges everywhere.
+SOURCE_SILENT_RUNS = 5
+
+
+def source_health_warnings(source_stats, history=None, runs=SOURCE_SILENT_RUNS):
+    """
+    Sources that fetched items successfully but kept NONE, for several runs.
+
+    Needs real evidence: it reads the stored run history, so it stays quiet until
+    at least 'runs'-1 previous runs recorded the same source (older records have
+    no `source_stats` field and are ignored rather than counted as zeros).
+    """
+    history = load_run_history() if history is None else history
+    # Run history is newest-first (append_run_record inserts at 0), so the most
+    # recent (runs - 1) completed runs are simply its head.
+    recent = list(history or [])[:max(0, runs - 1)] if runs > 1 else []
+    out = []
+    for name, st in sorted((source_stats or {}).items()):
+        if st.get("failed") or st.get("fetched"):
+            continue                      # producing, or failing loudly
+        seen = [((r.get("source_stats") or {}).get(name) or {}) for r in recent]
+        # Stay quiet until the full window has recorded this source: otherwise a
+        # freshly deployed field would warn on its first run.
+        if len(recent) < max(1, runs - 1) or not seen or any(not s for s in seen):
+            continue
+        if all(s.get("fetched") == 0 for s in seen):
+            out.append(f"{name} kept 0 items across {len(seen) + 1} runs - it may be "
+                       f"broken (the delta still advances, so nothing is retried).")
+    return out
+
+
 # Progress of the run currently in flight. main() publishes these so the
 # top-level crash handler at the bottom of this file can report how far the run
 # actually got, instead of writing a row of zeros that reads like "it ran and
@@ -597,10 +630,18 @@ _ORD_Q = {"first": "1", "second": "2", "third": "3", "fourth": "4"}
 # event must come before a general one ("...EGM to Extend Convertible Notes"
 # is a convertible-note event, not a generic EGM).
 _EVENT_NAME_PATTERNS = [
+    # NOTE: `\bresults\b` and the Chinese interim/annual-report words matter.
+    # Without them the commonest real phrasings produced NO event key at all -
+    # "Qifu Technology Q3 2026 Results", "…2Q26 Results", 乐信中报, 上半年业绩 -
+    # so the same quarter could be pushed again and again from different outlets
+    # whenever the token-similarity fallback also missed (verified 2026-10-07).
     (r"earnings call|earnings results|financial results|quarter(?:ly)? ended|"
      r"results for the (?:quarter|year|period)|full[- ]year results|"
+     r"\bresults\b|"
      r"季度业绩|业绩电话会议|业绩发布|财报|年度业绩|业绩公告|业绩说明会|"
-     r"中期业绩|业绩报告", "earnings"),
+     r"中期业绩|业绩报告|中报|半年报|半年度业绩|上半年业绩|全年业绩|年报|"
+     r"年度报告|业绩快报|业绩预告|净利润",
+     "earnings"),
     (r"converts?ible (?:notes?|bond)|可转换(?:债券|票据)", "connote"),
     (r"share (?:issuance|placement)|配股|增发|供股", "shareissue"),
     (r"dividend|分红|派息", "dividend"),
@@ -2180,6 +2221,31 @@ def save_lookup(data):
     _write_json(COMPANY_LOOKUP_FILE, data)
 
 
+def _grounded_names(names, snippets, existing=None):
+    """
+    Drop AI-extracted names that do not actually occur in the snippets.
+
+    The discovery prompt says "never invent a brand name" and "ONLY include
+    names you can support from the search results", but nothing enforced it: a
+    hallucinated subsidiary became a live search term, spending the 8-term
+    budget on a name that does not exist (and pulling news for whatever it
+    resembles). Existing (config-seeded) names are never filtered - they are the
+    user's own data.
+    """
+    hay = re.sub(r"[\s\W_]+", "", " ".join(snippets or []), flags=re.UNICODE).lower()
+    keep = {re.sub(r"[\s\W_]+", "", str(x), flags=re.UNICODE).lower()
+            for x in (existing or []) if str(x).strip()}
+    out = []
+    for name in names or []:
+        raw = str(name or "").strip()
+        if not raw:
+            continue
+        key = re.sub(r"[\s\W_]+", "", raw, flags=re.UNICODE).lower()
+        if key in keep or (key and key in hay):
+            out.append(raw)
+    return out
+
+
 def seed_lookup_from_config(config, lookup):
     """
     Merge config_local.json ticker_meta into the lookup (config wins, fills
@@ -2701,6 +2767,18 @@ def discover_company(ticker, config, secrets, existing=None, persist=True):
         content = _chat(base, model, ai_key, "You are a precise JSON-returning assistant.", prompt)
         parsed = _parse_json_object(content) if content else None
         if parsed:
+            # Anti-hallucination: keep only names the snippets actually support.
+            for k in ("aliases_zh", "subsidiaries_zh", "subsidiaries_other", "keywords"):
+                before = [str(x) for x in (parsed.get(k) or [])]
+                if not before:
+                    continue
+                grounded = _grounded_names(before, snippets, existing.get(k))
+                dropped = len(before) - len(grounded)
+                if dropped:
+                    print(f"  [discovery] {ticker}: dropped {dropped} {k} name(s) "
+                          f"not present in the search results "
+                          f"({[x for x in before if x not in grounded][:4]}).")
+                parsed[k] = grounded
             entry = _merge_lookup_entry(entry, parsed)
             print(f"  [discovery] {ticker}: extracted profile "
                   f"(zh={entry.get('name_zh') or '?'}, "
@@ -5685,12 +5763,20 @@ def select_push_items(enriched, config, conn=None, now=None):
             if it.get("category") in (None, "", "other"):
                 it["category"] = "regulatory"
 
-    # (2) Age gate.
+    # (2) Age gate. An item with NO usable publish date cannot be checked for
+    #     freshness at all - it may be years old (two such rows were pushed) - so
+    #     it is stored but never pushed. Regulatory items keep their exemption.
     if max_age > 0:
         fresh = []
         for it in unique:
             age = _item_age_hours(it)
-            if age is not None and age > max_age and not it.get("_regulatory"):
+            if it.get("_regulatory"):
+                fresh.append(it)
+                continue
+            if age is None:
+                it["_undated"] = True
+                continue
+            if age > max_age:
                 it["_too_old"] = True
                 continue
             fresh.append(it)
@@ -5709,15 +5795,20 @@ def select_push_items(enriched, config, conn=None, now=None):
         unique = [it for it in unique if not it.get("_repeat")]
 
     # (5) Importance floor + AI veto: push=false is honored as a veto, and
-    # nothing below the floor is pushed (kills low-score noise).
-    if push_mode == "score":
-        candidates = [it for it in unique
-                      if it.get("push", True)
-                      and (it.get("importance") or 0) >= max(floor, min_score)]
-    else:
-        candidates = [it for it in unique
-                      if it.get("push", True)
-                      and (it.get("importance") or 0) >= floor]
+    # nothing below the floor is pushed (kills low-score noise). Rejections are
+    # MARKED so the run log can say why an item did not make it - the counters
+    # used to omit the floor and seat drops entirely, which made "N stored"
+    # unexplainable.
+    thresh = max(floor, min_score) if push_mode == "score" else floor
+    candidates = []
+    for it in unique:
+        if not it.get("push", True):
+            it["_vetoed"] = True
+            continue
+        if (it.get("importance") or 0) < thresh:
+            it["_below_floor"] = True
+            continue
+        candidates.append(it)
 
     candidates.sort(
         key=lambda it: ((it.get("importance") or 0), 1 if it.get("lang") == "zh" else 0),
@@ -5749,15 +5840,24 @@ def select_push_items(enriched, config, conn=None, now=None):
             pushed.append(pool.pop(0))
             counts[t] = counts.get(t, 0) + 1
             progressed = True
+    # Anything that was a candidate but found no seat (per-ticker cap or the
+    # digest cap) is marked so the run log can account for it.
+    seated = {id(it) for it in pushed}
+    for it in candidates:
+        if id(it) not in seated:
+            it["_no_seat"] = True
     return pushed
 
 
 def push_decision_counts(enriched):
     """Per-reason counters for the 'why wasn't this pushed' run log."""
-    counts = {"too_old": 0, "repeat": 0, "event_repeat": 0, "same_story": 0,
-              "dup": 0, "known": 0, "vetoed": 0, "below_floor": 0}
+    counts = {"undated": 0, "too_old": 0, "repeat": 0, "event_repeat": 0,
+              "same_story": 0, "dup": 0, "known": 0, "vetoed": 0,
+              "below_floor": 0, "no_seat": 0}
     for it in enriched:
-        if it.get("_too_old"):
+        if it.get("_undated"):
+            counts["undated"] += 1
+        elif it.get("_too_old"):
             counts["too_old"] += 1
         elif it.get("_repeat"):
             counts["event_repeat" if it.get("_event_repeat") else "repeat"] += 1
@@ -5767,8 +5867,12 @@ def push_decision_counts(enriched):
             counts["dup"] += 1
         elif it.get("is_known"):
             counts["known"] += 1
-        elif not it.get("push", True):
+        elif it.get("_vetoed") or not it.get("push", True):
             counts["vetoed"] += 1
+        elif it.get("_below_floor"):
+            counts["below_floor"] += 1
+        elif it.get("_no_seat"):
+            counts["no_seat"] += 1
     return {k: v for k, v in counts.items() if v}
 
 
@@ -6285,6 +6389,9 @@ def main():
     # Per-ticker sector_watch candidates + drop counters for the run log.
     sector_report = {}
     dropped_report = {}
+    # Per-source fetched/kept counts, persisted with the run so a source that has
+    # gone quiet is visible instead of looking like a quiet news day.
+    source_stats = {}
 
     for ticker in tickers:
         # The lookup step: pull the company profile (Chinese name, aliases,
@@ -6336,6 +6443,9 @@ def main():
             if items is None:
                 print(f"  [warn] {ticker} {source} fetch failed - NOT advancing "
                       f"delta (will retry from {since_dt.strftime('%Y-%m-%d %H:%M')}).")
+                stat = source_stats.setdefault(source, {"fetched": 0, "kept": 0,
+                                                        "failed": 0})
+                stat["failed"] += 1
                 return None
             for item in items:
                 item["_source_status"] = status
@@ -6347,6 +6457,13 @@ def main():
                                   sector_items=_sector_items,
                                   run_start=run_start, report=ingest_report)
             set_last_fetched(conn, ticker, source, now_utc_str)
+            # Per-source observability: 'ran / 0 new' is otherwise
+            # indistinguishable from a quiet day, and a source that has been
+            # silently empty for weeks looks like healthy green badges.
+            stat = source_stats.setdefault(source, {"fetched": 0, "kept": 0,
+                                                    "failed": 0})
+            stat["fetched"] += len(keeps)
+            stat["kept"] += accept or 0
             return accept
 
         # 1) SEC filings (English, ADR regulatory coverage). A filing IS about
@@ -6845,6 +6962,18 @@ def main():
               f"candidate item(s) stay un-pushed and will be retried next run.")
 
     conn.close()
+    record["source_stats"] = source_stats
+    if source_stats:
+        summary = ", ".join(
+            f"{name} {st['kept']}/{st['fetched']}"
+            + (f" ({st['failed']} failed)" if st.get("failed") else "")
+            for name, st in sorted(source_stats.items()))
+        print(f"  Sources (kept/fetched): {summary}")
+        silent = source_health_warnings(source_stats)
+        for line in silent:
+            print(f"  [warn] {line}")
+        if silent:
+            record["source_warnings"] = silent
     record["duration_sec"] = round((datetime.now(EASTERN) - start_time).total_seconds(), 2)
     append_run_record(record)
 
