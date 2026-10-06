@@ -318,13 +318,25 @@ def _parse_pub(s, naive_tz=EASTERN):
     except Exception:
         pass
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S",
-                "%a, %d %b %Y %H:%M:%S %Z", "%a, %d %b %Y %H:%M:%S %z",
+                # Numeric offsets BEFORE the named-zone form: strptime drops the
+                # zone for %Z and returns a naive datetime, which used to be
+                # stamped with naive_tz - so every Tavily "… GMT" timestamp was
+                # stored 4-5 hours in the FUTURE.
+                "%a, %d %b %Y %H:%M:%S %z",
+                "%a, %d %b %Y %H:%M:%S %Z",
                 "%a, %d %b %Y %H:%M:%S", "%Y-%m-%dT%H:%M:%S%z",
                 "%Y-%m-%dT%H:%M:%SZ"):
         try:
             dt = datetime.strptime(s, fmt)
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=naive_tz)
+                tz = naive_tz
+                # A named zone strptime could not resolve: GMT/UTC really are
+                # UTC, so do not relabel them as Eastern.
+                if fmt.endswith("%Z"):
+                    upper = s.upper()
+                    if "GMT" in upper or "UTC" in upper:
+                        tz = ZoneInfo("UTC")
+                dt = dt.replace(tzinfo=tz)
                 if date_only:
                     dt = dt.replace(hour=NOON_HOUR, minute=0, second=0)
             return dt.astimezone(EASTERN)
@@ -2990,7 +3002,22 @@ def fetch_rss(url, ticker, since_dt=None, source="RSS", lang="en"):
         resp = requests.get(url, headers=HEADERS, timeout=20)
         resp.raise_for_status()
         parsed = feedparser.parse(resp.content)
-        for entry in parsed.entries[:30]:
+
+        def _entry_dt(entry):
+            t = entry.get("published_parsed") or entry.get("updated_parsed")
+            return datetime(*t[:6], tzinfo=ZoneInfo("UTC")) if t else None
+
+        # NEWEST FIRST, then cap. Google News returns results in RELEVANCE
+        # order, and its top entries are regularly years old (measured
+        # 2026-10-06: the LX zh feed's first entries reached back to 2024). Taking
+        # entries[:30] before sorting therefore threw away the few fresh items
+        # and still advanced the delta, so the source looked "quiet" while it was
+        # hiding news.
+        entries = sorted(
+            parsed.entries,
+            key=lambda e: _entry_dt(e) or datetime.min.replace(tzinfo=ZoneInfo("UTC")),
+            reverse=True)
+        for entry in entries[:RSS_MAX_ITEMS]:
             title = entry.get("title", "").strip()
             link = entry.get("link", "") or url
             if not title:
@@ -3043,13 +3070,46 @@ def fetch_rss(url, ticker, since_dt=None, source="RSS", lang="en"):
         return None
 
 
-def google_news_url(query, lang="en"):
+def google_news_url(query, lang="en", edition=None):
     """Google News RSS URL. For zh we force Chinese results (hl/gl/ceid)."""
     q = urllib.parse.quote_plus(query)
     if lang == "zh":
+        hl, gl, ceid = edition or GOOGLE_NEWS_EDITIONS_ZH[0]
         return (f"https://news.google.com/rss/search?q={q}"
-                f"&hl=zh-CN&gl=CN&ceid=CN:zh-Hans")
+                f"&hl={hl}&gl={gl}&ceid={ceid}")
     return f"https://news.google.com/rss/search?q={q}"
+
+
+def fetch_google_news_zh(query, ticker, since_dt, source="GoogleNewsZH", editions=None):
+    """
+    Merge the Chinese Google News editions, newest first.
+
+    No single edition is best for every name: measured 2026-10-06 the CN edition
+    had nothing fresher than 353 h for 乐信 while the HK edition had 132 h, and
+    the CN edition was clearly best for 奇富科技/元保. One extra free request per
+    ticker per run buys the freshest of both. Returns None only when EVERY
+    edition failed, so a total failure still does not advance the delta.
+    """
+    out, seen, failed = [], set(), 0
+    eds = editions or GOOGLE_NEWS_EDITIONS_ZH
+    for ed in eds:
+        res = fetch_rss(google_news_url(query, "zh", ed), ticker, since_dt,
+                        source=source, lang="zh")
+        if res is None:
+            failed += 1
+            continue
+        for it in res:
+            key = normalize_title(it.get("title", ""))
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            out.append(it)
+    if failed == len(eds):
+        return None
+    floor = datetime.min.replace(tzinfo=EASTERN)
+    out.sort(key=lambda it: _parse_pub(it.get("date", "")) or floor, reverse=True)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -3076,7 +3136,13 @@ def fetch_eastmoney_search(query, since_dt=None, limit=10, terms=None):
         "clientVersion": "curr",
         "param": {
             "cmsArticleWebOld": {
-                "searchScope": "default",
+                # "title", NOT "default": full-text scope returns articles that
+                # merely mention the keyword anywhere in the body, so with the
+                # fetcher's own title filter in place the source was effectively
+                # dead. Measured 2026-10-06, per ticker: 陆金所 default 10 raw ->
+                # 0 usable vs title 10 -> 10; 奇富科技 10 -> 3 vs 10 -> 10;
+                # 慧择 10 -> 0 vs 5 -> 4; 分期乐 10 -> 0 vs 1 -> 1.
+                "searchScope": "title",
                 "sort": "time",          # newest first
                 "pageIndex": 1,
                 "pageSize": limit,
@@ -3630,6 +3696,23 @@ def fetch_exa(query, secrets, config, since_dt=None, limit=6, with_text=False,
 # 格隆汇's API is unstable - not worth the fragility.
 EASTMONEY_724_API = "https://np-listapi.eastmoney.com/comm/web/getFastNewsList"
 SINA_724_API = "https://zhibo.sina.com.cn/api/zhibo/feed"
+# How many pages of each wire to walk per run. Measured 2026-10-06: Eastmoney
+# pageSize=200 covers ~14 h and Sina page_size=100 covers ~2.5 h, while runs are
+# 8-16 h apart - one page each silently discarded most of the tape.
+EASTMONEY_WIRE_PAGES = 2
+# Sina's page holds ~2.5 h, so covering the 16 h overnight gap needs ~7 pages.
+SINA_WIRE_PAGES = 10
+# Newest-first cap applied AFTER sorting by date (Google News returns
+# relevance-ordered entries whose top items can be years old).
+RSS_MAX_ITEMS = 30
+# Google News editions merged for the Chinese feed. No single edition is best for
+# every name (measured 2026-10-06: CN had nothing fresher than 353 h for 乐信
+# while HK had 132 h; CN was much fresher for 奇富科技/元保). Order matters only
+# as the default; results are merged and sorted newest-first anyway.
+GOOGLE_NEWS_EDITIONS_ZH = (
+    ("zh-CN", "CN", "CN:zh-Hans"),
+    ("zh-HK", "HK", "HK:zh-Hant"),
+)
 WIRE_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"),
@@ -3637,31 +3720,50 @@ WIRE_HEADERS = {
 }
 
 
-def fetch_eastmoney_724(limit=50):
+def fetch_eastmoney_724(limit=200, pages=EASTMONEY_WIRE_PAGES):
     """
-    Eastmoney 7x24 breaking-news wire (kuaixun). Returns a list of raw items
-    (ticker/source filled by the caller), or None on failure (so no delta is
-    advanced for that wire).
+    Eastmoney 7x24 breaking-news wire (kuaixun), paginated.
+
+    Returns a list of raw items (ticker/source filled by the caller), or None on
+    failure (so no delta is advanced for that wire).
+
+    ONE page was never enough: measured 2026-10-06, pageSize=50 spans 4 h 17 m
+    and pageSize=200 spans 14 h 17 m, while the runs are 8-16 h apart - so the
+    majority of every window was never even requested, and because the delta
+    then advanced, those items could never be recovered. The API paginates
+    backwards with the `sortEnd` cursor it returns in `data`.
     """
-    try:
-        resp = requests.get(
-            EASTMONEY_724_API,
-            params={"client": "web", "biz": "web_724", "fastColumn": "102",
-                    "sortEnd": "", "pageSize": str(limit),
-                    "req_trace": str(int(time.time() * 1000))},
-            headers={**WIRE_HEADERS, "Referer": "https://kuaixun.eastmoney.com/"},
-            timeout=20,
-        )
-        resp.raise_for_status()
-        items = []
-        for it in (resp.json().get("data") or {}).get("fastNewsList") or []:
+    items, seen_ids, sort_end = [], set(), ""
+    for _ in range(max(1, pages)):
+        try:
+            resp = requests.get(
+                EASTMONEY_724_API,
+                params={"client": "web", "biz": "web_724", "fastColumn": "102",
+                        "sortEnd": sort_end, "pageSize": str(limit),
+                        "req_trace": str(int(time.time() * 1000))},
+                headers={**WIRE_HEADERS, "Referer": "https://kuaixun.eastmoney.com/"},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data") or {}
+            page = data.get("fastNewsList") or []
+        except Exception as exc:
+            print(f"  [error] Eastmoney 7x24 wire: {exc}", file=sys.stderr)
+            return items if items else None
+        if not page:
+            break
+        for it in page:
             title = strip_tags(it.get("title") or "") or strip_tags(it.get("summary") or "")
             if not title:
                 continue
+            ident = str(it.get("code") or title)
+            if ident in seen_ids:
+                continue
+            seen_ids.add(ident)
             items.append({
                 "source": "",
                 "ticker": "",
-                "id": str(it.get("code") or title),
+                "id": ident,
                 "title": title,
                 "url": it.get("url") or "",
                 # showTime is Beijing wall-clock - normalize to ET.
@@ -3669,36 +3771,52 @@ def fetch_eastmoney_724(limit=50):
                 "lang": "zh",
                 "snippet": strip_tags(it.get("summary") or "")[:300],
             })
-        return items
-    except Exception as exc:
-        print(f"  [error] Eastmoney 7x24 wire: {exc}", file=sys.stderr)
-        return None
+        nxt = str(data.get("sortEnd") or "")
+        if not nxt or nxt == sort_end:
+            break          # no cursor (or it did not move): this was the last page
+        sort_end = nxt
+    return items
 
 
-def fetch_sina_724(limit=100):
+def fetch_sina_724(limit=100, pages=SINA_WIRE_PAGES):
     """
-    Sina 7x24 fast-news wire (财经7x24). Returns a list of raw items, or None
-    on failure.
+    Sina 7x24 fast-news wire (财经7x24), paginated backwards.
+
+    One page of 100 spans only ~2.5 h (measured 2026-10-06) against 8-16 h
+    between runs, so the page number is walked until a page is empty, a page
+    repeats, or the cap is reached. Returns a list of raw items, or None on
+    failure (nothing at all retrieved).
     """
-    try:
-        resp = requests.get(
-            SINA_724_API,
-            params={"page": "1", "page_size": str(limit), "zhibo_id": "152",
-                    "tag_id": "0", "dire": "f", "dpc": "1"},
-            headers={**WIRE_HEADERS, "Referer": "https://finance.sina.com.cn/7x24/"},
-            timeout=20,
-        )
-        resp.raise_for_status()
-        items = []
-        for it in (((resp.json().get("result") or {}).get("data") or {})
-                   .get("feed") or {}).get("list") or []:
+    items, seen_ids = [], set()
+    for page in range(1, max(1, pages) + 1):
+        try:
+            resp = requests.get(
+                SINA_724_API,
+                params={"page": str(page), "page_size": str(limit), "zhibo_id": "152",
+                        "tag_id": "0", "dire": "f", "dpc": "1"},
+                headers={**WIRE_HEADERS, "Referer": "https://finance.sina.com.cn/7x24/"},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            lst = (((resp.json().get("result") or {}).get("data") or {})
+                   .get("feed") or {}).get("list") or []
+        except Exception as exc:
+            print(f"  [error] Sina 7x24 wire (page {page}): {exc}", file=sys.stderr)
+            return items if items else None
+        fresh = 0
+        for it in lst:
             title = strip_tags(it.get("rich_text") or it.get("text") or "")
             if not title:
                 continue
+            ident = str(it.get("id") or title)
+            if ident in seen_ids:
+                continue
+            seen_ids.add(ident)
+            fresh += 1
             items.append({
                 "source": "",
                 "ticker": "",
-                "id": str(it.get("id") or title),
+                "id": ident,
                 "title": title[:200],
                 "url": "",
                 # create_time is Beijing wall-clock - normalize to ET.
@@ -3706,10 +3824,9 @@ def fetch_sina_724(limit=100):
                 "lang": "zh",
                 "snippet": title[:300],
             })
-        return items
-    except Exception as exc:
-        print(f"  [error] Sina 7x24 wire: {exc}", file=sys.stderr)
-        return None
+        if fresh == 0:
+            break          # the feed ran out: no need to ask for page N+1
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -5975,13 +6092,12 @@ def main():
 
         # 2) Chinese sources (the alpha) - require Chinese search terms.
         if zh_terms:
-            # Google News, Chinese edition.
+            # Google News, Chinese editions (CN + HK merged, newest first).
             if src_on("google_news_zh"):
-                zh_query = " OR ".join(zh_terms)
+                zh_query = " ".join(zh_terms[:3]) + " when:14d"
                 fetch_source(
                     "GoogleNewsZH",
-                    lambda sd: fetch_rss(google_news_url(zh_query, "zh"), ticker, sd,
-                                         source="GoogleNewsZH", lang="zh"),
+                    lambda sd: fetch_google_news_zh(zh_query, ticker, sd),
                     src_status("google_news_zh"))
 
             # Eastmoney search - one query per term (capped), already
