@@ -46,7 +46,7 @@ for season, u in cron:
     print(f"  {season:6} -> {u:%H:%M} UTC   cron \"{u.minute:02d} {u.hour:02d} * * 1-5\"   "
           f"{'*** PEAK - double cost ***' if peak else 'off-peak OK'}")
 
-print(f"\ncron lines generated              = {len(cron)} (expect 6)")
+print(f"\ncron lines generated              = {len(cron)} (expect 4)")
 print(f"all off-peak                      = {all_offpeak}")
 
 
@@ -81,17 +81,17 @@ for name, day in probe_days:
             survivors.append(f"{season} {ref:%H:%M}UTC -> {fire.astimezone(E):%H:%M} ET")
     seasons = {s.split()[0] for s in survivors}
     print(f"  {name:9} {day:%a %Y-%m-%d}: {len(survivors)} run(s) -> {survivors}")
-    # Exactly 3 real runs (09:15 pre-open, 17:00 post-close, 19:00 Asia-open),
-    # and every one of them must come from a SINGLE season - if both seasons
-    # passed, the day would get 6.
-    if len(survivors) != 3 or len(seasons) != 1:
+    # Exactly 2 real runs (09:15 pre-open + 17:00 post-close), and every one of
+    # them must come from a SINGLE season - if both seasons passed, the day would
+    # get 4.
+    if len(survivors) != 2 or len(seasons) != 1:
         ok = False
 
 print()
 if ok and all_offpeak:
-    print("RESULT: PASS - three real runs per day in every season and across "
-          "both DST transitions; all six cron lines land off-peak")
+    print("RESULT: PASS - two real runs per day in every season and across "
+          "both DST transitions; all four cron lines land off-peak")
     sys.exit(0)
-print("RESULT: FAIL - the generated schedule does not deliver exactly three "
+print("RESULT: FAIL - the generated schedule does not deliver exactly two "
       "off-peak runs per day")
 sys.exit(1)

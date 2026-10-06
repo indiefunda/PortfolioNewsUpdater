@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Verify the cron slots + schedule guard produce exactly three runs per day in
+"""Verify the cron slots + schedule guard produce exactly two runs per day in
 each DST season, and that every real slot is off-peak for DeepSeek."""
 import importlib.util
 import sys
@@ -15,8 +15,8 @@ spec.loader.exec_module(nu)
 
 UTC = ZoneInfo("UTC")
 PEAK = [(1, 4), (6, 10)]           # DeepSeek double-price windows (UTC, Mon-Fri)
-CRON_SLOTS = [(13, 15), (21, 0), (23, 0), (14, 15), (22, 0), (0, 0)]   # what cron now fires
-EXPECTED_RUNS_PER_DAY = 3
+CRON_SLOTS = [(13, 15), (21, 0), (14, 15), (22, 0)]   # what cron now fires
+EXPECTED_RUNS_PER_DAY = 2
 
 print("cron slots (UTC) -> behavior")
 print("-" * 72)
@@ -64,7 +64,7 @@ for label, month, day in (("EDT week", 7, 6), ("EST week", 1, 5)):
                 fired += 1
                 if any(lo <= hh < hi for lo, hi in PEAK):
                     peak_fired += 1
-    expected = EXPECTED_RUNS_PER_DAY * 5     # three runs x five weekdays
+    expected = EXPECTED_RUNS_PER_DAY * 5     # two runs x five weekdays
     good = fired == expected and peak_fired == 0
     if not good:
         fail += 1

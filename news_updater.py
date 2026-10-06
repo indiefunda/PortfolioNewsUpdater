@@ -5885,7 +5885,7 @@ def push_decision_counts(enriched):
 # ---------------------------------------------------------------------------
 # Schedule guard
 # ---------------------------------------------------------------------------
-# Three runs a day, pinned to US market time. All are deliberately placed
+# TWO runs a day, pinned to US market time. Both are deliberately placed
 # OUTSIDE DeepSeek's peak-pricing windows (01:00-04:00 / 06:00-10:00 UTC
 # Mon-Fri, when API tokens cost DOUBLE). Verified for both DST seasons:
 #
@@ -5893,27 +5893,27 @@ def push_decision_counts(enriched):
 #                                                   14:15 UTC (EST, winter)
 #   Run 2  17:00 ET (one hour after the 16:00 close) -> 21:00 UTC (EDT)
 #                                                      22:00 UTC (EST)
-#   Run 3  19:00 ET (= 07:00 Beijing, the Chinese pre-open news morning)
-#                                                  -> 23:00 UTC (EDT)
-#                                                     00:00 UTC (EST)
-#
-# Run 3 exists because Chinese news breaks during the Asian session; without it
-# nothing is read between 17:00 ET and 09:15 ET the next morning (~16 h). 19:00
-# ET is the sweet spot: it is the Chinese pre-open window AND off-peak in both
-# seasons, so it costs half price. (The older 23:00 ET third run was removed for
-# cost because 23:00 ET = 03:00/04:00 UTC sits INSIDE the peak window.)
 #
 # cron fires at fixed UTC times and installs BOTH seasons' jobs (see
 # setup_cloud.sh); the guard below makes the out-of-season job an instant no-op,
-# so exactly three real runs happen per day.
-SCHEDULE_RUN_TIMES = (dtime(9, 15), dtime(17, 0), dtime(19, 0))
+# so exactly two real runs happen per day.
+#
+# A third run at 19:00 ET (= 07:00 Beijing, the Chinese pre-open) was tried and
+# removed: it also lands off-peak, so it is a one-line change here plus a re-run
+# of setup_cloud.sh if you ever want the Asian-morning coverage back. Note the
+# costs of NOT having it: nothing is read between 17:00 ET and 09:15 ET the next
+# morning, so Chinese news that breaks during the Asian session waits for the
+# pre-open run - and because the two wires are paginated to their delta window,
+# it is still captured, just later.
+SCHEDULE_RUN_TIMES = (dtime(9, 15), dtime(17, 0))
 SCHEDULE_TOLERANCE_MIN = 5
 
-# Label shown in the digest header so it is obvious WHICH run delivered it.
+# Label shown in the digest header so it is obvious WHICH run delivered it:
+# the 09:15 ET run is the pre-open read, the 17:00 ET run is the post-close read
+# (one hour after the 16:00 ET close).
 SCHEDULE_LABELS = {
     dtime(9, 15): "pre-open",
     dtime(17, 0): "post-close",
-    dtime(19, 0): "asia-open",
 }
 
 
@@ -5938,7 +5938,7 @@ def _schedule_guard(now_et):
         if delta <= SCHEDULE_TOLERANCE_MIN * 60:
             return
     print(f"[{now_et.strftime('%Y-%m-%d %H:%M %Z')}] "
-          f"Outside scheduled times (9:15 / 17:00 / 19:00 ET) - skipping.")
+          f"Outside scheduled times (9:15 / 17:00 ET) - skipping.")
     sys.exit(0)
 
 
