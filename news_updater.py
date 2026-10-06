@@ -1140,6 +1140,10 @@ NAME_PREFIXES = set("与和及由为被向从在据是对给跟同了将已拟�
 # 管(管理) 融(金融). Including later characters (息, 务, 络...) would accept a
 # coincidental match: "音乐信息" would look like 乐信 + 息.
 NAME_CONTINUATIONS = set("保科集控信服网数金有公银经平商贷支理国香中证投资管融")
+# News words that legitimately FOLLOW a company name in a headline
+# ("美股乐信财报超预期" = 乐信 + 财报, "元保股价上涨" = 元保 + 股价). Without these
+# the boundary rule dropped real coverage, because both neighbours are CJK.
+NEWS_CONTINUATIONS = set("财股业发涨跌被获宣公将价报季盈净")
 # Currency / measure characters that turn a leading 元 into a money phrase
 # ("美<元保>证金" = USD deposit, "亿<元保>偏光纤" = billion-yuan PM fiber).
 UNIT_PREFIXES = set("美欧港日加澳亿万")
@@ -1166,7 +1170,7 @@ def _term_in_text(term, text):
             continue
         if (not before) or (not is_chinese(before)) or (before in NAME_PREFIXES) \
                 or (not after) or (not is_chinese(after)) \
-                or (after in NAME_CONTINUATIONS):
+                or (after in NAME_CONTINUATIONS) or (after in NEWS_CONTINUATIONS):
             return True
         idx = text.find(term, idx + 1)
     return False
@@ -1293,8 +1297,20 @@ def normalize_title(title):
     outlets ("… - 新浪财经" / "… - East Money") collapses to one key, which the
     per-source seen hash (source + url + title) cannot do because the URL and
     often the title differ slightly.
+
+    The publisher tail is only removed when it really looks like an outlet name:
+    SHORT and free of digits. Chinese portals and company pages also use the form
+    "<company> - <the actual story>" ("奇富科技 - 宣布3亿美元回购计划"); cutting at
+    the first separator reduced every such headline to the company name alone, so
+    a buyback looked like a duplicate of the earnings release and was dropped
+    before it was even stored.
     """
-    t = re.split(r"\s+[-–—|]\s+", str(title or ""))[0]
+    t = str(title or "").strip()
+    parts = re.split(r"\s+[-–—|]\s+", t)
+    if len(parts) > 1:
+        tail = parts[-1]
+        if len(tail) <= 20 and not re.search(r"\d", tail):
+            t = " - ".join(parts[:-1])
     return re.sub(r"[\s\W_]+", "", t, flags=re.UNICODE).lower()[:80]
 
 
@@ -1781,7 +1797,15 @@ def passes_relevance(item, meta, resolved):
     ticker = str(item.get("ticker") or "").lower()
     title_l = str(item.get("title") or "").lower()
     if ticker and re.search(r"(?<![a-z0-9])" + re.escape(ticker) + r"(?![a-z0-9])", title_l):
-        return "company"
+        if len(ticker) > 2:
+            return "company"
+        # Even in the title, a one/two-letter symbol is usually an ordinary word
+        # or another company: "Lu Xun's former residence", "Lu Zhiqiang resigns
+        # as chairman", "LX Pantos to build a logistics center". Accept it only
+        # when the headline is otherwise about a listed company.
+        if any(re.search(r"(?<![a-z])" + re.escape(w) + r"(?![a-z])", title_l)
+               for w in CORPORATE_CONTEXT_WORDS):
+            return "company"
     for domain in resolved["domains"]:
         if domain and domain in hay:
             return "company"
