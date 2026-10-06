@@ -200,7 +200,7 @@ NO_WRITE = False
 # credit usage low.
 MAX_ZH_TERMS = 8
 # Sub-queries per ticker per run for Eastmoney (1 per term).
-EASTMONEY_MAX_QUERIES = 6
+EASTMONEY_MAX_QUERIES = 8
 # Tavily free plan = 1,000 credits/month; 1 basic search = 1 credit.
 # Defaults are conservative: a daily cap of 15 (~450/month worst case) plus a
 # monthly hard cap of 850 as insurance, and an adaptive skip that avoids using
@@ -3725,6 +3725,18 @@ MACRO_TAGS = [
 # One compact Google News query for longer-form macro coverage (the wires
 # carry the flash items; this catches the articles).
 MACRO_GNEWS_QUERY = "中国 央行 降息 降准 LPR 助贷 消费金融 中概股 刺激政策"
+# Primary regulator sources, reached through the news index because the
+# regulators' own listing pages are JavaScript-driven and their item APIs are
+# not public (verified 2026-10-06: the NFRA/CSRC list pages return a JS shell,
+# their guessed JSON endpoints 404). These queries DO work: site:nfra.gov.cn
+# 处罚 returned items ~2.4 days old and site:csrc.gov.cn 处罚 returned actual
+# 行政处罚决定书 documents, i.e. the primary penalty text rather than a news
+# write-up of it.
+REGULATOR_SITE_QUERIES = (
+    "site:nfra.gov.cn 处罚",
+    "site:csrc.gov.cn 处罚",
+    "site:pbc.gov.cn 行政处罚",
+)
 
 
 def macro_tag(text):
@@ -3926,7 +3938,11 @@ def fetch_eastmoney_724(limit=200, pages=EASTMONEY_WIRE_PAGES):
                 "ticker": "",
                 "id": ident,
                 "title": title,
-                "url": it.get("url") or "",
+                # The wire API carries no link, but the item code is the article
+                # id on finance.eastmoney.com (verified: HTTP 200), so the digest
+                # can link to the source instead of nothing.
+                "url": (f"https://finance.eastmoney.com/a/{ident}.html"
+                        if ident.isdigit() else (it.get("url") or "")),
                 # showTime is Beijing wall-clock - normalize to ET.
                 "date": _zh_date_to_et(it.get("showTime") or ""),
                 "lang": "zh",
@@ -3977,9 +3993,10 @@ def fetch_sina_724(limit=100, pages=SINA_WIRE_PAGES):
             items.append({
                 "source": "",
                 "ticker": "",
-                "id": ident,
+                "id": str(it.get("id") or title),
                 "title": title[:200],
-                "url": "",
+                # Sina gives a real document URL; the digest used to link nowhere.
+                "url": str(it.get("docurl") or "").strip(),
                 # create_time is Beijing wall-clock - normalize to ET.
                 "date": _zh_date_to_et(it.get("create_time") or ""),
                 "lang": "zh",
@@ -4434,6 +4451,11 @@ STRONG_MACRO_PATTERNS = [
     r"中央经济工作会议", r"中央金融工作会议",
     r"助贷", r"网络小贷", r"网络小额贷款", r"互联网小额贷款",
     r"消费金融", r"金融监管总局", r"银保监会", r"国家金融监督管理总局",
+    # The FULL names, because the abbreviations are not substrings of them:
+    # "中国证券监督管理委员会" does not contain "证监会", so CSRC penalty
+    # announcements were not recognised as regulatory at all.
+    r"中国证券监督管理委员会", r"证券监督管理委员会", r"国家金融监督管理总局",
+    r"证券交易所", r"行政处罚",
     r"互联网金融", r"互联网贷款", r"小额贷款", r"现金贷",
     r"中概股", r"中国金龙", r"退市新规", r"实体清单", r"出口管制",
     r"财政部", r"证监会", r"国家发改委",
@@ -4707,6 +4729,28 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
                 item["source"] = "ExaMacro"
                 raw_items.append(item)
             set_last_fetched(conn, "MACRO", "ExaMacro", now_utc_str)
+    # Primary regulator sources (NFRA / CSRC / PBoC penalty announcements), via
+    # the news index. These are the highest-signal items for lending and
+    # insurance names - a fine is news when the regulator publishes it, not when
+    # a portal writes it up.
+    if src_on("regulators"):
+        got_any = False
+        for q in REGULATOR_SITE_QUERIES:
+            res = fetch_rss(google_news_url(q, "zh"), "MACRO", None,
+                            source="Regulator", lang="zh")
+            if res is None:
+                continue
+            got_any = True
+            for it in res:
+                if wanted(f"{it.get('title', '')} {it.get('snippet', '')}"):
+                    item = dict(it)
+                    item["ticker"] = "MACRO"
+                    raw_items.append(item)
+        if got_any:
+            print(f"  [macro] regulator site queries added "
+                  f"{sum(1 for i in raw_items if i.get('source') == 'Regulator')} "
+                  f"candidate(s).")
+
     seen_keys = set()
     subjects_seen = set()
     candidates = []
@@ -6370,6 +6414,20 @@ def main():
                 lambda sd: fetch_rss(google_news_url(site_query, "zh"), ticker, sd,
                                      source="GoogleNewsSite", lang="zh"),
                 src_status("google_news_site", strict=False))
+
+        # 2.6) HKEX is deliberately NOT a source. Two approaches were tested
+        #      (2026-10-06) and neither is usable:
+        #        - HKEX's own titleSearchServlet needs internal session state: it
+        #          answers HTTP 200 with recordCnt 0 even for Tencent (700), with
+        #          or without a primed cookie session;
+        #        - reaching the filings through the news index returns documents
+        #          Google titled "Untitled - HKEXnews" (0 of 30 named the company
+        #          for 陆金所) or other issuers' filings entirely (site:hkexnews.hk
+        #          3660 returned 專業旅運 and 普源精電), so the relevance gate
+        #          correctly drops them.
+        #      A real HKEX source needs a per-document fetch (PDF text) plus a
+        #      working session handshake; that is a project of its own, and
+        #      shipping the index version would only add noise.
 
         # 3) Google News English - includes the company's EN names/brands so
         #    subsidiary news is found even when the ticker symbol isn't in it.

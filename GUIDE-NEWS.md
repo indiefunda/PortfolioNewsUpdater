@@ -107,8 +107,18 @@ company and its brands.
    the company's English brand names (e.g. Fenqile, Temu)
 9. **Google News `site:`** — searches the company's OWN discovered websites
    (official site, news page, subsidiary sites) so official announcements and
-   press releases are caught even when no news outlet covers them
-10. **Company RSS / press-release feeds** (optional, per-ticker)
+   press releases are caught even when no news outlet covers them. Note: the
+   news index covers publishers far better than corporate IR pages, so expect
+   little from this source — real IR/newsroom **RSS** feeds (item 10) are the
+   reliable way to catch a company's own announcements
+10. **Primary regulator sources** (`regulators`, on by default) — the
+    **NFRA (国家金融监督管理总局)**, **CSRC** and **PBoC** penalty announcements,
+    reached through their published documents. These are the highest-signal
+    items for lending and insurance names: a fine is news when the regulator
+    publishes it, not when a portal writes it up. They land in the 📢 CHINA
+    MACRO section
+11. **Company RSS / press-release feeds** (optional, per-ticker — empty by
+    default; add the company's newsroom feed to catch its own announcements)
 
 All new items are stored in `news.db`, translated + summarized + scored by AI
 (one batched call per ticker to keep token usage tiny), then the **top-N by

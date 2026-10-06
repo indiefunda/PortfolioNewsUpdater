@@ -6,7 +6,7 @@ import os
 import shutil
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 spec = importlib.util.spec_from_file_location(
@@ -26,16 +26,20 @@ conn.row_factory = sqlite3.Row
 fail = 0
 
 orphans = conn.execute("SELECT COUNT(*) FROM news WHERE importance IS NULL").fetchone()[0]
+# The rescue deliberately ignores rows OLDER than NEWS_RETENTION_DAYS (they are
+# about to be pruned anyway), and this fixture is a snapshot of the live DB, so
+# it goes stale: on 2026-10-06 its newest row was 2026-09-10, i.e. outside the
+# 21-day window, and every seeded orphan was correctly ignored. Seed IN-WINDOW
+# rows so the drain-and-stop behaviour is what gets exercised.
+recent = (datetime.now(nu.EASTERN) - timedelta(hours=6)).strftime("%Y-%m-%d %H:%M:%S")
 if orphans == 0:
-    # No orphans left in the fixture (the recovery pass drained them). Seed a
-    # few so the drain-and-stop behaviour is actually exercised.
-    print("no orphans in the fixture - seeding 8 synthetic ones")
+    print("no orphans in the fixture - seeding 8 synthetic ones (recent)")
     for i in range(8):
         conn.execute(
             "INSERT INTO news (ticker, source, lang, item_hash, title_raw, url, "
             "published_at, first_seen, rescues) VALUES ('ZZORPH','Tavily','en',?,?,?,?,?,0)",
             (f"orphan{i:02d}", f"orphan test row {i}", f"https://o.example/{i}",
-             "2026-09-10 10:00:00", "2026-09-10 10:00:00"))
+             recent, recent))
     conn.commit()
     orphans = conn.execute("SELECT COUNT(*) FROM news WHERE importance IS NULL").fetchone()[0]
 print(f"orphans in the live DB copy: {orphans}")

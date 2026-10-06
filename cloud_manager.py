@@ -128,6 +128,7 @@ DEFAULT_CONFIG = {
         "sina_724": True,  # Sina 7x24 fast-news wire
         "exa": True,  # EXA neural per-ticker impact search
         "exa_macro": True,  # EXA neural macro search (semantic, no regex)
+        "regulators": True,  # NFRA/CSRC/PBoC penalty announcements (macro tier)
         "baidu": False,  # captcha-blocked from server IPs - off by default
         "tavily": True,
         "google_news_en": True,
