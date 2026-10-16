@@ -710,8 +710,15 @@ HTML = """<!DOCTYPE html>
       <span>Run the news updater (2x daily)</span>
       <label class="switch"><input type="checkbox" id="enabledToggle"><span class="slider"></span></label>
     </div>
-    <button class="btn-primary" onclick="uploadConfig()">🚀 Upload config to server</button>
-    <div class="hint">Sends your stocks, AI settings, and Telegram keys to the cloud server. Keys stay local and on your VM — never shared.</div>
+    <button class="btn-primary" id="uploadBtn" onclick="uploadConfig()">🚀 Upload config to server</button>
+    <div class="status" id="uploadStatus">—</div>
+    <div class="row" style="margin-top:8px">
+      <button class="btn-ok" onclick="runNow(false)">▶ Run now (test)</button>
+      <button class="btn-ok" onclick="runNow(true)" title="Real run; if nothing is NEW it sends a 📊 snapshot of the current picture instead of nothing">📊 Run now + snapshot</button>
+    </div>
+    <div class="hint">Both buttons run the REAL updater (fetch + AI + Telegram). If nothing is new since the last run, no digest is sent (dedup) — the snapshot button always delivers the current picture.</div>
+    <div class="hint">Uploading sends your stocks, AI settings and Telegram keys to the server <b>and reinstalls the schedule there</b> (it runs the setup script on the VM), so 2–5 minutes is normal — watch the status line above. You do <b>not</b> need a separate "Create/update free server" step for a config change.</div>
+    <div class="log" id="cfgLog">Command output will appear here.</div>
   </div>
 
   </div><!-- /pane -->
@@ -968,35 +975,77 @@ async function createVM(){
   refreshStatus(); }
 
 async function uploadConfig(){
-  showMsg('Uploading to server...','ok');
   let tickerMeta = {};
   try { tickerMeta = JSON.parse($('tickerMeta').value || '{}'); }
   catch(e){ showMsg('❌ ticker_meta is not valid JSON: '+e.message, 'err'); return; }
-  const d = await api('/api/upload', {
-    tickers, enabled: $('enabledToggle').checked,
-    ai_provider: $('aiProvider').value, ai_model: $('aiModel').value.trim(),
-    ai_base_url: $('aiBase').value.trim(),
-    telegram_bot_token: secretValue('token'), telegram_chat_id: secretValue('chatid'),
-    ai_api_key: secretValue('aikey'), tavily_api_key: secretValue('tavilyKey'),
-    exa_api_key: secretValue('exaKey'),
-    ticker_meta: tickerMeta,
-    push_mode: $('pushMode').value, push_min_score: parseInt($('pushMinScore').value)||7,
-    push_min_importance: parseInt($('pushMinImportance').value)||4,
-    push_max_per_ticker: parseInt($('pushMaxPerTicker').value)||2,
-    web_url: ($('webUrl').value||'').trim(),
-    news_retention_days: parseInt($('retentionDays').value)||21,
-    tavily_max_daily_searches: parseInt($('tavilyDaily').value)||30,
-    tavily_max_monthly_searches: parseInt($('tavilyMonthly').value)||900,
-    tavily_min_free_items: parseInt($('tavilyMinFree').value)||4,
-    initial_lookback_hours: window._lookback || undefined,
-    max_items_per_run: window._maxItems || undefined,
-    max_digest_items: window._maxDigest || undefined,
-    lookup_refresh_days: 30,
-  });
-  $('log').textContent = d.output || '';
+  const btn = $('uploadBtn');
+  const label = btn ? btn.textContent : '';
+  const started = Date.now();
+  // The upload copies the code AND runs setup_cloud.sh on the VM (apt + pip +
+  // cron), so it routinely takes minutes. Without a live status the panel looked
+  // frozen for the whole time and there was no way to tell "working" from
+  // "hung" - the only output went to the log box in the Setup tab.
+  if(btn){ btn.disabled = true; btn.textContent = '⏳ Uploading…'; }
+  const tick = setInterval(() => {
+    const s = Math.round((Date.now() - started) / 1000);
+    const el = $('uploadStatus');
+    if(el) el.textContent = '⏳ Uploading to the server… ' + s + 's elapsed. '
+      + 'Copying the code and reinstalling the schedule on the VM is normal to take 2–5 minutes.';
+  }, 1000);
+  const el0 = $('uploadStatus');
+  if(el0) el0.textContent = '⏳ Uploading to the server…';
+  showMsg('Uploading to server...','ok');
+  let d;
+  try {
+    d = await api('/api/upload', {
+      tickers, enabled: $('enabledToggle').checked,
+      ai_provider: $('aiProvider').value, ai_model: $('aiModel').value.trim(),
+      ai_base_url: $('aiBase').value.trim(),
+      telegram_bot_token: secretValue('token'), telegram_chat_id: secretValue('chatid'),
+      ai_api_key: secretValue('aikey'), tavily_api_key: secretValue('tavilyKey'),
+      exa_api_key: secretValue('exaKey'),
+      ticker_meta: tickerMeta,
+      push_mode: $('pushMode').value, push_min_score: parseInt($('pushMinScore').value)||7,
+      push_min_importance: parseInt($('pushMinImportance').value)||4,
+      push_max_per_ticker: parseInt($('pushMaxPerTicker').value)||2,
+      web_url: ($('webUrl').value||'').trim(),
+      news_retention_days: parseInt($('retentionDays').value)||21,
+      tavily_max_daily_searches: parseInt($('tavilyDaily').value)||30,
+      tavily_max_monthly_searches: parseInt($('tavilyMonthly').value)||900,
+      tavily_min_free_items: parseInt($('tavilyMinFree').value)||4,
+      initial_lookback_hours: window._lookback || undefined,
+      max_items_per_run: window._maxItems || undefined,
+      max_digest_items: window._maxDigest || undefined,
+      lookup_refresh_days: 30,
+    });
+  } catch(e) {
+    d = { ok:false, error:String(e && e.message ? e.message : e) };
+  } finally {
+    clearInterval(tick);
+    if(btn){ btn.disabled = false; btn.textContent = label || '🚀 Upload config to server'; }
+  }
+  const secs = Math.round((Date.now() - started) / 1000);
+  writeLog(d.output || d.error || '');
   setWebUrl($('webUrl').value);
-  showMsg(d.ok ? '✅ Config uploaded!' : '❌ '+d.error, d.ok?'ok':'err');
+  const st = $('uploadStatus');
+  if(st){
+    st.textContent = d.ok
+      ? '✅ Uploaded in ' + secs + 's — the server is running this config and its schedule has been reinstalled.'
+      : '❌ Upload failed after ' + secs + 's: ' + (d.error || 'unknown error');
+  }
+  showMsg(d.ok ? '✅ Config uploaded!' : '❌ '+(d.error||'upload failed'), d.ok?'ok':'err');
   loadCron(); loadNews(); }
+
+// The upload and the run buttons are reachable from two tabs; the output goes to
+// whichever log boxes exist so the user never has to hunt in another tab.
+function writeLog(text){
+  ['log','cfgLog'].forEach(id => { const el = $(id); if(el) el.textContent = text; });
+}
+
+function configTabVisible(){
+  const p = $('pane-config');
+  return !!(p && p.style.display !== 'none');
+}
 
 async function loadUsage(){
   const d = await api('/api/tavily');
@@ -1307,14 +1356,31 @@ async function loadCron(){
 
 async function runNow(withSnapshot){
   showMsg('Running the real updater on the server now...','ok');
-  const d = await api('/api/run_now' + (withSnapshot ? '?snapshot=1' : ''), {snapshot: withSnapshot?1:0});
-  $('log').textContent = d.output || '';
+  const onConfig = configTabVisible();
+  const cfgBtn = onConfig ? $('uploadStatus') : null;
+  const started = Date.now();
+  if(cfgBtn) cfgBtn.textContent = '▶ Running the real updater on the server… (0s)';
+  const tick = cfgBtn ? setInterval(() => {
+    cfgBtn.textContent = '▶ Running the real updater on the server… ('
+      + Math.round((Date.now() - started) / 1000) + 's)';
+  }, 1000) : null;
+  let d;
+  try {
+    d = await api('/api/run_now' + (withSnapshot ? '?snapshot=1' : ''), {snapshot: withSnapshot?1:0});
+  } catch(e) {
+    d = { ok:false, error:String(e && e.message ? e.message : e) };
+  } finally {
+    if(tick) clearInterval(tick);
+  }
+  writeLog(d.output || d.error || '');
   // Reflect what actually happened instead of a generic "test works" message.
   const out = d.output || '';
+  const secs = Math.round((Date.now() - started) / 1000);
   let msg = '';
   if(out.includes('Digest sent') || out.includes('snapshot sent')) msg = '✅ Real run done - Telegram message sent.';
   else if(out.includes('No items to push') || out.includes('No new items') || out.includes('nothing to do') || out.includes('nothing sent')) msg = 'ℹ️ Run done - nothing NEW to send (dedup). ' + (withSnapshot ? 'No notable news in the last 24h.' : 'Try 📊 Run now + snapshot for the current picture.');
   else msg = d.ok ? '✅ Real run completed (see log).' : '❌ '+(d.error||'run failed');
+  if(cfgBtn) cfgBtn.textContent = '▶ Run finished in ' + secs + 's — ' + msg.replace(/^[^0-9A-Za-z]*/, '');
   showMsg(msg, d.ok?'ok':'err');
   loadLogs(); }
 

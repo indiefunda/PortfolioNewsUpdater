@@ -65,17 +65,21 @@ still used for the macro tier and for company discovery.)
    (**http://localhost:8001**; if that port is taken it uses 8002/8003 and the
    launcher opens the right one — a second copy refuses to start, so there is
    never more than one panel).
-5. In the panel — it is split into four tabs:   - **🔎 Deep search** — a one-off scan of any ticker. Nothing is saved; this
+5. In the panel — it is split into four tabs:
+   - **🔎 Deep search** — a one-off scan of any ticker. Nothing is saved; this
      is the tab it opens on.
    - **⚙️ Setup & schedule** — **Connect to Google** → Authenticate, then
      **Your server** → **Create/update free server** (creates the free VM and
-     enables Compute Engine automatically). The schedule and run history are
-     here too.
+     enables Compute Engine automatically). You only need this to create the VM
+     or repair it — **Upload config to server** already reinstalls the schedule.
    - **🧩 Configuration** — add **your** tickers, pick **Gemini (free tier)** or
      DeepSeek, paste your Telegram bot token/chat id, your Tavily key and your
-     AI key, then **Upload config to server** and **Run now (test)**.
+     AI key, then **Upload config to server** (a live status line and the command
+     output are shown right there, since it also runs the setup script on the VM
+     and takes a few minutes) and **Run now (test)**.
      The names/subsidiaries editor lives here as well.
-   - **📰 News & data** — the stored-news browser and the company lookup.
+   - **📰 News & data** — the stored-news browser, the run history/schedule and
+     the company lookup.
 6. Check the stored news and the company lookup — the
    updater auto-discovers each company's Chinese name, subsidiaries and
    websites, and alerts you on Telegram when it finds new ones. In Step 5 every

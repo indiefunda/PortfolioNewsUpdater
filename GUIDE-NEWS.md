@@ -209,6 +209,12 @@ knowledge base in `company_lookup.json` (on the server):
    - **Setup & schedule** → **Connect to Google** → Authenticate.
    - **Setup & schedule** → **Your server** → **Create/update free server**
      (creates the free e2-micro VM; re-runs safely if it already exists).
+
+     **After the VM exists you do not need this button again.** *Upload config to
+     server* already copies the code **and re-runs `setup_cloud.sh` on the VM**,
+     which reinstalls the cron schedule and the logrotate rule. Use
+     *Create/update free server* only to create the VM, or to repair it (it also
+     starts a stopped VM).
    - **Configuration** → add tickers, pick AI provider, paste Telegram +
      AI keys, and paste your free **Tavily key** (optional but recommended).
    - **Configuration** → **Chinese names (ticker_meta)** → per-ticker JSON with
@@ -229,8 +235,14 @@ knowledge base in `company_lookup.json` (on the server):
      pushes items ≥ the min score. **Both modes apply the importance floor**
      (`push_min_importance`, default 4) and the per-ticker cap.
      `max_digest_items` caps the digest.
-   - **Upload config to server**, then **Run now (test)**, then check
-     **Stored news (Step 5)** to see everything it found.
+   - **Upload config to server** — this is the one step that ships everything:
+     it copies `news_updater.py` / `news_web.py` / your config + keys to the VM
+     **and re-runs the setup script there**, reinstalling the schedule. It takes
+     2–5 minutes (apt + pip run on the VM) and the **Configuration** tab shows a
+     live timer plus the command output, so you can see it start and finish.
+   - Then **Run now (test)** — from the Configuration tab or
+     **News & data → Schedule & run history** — and check **Stored news (Step 5)**
+     to see everything it found.
 
 ## Relevance & duplicates — why the digest is short
 
