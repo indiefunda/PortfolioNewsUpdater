@@ -120,7 +120,15 @@ company and its brands.
     items for lending and insurance names: a fine is news when the regulator
     publishes it, not when a portal writes it up. They land in the 📢 CHINA
     MACRO section
-11. **Company RSS / press-release feeds** (optional, per-ticker — empty by
+11. **Industry regulation by THEME** (`sector_regulation`, on by default) — the
+    fix for sector-wide rules that name no issuer, which every company-name
+    query misses: *"中互金协会：15家助贷平台提交专项审计报告"*, *"互联网贷款自律
+    筹备组将扩容"*, *"消费金融公司迎来最严检查"*. Searched by theme (助贷 专项审计 /
+    互联网贷款 自律 / 消费金融 监管 处罚 / 小额贷款 利率 新规 …) and admitted only
+    when a **sector noun AND a policy/action word** are both present, so
+    *"助贷概念股大涨"* or a product launch does not qualify. They feed the
+    CHINA MACRO section, where the AI writes the impact line for your names
+12. **Company RSS / press-release feeds** (optional, per-ticker — empty by
     default; add the company's newsroom feed to catch its own announcements)
 
 All new items are stored in `news.db`, translated + summarized + scored by AI
@@ -136,9 +144,10 @@ with each item. Everything else stays in the DB — browse it from the panel
 Huge policy / market news — **rate cuts (降息/降准/LPR), stimulus (万亿/特别国债),
 assisted-loan regulation (助贷/消费金融/利率上限), 金融监管总局 actions, 中概股
 moves, tariffs/sanctions** — is caught in real time from the 7x24 wires, a
-macro Google News query, **and EXA's semantic macro search (finds
-differently-worded big news the regex can't)**, and pushed in its **own digest
-section at the top**, always (never floor-capped), capped at
+macro Google News query, **EXA's semantic macro search**, the **primary
+regulator sources**, and **industry-theme regulation** (see the source list
+above), and pushed in its **own digest section at the top**, always (never
+floor-capped), capped at
 `macro_max_per_run` (default 3).
 
 **Cost:** the gate is a **free regex** — no AI is spent filtering. Only the

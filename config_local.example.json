@@ -38,7 +38,8 @@
     "baidu": false,
     "tavily": true,
     "google_news_en": true,
-    "regulators": true
+    "regulators": true,
+    "sector_regulation": true
   },
   "ticker_meta": {},
   "rss_feeds": {}

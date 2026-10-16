@@ -1917,18 +1917,26 @@ def passes_relevance(item, meta, resolved):
                     never sent to the AI.
     """
     hay = " ".join(str(item.get(k) or "") for k in ("title", "snippet")).lower()
-    if mentions_company(hay, resolved["names"]):
+    title_l = str(item.get("title") or "").lower()
+    # The NAME must be in the TITLE. Matching title+snippet let an aggregator
+    # page qualify through its sidebar: a Yahoo Finance page headed "Yiren Digital
+    # Ltd. (YRD) Stock Price..." was stored as LX news because its excerpt listed
+    # LexinFintech among related tickers. A snippet-only mention is at most a
+    # SECTOR signal now (kept only when sector_watch is on) - and unnamed sector
+    # regulation reaches the digest through the industry-theme source instead.
+    if mentions_company(title_l, resolved["names"]):
         return "company"
-    # A subsidiary/brand mention (分期乐, Fenqile, 奇富借条) is a real company
-    # mention: the news is about the stock's own business, not its sector.
-    if mentions_company(hay, resolved.get("subsidiary_names") or []):
+    # A subsidiary/brand mention (分期乐, Fenqile, 奇富借条) in the title is a real
+    # company mention: the news is about the stock's own business.
+    if mentions_company(title_l, resolved.get("subsidiary_names") or []):
         return "company"
+    snippet_only = mentions_company(hay, resolved["names"]) or \
+        mentions_company(hay, resolved.get("subsidiary_names") or [])
     # The ticker must appear in the TITLE. Matching it anywhere in the page text
     # let one- and two-letter symbols collide with ordinary words in a noisy
     # excerpt ("lx", "lu", "yb"), which is how unrelated pages were classified
     # as being about the company.
     ticker = str(item.get("ticker") or "").lower()
-    title_l = str(item.get("title") or "").lower()
     if ticker and re.search(r"(?<![a-z0-9])" + re.escape(ticker) + r"(?![a-z0-9])", title_l):
         if len(ticker) > 2:
             return "company"
@@ -1945,6 +1953,9 @@ def passes_relevance(item, meta, resolved):
     # Not about the company by name. Sector vocabularies are deliberately
     # narrow: broad words like 金融/监管 alone would match almost everything.
     if resolved["sector_tokens"] and any(t in hay for t in resolved["sector_tokens"]):
+        return "sector"
+    if snippet_only:
+        # Named only in the page text (a sidebar, a related-tickers list).
         return "sector"
     if resolved["strict"] and resolved["strong"]:
         # The query itself was company-specific, so a result from it is at
@@ -3816,6 +3827,77 @@ REGULATOR_SITE_QUERIES = (
     "site:pbc.gov.cn 行政处罚",
 )
 
+# ---------------------------------------------------------------------------
+# INDUSTRY / THEME watch (the fix for "the 15-lender audit news never arrived")
+# ---------------------------------------------------------------------------
+# The per-ticker sources all require the COMPANY to be named, so a sector-wide
+# regulatory event - "中互金协会：15家助贷平台提交专项审计报告", "助贷业自律加码"
+# - is invisible: the headlines name the industry, not 乐信 or 奇富. These
+# queries search the THEMES instead, independent of any ticker, and their
+# results feed the China-macro/regulatory tier (where the AI writes the impact
+# line for the fintech names and the regulatory force-push applies).
+#
+# Deliberately narrow: each query pairs a sector noun with a policy/action word,
+# so the result set is regulation, not general industry chatter.
+SECTOR_REGULATORY_QUERIES = (
+    "助贷 专项审计",
+    "互联网贷款 自律",
+    "助贷 新规 监管",
+    "消费金融 监管 处罚",
+    "小额贷款 利率 新规",
+    "助贷平台 整改",
+)
+# An item must match one of these to count as sector regulation. Kept separate
+# from MACRO_KEYWORDS so the queries can be broad while admission stays strict.
+SECTOR_REGULATORY_PATTERNS = (
+    r"助贷", r"互联网贷款", r"网络小贷", r"网络小额贷款", r"小额贷款",
+    r"消费金融", r"现金贷", r"贷款中介", r"汽车金融", r"征信", r"催收",
+    # Bank lending-conduct stories ("多家银行严控贷款违规流向…监管力度进一步
+    # 增强") matter to the same lenders, and 贷款 alone would match everything.
+    r"贷款违规", r"贷款流向", r"银行.{0,4}贷款", r"助贷机构",
+)
+# A policy/action word must ALSO be present: sector nouns alone match market
+# chatter ("助贷概念股大涨"), which is not regulation.
+SECTOR_ACTION_PATTERNS = (
+    r"审计", r"自律", r"新规", r"监管", r"检查", r"处罚", r"罚款", r"约谈",
+    r"整改", r"合规", r"通知", r"征求意见", r"利率上限", r"备案", r"清退",
+    r"通报", r"整治", r"规范", r"指引", r"办法",
+)
+# World news that is NOT market-moving for Chinese ADRs, however dramatic. Used
+# as a veto on the macro tier: drama scores high with an LLM, and without this a
+# missile strike outranks an assist-loan regulation. A strong China POLICY anchor
+# always overrides it (制裁/关税 stories legitimately mention both).
+WORLD_NOISE_PATTERNS = (
+    r"袭击|空袭|导弹|无人机|击落|爆炸|枪击|恐袭|交火|停火|伤亡|死亡|受伤",
+    r"飓风|台风|地震|洪水|山火|干旱|海啸|火山",
+    r"坠机|相撞|脱轨|沉没|火灾|起火|油轮|事故",
+    r"选举|大选|就职|弹劾|辞职|组阁",
+    r"军事|军舰|战机|武装|冲突|战争",
+    r"球队|联赛|世界杯|奥运|比赛|夺冠",
+)
+
+
+def is_world_noise(text):
+    """True for drama/geopolitics/accidents that are not ADR-market news."""
+    if not text:
+        return False
+    return any(re.search(p, text) for p in WORLD_NOISE_PATTERNS)
+
+
+def is_sector_regulation(text):
+    """
+    Is this INDUSTRY regulation for the consumer-lending / fintech sector?
+
+    Needs a sector noun AND a policy/action word, so '助贷概念股大涨' or a single
+    platform's product launch does not qualify, while '15家助贷平台提交专项审计
+    报告' and '互联网贷款自律筹备组将扩容' both do.
+    """
+    if not text:
+        return False
+    if not any(re.search(p, text) for p in SECTOR_REGULATORY_PATTERNS):
+        return False
+    return any(re.search(p, text) for p in SECTOR_ACTION_PATTERNS)
+
 
 def macro_tag(text):
     """English label for a macro item (first matching pattern), or 'MACRO'."""
@@ -4474,7 +4556,12 @@ def get_recent_pushed_titles(conn, ticker, limit=SEMANTIC_DEDUP_HISTORY):
 # headline no longer arrives labelled as "China macro".
 GLOBAL_MARKET_PATTERNS = [
     r"美联储", r"鲍威尔", r"沃勒", r"FOMC", r"非农", r"美国CPI|CPI数据",
-    r"ADP数据|ADP就业", r"联邦基金利率", r"点阵图", r"美国通胀|美国PPI",
+    r"ADP数据|ADP就业", r"联邦基金利率", r"点阵图",
+    # Tolerate the words BETWEEN the country and the indicator: "美国9月PPI同比
+    # 增长6.3% 远超市场预期" did NOT match the old "美国PPI" pattern, so a
+    # genuinely systemic inflation surprise was dropped while a Fed official's
+    # small talk passed the gate.
+    r"美国.{0,8}(CPI|PPI|PCE|通胀)", r"(CPI|PPI|PCE)(同比|环比|数据|增速)?",
     r"美国国债收益率|美债收益率", r"华尔街|标普500|纳斯达克指数|道琼斯",
     r"美股", r"美元指数", r"人民币汇率|离岸人民币",
     # Non-China central banks / economies: a foreign rate decision is global
@@ -4482,6 +4569,14 @@ GLOBAL_MARKET_PATTERNS = [
     r"欧洲央行|欧央行|ECB", r"日本央行|日银", r"英国央行|英格兰银行",
     r"韩国央行|澳洲联储|加拿大央行|瑞士央行",
 ]
+# What makes a central-bank mention MARKET-MOVING rather than small talk. A
+# central bank NAME alone is no longer enough: "美联储哈马克表示：民间见闻信息可
+# 提供重要的经济参考依据" reached the macro tier (it is in the user's junk list)
+# purely because it says 美联储. A rate action or a hard data point is news.
+SYSTEMIC_MARKERS = (
+    r"降息|加息|利率决议|决议|会议纪要|纪要|缩表|扩表|点阵图|加息押注|降息押注",
+    r"CPI|PPI|PCE|非农|失业率|就业数据|通胀|通缩|利率区间|基准利率",
+)
 # The subset of those patterns that unambiguously identifies a FOREIGN subject:
 # a foreign central bank or a US-economy datapoint. An item matching one of
 # these never counts as China macro unless it ALSO carries a strong China
@@ -4534,14 +4629,17 @@ STRONG_MACRO_PATTERNS = [
     r"中央经济工作会议", r"中央金融工作会议",
     r"助贷", r"网络小贷", r"网络小额贷款", r"互联网小额贷款",
     r"消费金融", r"金融监管总局", r"银保监会", r"国家金融监督管理总局",
-    # The FULL names, because the abbreviations are not substrings of them:
-    # "中国证券监督管理委员会" does not contain "证监会", so CSRC penalty
-    # announcements were not recognised as regulatory at all.
-    r"中国证券监督管理委员会", r"证券监督管理委员会", r"国家金融监督管理总局",
-    r"证券交易所", r"行政处罚",
+    # The FULL regulator name, because the abbreviation is not a substring of it:
+    # "中国证券监督管理委员会" does not contain "证监会".
+    #
+    # NOT here (and this matters): bare 证监会, 证券交易所, 行政处罚. Those are
+    # company-level announcement words - "翔丰华：向特定对象发行股票获证监会同意
+    # 注册批复" became a China-macro item that way. The full regulator name is a
+    # policy signal; "证监会" alone is not.
+    r"中国证券监督管理委员会", r"证券监督管理委员会",
     r"互联网金融", r"互联网贷款", r"小额贷款", r"现金贷",
     r"中概股", r"中国金龙", r"退市新规", r"实体清单", r"出口管制",
-    r"财政部", r"证监会", r"国家发改委",
+    r"财政部", r"国家发改委",
 ]
 
 
@@ -4645,21 +4743,55 @@ def is_global_markets(text):
     return any(re.search(p, text) for p in GLOBAL_MARKET_PATTERNS)
 
 
+def wants_macro_tier(text, extra=None):
+    """
+    Should the macro/global tier even SEE this item? (The one admission test.)
+
+    A POSITIVE test: it must match a China-macro pattern or a systemic
+    global-markets pattern. It must NOT be "anything that is not about one of my
+    tickers" - that is how the tier filled up with Houthi missile strikes,
+    KFC/Pepsi deals, Alcoa earnings, hurricanes and India's fuel tax: the broad
+    country list makes almost every world-news headline a "foreign subject", and
+    the old test accepted every one of them. Three further rules:
+      - world drama has to clear the noise veto (is_world_noise);
+      - a central-bank NAME alone is small talk - a rate action or hard data is
+        required (SYSTEMIC_MARKERS);
+      - the user's own macro_keywords still count as macros.
+    """
+    if not text:
+        return False
+    if is_world_noise(text) and not any(
+            re.search(p, text) for p in STRONG_MACRO_PATTERNS):
+        return False
+    if is_macro(text, extra):
+        return True
+    if not is_global_markets(text):
+        return False
+    if any(re.search(p, text) for p in FOREIGN_CENTRAL_BANK_PATTERNS):
+        return any(re.search(p, text) for p in SYSTEMIC_MARKERS)
+    return True
+
+
 def news_tier(text, extra=None):
     """
     Route one headline to its tier: 'macro', 'global' or 'ticker'.
 
     Order matters and is deliberately simple:
-      1. a foreign central bank / US-economy reference WITHOUT a China anchor
-         -> 'global' (an ECB or Fed headline that also contains 加息);
-      2. a strong China-policy anchor -> 'macro';
-      3. a China monetary anchor (央行/降息/LPR/逆回购...) -> 'macro';
-      4. otherwise anything matching the global vocabulary -> 'global'.
+      1. WORLD NOISE (geopolitics, disasters, accidents, sport) -> 'ticker',
+         i.e. not collected, UNLESS it carries a strong China-policy anchor;
+      2. a foreign central bank / US-economy reference WITHOUT a China anchor
+         -> 'global';
+      3. a strong China-policy anchor -> 'macro';
+      4. a China monetary anchor (央行/降息/LPR/逆回购...) -> 'macro';
+      5. otherwise anything matching the global vocabulary -> 'global'.
 
     'extra' are the user's own macro_keywords (config), so a custom watchword
     routes exactly like the built-in ones.
     """
     if not text:
+        return "ticker"
+    if is_world_noise(text) and not any(
+            re.search(p, text) for p in STRONG_MACRO_PATTERNS):
         return "ticker"
     if _foreign_subject_only(text):
         return "global"
@@ -4753,10 +4885,8 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
     extra = [str(k) for k in (config.get("macro_keywords") or []) if str(k).strip()]
 
     def wanted(text):
-        """Would the China-macro OR the global-markets tier want this item?
-        (The caller splits the result with news_tier().) Being generous here is
-        cheap: the gate is a free regex and the per-run caps still apply."""
-        return news_tier(text) != "ticker"
+        """Admission test for the macro/global tiers (see wants_macro_tier)."""
+        return wants_macro_tier(text, extra)
 
     raw_items = []
     for wire_src in ("Eastmoney724", "Sina724"):
@@ -4834,8 +4964,33 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
                   f"{sum(1 for i in raw_items if i.get('source') == 'Regulator')} "
                   f"candidate(s).")
 
+    # INDUSTRY REGULATION, searched by THEME rather than by company name. This is
+    # the source that catches "15家助贷平台提交专项审计报告" / "互联网贷款自律筹备组
+    # 将扩容": sector-wide rules that name no issuer, so every per-ticker gate
+    # drops them and the company-name queries never return them. Free (Google
+    # News + the Eastmoney search API in title scope), and admission is strict -
+    # a sector noun AND a policy/action word.
+    if src_on("sector_regulation"):
+        added = 0
+        for q in SECTOR_REGULATORY_QUERIES:
+            for res in (fetch_rss(google_news_url(q, "zh"), "MACRO", None,
+                                  source="Sector", lang="zh"),
+                        fetch_eastmoney_search(q, terms=[q.split()[0]])):
+                for it in (res or []):
+                    text = f"{it.get('title', '')} {it.get('snippet', '')}"
+                    if not is_sector_regulation(text):
+                        continue
+                    item = dict(it)
+                    item["ticker"] = "MACRO"
+                    item["source"] = "Sector"
+                    raw_items.append(item)
+                    added += 1
+        if added:
+            print(f"  [macro] industry-regulation queries added {added} candidate(s).")
+
     seen_keys = set()
     subjects_seen = set()
+    titles_seen = recent_stored_titles(conn, "MACRO")
     candidates = []
     for it in raw_items:
         # Same hard freshness backstop as the per-ticker path: a macro wire/
@@ -4864,6 +5019,15 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
         if key in seen_keys:
             continue
         seen_keys.add(key)
+        # Same-title guard. The macro path used to bypass it (it inserts rows
+        # directly instead of going through ingest_items), so an item arriving
+        # from two sources in one run was stored twice - the user saw the same
+        # headline twice in the panel, at the same second.
+        title_key = normalize_title(it.get("title", ""))
+        if title_key and title_key in titles_seen:
+            continue
+        if title_key:
+            titles_seen.add(title_key)
         it["published_at"] = _normalize_pub(it.get("date", ""))
         it["first_seen"] = run_start
         if is_new(conn, "MACRO", it["source"], it["id"], it["title"]):

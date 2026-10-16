@@ -129,6 +129,7 @@ DEFAULT_CONFIG = {
         "exa": True,  # EXA neural per-ticker impact search
         "exa_macro": True,  # EXA neural macro search (semantic, no regex)
         "regulators": True,  # NFRA/CSRC/PBoC penalty announcements (macro tier)
+        "sector_regulation": True,  # industry rules searched by THEME, no company name
         "baidu": False,  # captcha-blocked from server IPs - off by default
         "tavily": True,
         "google_news_en": True,
