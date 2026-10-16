@@ -257,6 +257,17 @@ GLOBAL_MARKETS_MAX_PER_RUN = 2
 # score (they showed as "—" in the panel). Everything not stored is simply not
 # seen again, so the DB stays a record of notable macro news.
 MACRO_STORE_MAX_PER_RUN = 12
+# Which macro sources win the (bounded) storage slots when a run finds more than
+# the cap allows. Lower wins. Industry regulation and regulator documents are the
+# user's core alpha, so they are never crowded out by the wire tape.
+MACRO_SOURCE_PRIORITY = {
+    "Sector": 0,        # industry rules by theme (15 lenders audited, etc.)
+    "Regulator": 1,     # NFRA/CSRC/PBoC penalty documents
+    "ExaMacro": 2,      # semantic macro
+    "GoogleNewsMacro": 2,
+    "Eastmoney724": 3,  # the wire tape
+    "Sina724": 3,
+}
 # Minimum AI score for an item to occupy a CHINA MACRO seat. The macro section
 # is pushed in addition to the digest seats and was never floor-capped, so a
 # routine item scored 4 used to take one of its three places. Configurable:
@@ -5039,9 +5050,26 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
     # notable macro news instead of a dump of the tape.
     store_cap = max(1, _cfg_int(config, "macro_store_max_per_run",
                                 MACRO_STORE_MAX_PER_RUN))
+    # Collapse same-story copies BEFORE the cap: one regulatory story arrives from
+    # 新浪/搜狐/雪球/界面 with four different headlines, and without this the 12
+    # slots held ~6 distinct stories. Keeps the best-sourced copy of each.
+    candidates, collapsed = dedupe_same_story(candidates)
+    if collapsed:
+        print(f"  [macro] collapsed {collapsed} same-story macro copy(ies).")
     if len(candidates) > store_cap:
+        # PRIORITY, not insertion order. The cap used to take the first N
+        # candidates, and the wires are collected first - so on a busy run the
+        # 12 slots went to wire items and the industry-regulation and regulator
+        # candidates (the whole point of those sources) were cut off before they
+        # could be scored. Sector regulation wins a seat, then regulator
+        # penalties, then the semantic/Google macro query, then the wires.
+        def _cap_key(it):
+            prio = MACRO_SOURCE_PRIORITY.get(it.get("source", ""), 2)
+            dt = _parse_pub(it.get("published_at") or it.get("date") or "")
+            return (prio, -(dt.timestamp() if dt else 0))
+        candidates.sort(key=_cap_key)
         print(f"  [macro] {len(candidates)} candidate(s) passed the quality gate; "
-              f"storing the newest {store_cap}.")
+              f"storing the top {store_cap} by priority (industry/regulator first).")
         candidates = candidates[:store_cap]
     for it in candidates:
         mark_seen(conn, "MACRO", it["source"], it["id"], it["title"], it.get("url", ""))
