@@ -42,6 +42,17 @@ news_updater.lock
 _test_ai.py
 .edgar_cache/
 
+# Ad-hoc scratch / diagnostic dumps (one-off scripts and data pulled while
+# debugging). These were accidentally committed once - a dump of the real
+# archive - so the patterns are pinned here rather than relying on remembering
+# to delete them before `git add`.
+_*.py
+_*.json
+_*.db
+_*.db-shm
+_*.db-wal
+!/.gitignore
+
 # Local audit workspace.
 #
 # The TOOLING in here is versioned on purpose: a test suite that only exists on

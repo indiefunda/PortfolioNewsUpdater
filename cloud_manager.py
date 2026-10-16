@@ -161,7 +161,7 @@ POST_ONLY_API = ("/api/upload", "/api/delete_news", "/api/auth_code")
 # them as GET; they are refused unless the request is same-origin (see
 # _origin_ok), which is what actually blocks the CSRF/DNS-rebinding vector.
 MUTATING_API = ("/api/auth", "/api/create_vm", "/api/run_now", "/api/purge_junk",
-                "/api/purge_duplicates",
+                "/api/purge_duplicates", "/api/regroup_events",
                 "/api/rediscover")
 
 
@@ -743,7 +743,8 @@ HTML = """<!DOCTYPE html>
       <input id="newsFilter" placeholder="Filter: ticker, category, title, source..." style="flex:1" onkeyup="renderNews()">
       <button class="btn-ghost" onclick="reload('news', loadNews)">📥 Load stored news</button>
       <button class="btn-ghost" onclick="translateAll()" title="Fill in English titles for stored items that have none (one batched AI call per ~25 headlines)">🌐 Translate missing</button>
-      <button class="btn-ghost" onclick="purgeJunk()" title="Step 1: delete stored, never-pushed items scored <= 2. Step 2: find rows that are the SAME story stored more than once, show them, and delete the extras (never a row that was pushed)">🧹 Purge junk &amp; duplicates</button>
+      <button class="btn-ghost" onclick="purgeJunk()" title="Step 1: delete stored junk - naive/crap rows (never-pushed items scored <= 2), off-topic MACRO rows, claim-farming and quote-page filler, and never-pushed rows the relevance gate now rejects. Step 2: same-story duplicates, showing them before deleting. Rows you were sent are kept, except junk.">🧹 Purge junk &amp; duplicates</button>
+      <button class="btn-ghost" onclick="regroupEvents()" title="One-off: ask the AI which stored rows describe the SAME event and keep one row per event. Use this to tidy rows written before one-row-per-event existed (e.g. one announcement stored from 12 outlets). Shows the plan before deleting; costs one AI call per ticker.">🧠 Collapse same-event rows (AI)</button>
     </div>
     <div class="status" id="newsStatus">Click "Load stored news" to fetch from the server.</div>
     <div class="hint">🇨🇳 marks a Chinese-language item. Click <b>EN</b> on a row to translate that one, or the <b>译</b> link to open the article through Google Translate.</div>
@@ -1094,6 +1095,29 @@ async function purgeJunk(){
   $('newsStatus').textContent = '🧹 Removing duplicates...';
   const c = await api('/api/purge_duplicates', {dry:false});
   $('newsStatus').textContent = c.ok ? ('✅ '+a.output+' | '+c.output) : '❌ '+(c.error||'duplicate purge failed');
+  loadNews();
+}
+
+// One-off archive tidy for the rows written BEFORE one-row-per-event existed:
+// the same announcement stored from a dozen outlets cannot be merged by any
+// mechanical rule (they are worded too differently), so the AI groups them.
+async function regroupEvents(){
+  $('newsStatus').textContent = '🔍 Asking the AI which stored rows are the same event...';
+  const b = await api('/api/regroup_events', {dry:true});
+  if(!b.ok){ $('newsStatus').textContent = '❌ '+(b.error||'regroup failed'); return; }
+  const m = /ROWS=([0-9]+)/.exec(b.output||'');
+  const n = m ? parseInt(m[1],10) : 0;
+  if(!n){
+    $('newsStatus').textContent = '✅ Every stored story is already a distinct event (nothing to merge).';
+    return;
+  }
+  const preview = (b.output||'').slice(0, 1200);
+  const pushed = /\\[P\\]/.test(b.output||'');
+  if(!confirm('The AI found '+n+' row(s) that are the SAME event as another stored row'
+      +(pushed?' (including some that were pushed)':'')+'.\\n\\nKeep one row per event and delete the rest?\\n\\n'+preview)) return;
+  $('newsStatus').textContent = '🧠 Merging same-event rows...';
+  const c = await api('/api/regroup_events', {dry:false});
+  $('newsStatus').textContent = c.ok ? ('✅ '+(c.output||'').split('\\n').pop()) : '❌ '+(c.error||'regroup failed');
   loadNews();
 }
 
@@ -1915,6 +1939,32 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"ok": ok, "error": (err or "") if not ok else "",
                          "dry": dry, "output": "\n".join(tail)})
 
+    def _handle_regroup_events(self):
+        """AI-group the stored rows into events and keep one row per event.
+
+        Same two-step contract as the duplicate purge: dry=true prints the plan
+        (and is free to re-run), dry=false applies it.
+        """
+        zone = find_vm_zone()
+        if not zone:
+            self._send_json({"ok": False, "error": "VM not found. Create the server first."})
+            return
+        data, error = self._read_json_body()
+        if error:
+            self._send_json({"ok": False, "error": error}, 400)
+            return
+        dry = bool((data or {}).get("dry"))
+        flag = ("--dry-run --regroup-events" if dry else "--regroup-events")
+        home = get_vm_home(zone)
+        ok, out, err = run_gcloud([
+            "compute", "ssh", "--zone", zone, VM_NAME,
+            "--command", f"cd {home} && python3 news_updater.py {flag} 2>&1",
+            "--quiet"], timeout=600)
+        tail = (out + err).strip().splitlines()
+        tail = tail[-30:] if len(tail) > 30 else tail
+        self._send_json({"ok": ok, "error": (err or "") if not ok else "",
+                         "dry": dry, "output": "\n".join(tail)})
+
     def _handle_delete_news(self):
         """
         Delete ONE stored news row on the VM (the panel's per-row ✕ button).
@@ -2127,6 +2177,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_purge_junk()
         elif parsed.path == "/api/purge_duplicates":
             self._handle_purge_duplicates()
+        elif parsed.path == "/api/regroup_events":
+            self._handle_regroup_events()
             return
         if parsed.path == "/api/rediscover":
             self._handle_rediscover()

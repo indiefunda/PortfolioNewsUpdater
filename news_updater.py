@@ -290,6 +290,58 @@ STORY_CONTAINMENT_MIN = 0.82
 # Used only by --purge-duplicates, which runs on stored rows by explicit
 # command, so digest behaviour is untouched.
 DUP_PURGE_SIMILARITY = 0.55
+
+# ---------------------------------------------------------------------------
+# Junk CONTENT (not junk hosts): pages that exist to be found, not to inform
+# ---------------------------------------------------------------------------
+# A live archive review found these on top of the world-news noise:
+#
+#   "Stockholder Alert: Robbins LLP Informs Investors of the Qfin Holdings Class
+#    Action" / "Deadline Soon: Qfin Holdings Shareholders Who Lost Money Urged
+#    To ..." / "QFIN Class Action Notice: Sued for Securities Fraud"
+#        -> claim-farming by law firms. Mass-published for EVERY US-listed ADR
+#           after any price drop, they say nothing about the business, and they
+#           were scoring 7 and reaching the digest.
+#   "Lufax Holding (LU) Stock Price, News, Quote & History - Yahoo Finance" /
+#    "... Stock Valuation, Peer Comparison & Price Target" / "... Reaches New
+#    1-Year Low" / "... Stock Holds Ground As Ownership Shifts"
+#        -> quote/valuation/template pages, not news.
+#
+# These are title-level patterns because the spam IS the title. Deliberately
+# narrow: an analyst action ("Morgan Stanley cuts QFIN price target") is real
+# news and must survive, so bare "price target" is NOT here.
+JUNK_CONTENT_PATTERNS = (
+    r"class action", r"stockholder alert", r"shareholder alert",
+    r"investors? (?:with losses|may seek|encouraged|urged)",
+    r"shareholders? (?:who lost|urged|encouraged)",
+    r"deadline (?:soon|approaching|reminder)", r"lead plaintiff",
+    r"law offices? of", r"\bLLP\b", r"law firm",
+    r"encouraged to (?:contact|secure)", r"shareholder rights",
+    r"reminds investors", r"investigation on behalf of",
+    r"集体诉讼", r"投资者索赔",
+    # Quote / valuation / template pages.
+    r"stock price,? news,? quote", r"quote & history", r"stock valuation",
+    r"peer comparison", r"consensus (?:target|price target|rating)",
+    r"reaches? new (?:1|one)-year (?:low|high)",
+    r"sets new (?:12|twelve)-month (?:low|high)",
+    r"stock (?:holds|holding) (?:ground|steady)",
+    r"here'?s what happened", r"stock price today",
+    r"press releases?$", r"earnings calendar for", r"options chain",
+)
+
+
+def is_junk_content(text):
+    """
+    True for claim-farming / quote-page filler that is not news about a company.
+
+    Applied to the TITLE (plus title_en) only: the spam is the headline itself,
+    and matching a snippet would drop real articles that merely quote a law
+    firm or link a price page.
+    """
+    if not text:
+        return False
+    low = str(text).lower()
+    return any(re.search(p, low) for p in JUNK_CONTENT_PATTERNS)
 # How many of a ticker's already-pushed titles the mechanical repeat gate
 # compares a new candidate against.
 PUSH_REPEAT_HISTORY = 160
@@ -1862,12 +1914,16 @@ def _conflicting_actors(a, b):
     return bool(aa and ab and not (aa & ab))
 
 
-def _dup_pair_matches(row_a, row_b):
+def _dup_pair_matches(row_a, row_b, allow_pushed_victim=False):
     """Do these two STORED rows describe the same story?
 
     Every guard is checked against the pair directly - never through a chain of
     intermediate rows. The first dry run clustered transitively via a seed, so
     A~B and B~C pulled in A and C even when they were unrelated companies.
+
+    `allow_pushed_victim` is for the archive clean-up: when several DELIVERED
+    rows are the same event (the 8-outlets-one-announcement case), the event is
+    still represented by the kept row, so the extra delivered copies may go.
     """
     title_a, title_b = row_a[4] or "", row_b[4] or ""
     if _conflicting_symbols(title_a, title_b):
@@ -1899,13 +1955,16 @@ def _dup_keep_rank(row):
     )
 
 
-def find_duplicate_groups(conn, ticker=None):
+def find_duplicate_groups(conn, ticker=None, allow_pushed_victims=False):
     """Cluster stored rows into same-story groups.
 
     Returns a list of {"keeper": row, "victims": [rows]}. A row that was PUSHED
-    is never a victim: it records something actually delivered, and deleting it
-    would make the browse view disagree with what was sent. If a cluster holds
-    several pushed rows, all are kept and only the unpushed extras go.
+    is normally never a victim: it records something actually delivered, and
+    deleting it would make the browse view disagree with what was sent. If a
+    cluster holds several pushed rows, all are kept and only the unpushed extras
+    go - unless `allow_pushed_victims`, where the extra DELIVERED copies of one
+    event are removed as well (the kept row still represents that event, so
+    nothing about the delivery record is lost).
     """
     sql = f"SELECT {_DUP_COLS} FROM news"
     params = ()
@@ -1938,7 +1997,9 @@ def find_duplicate_groups(conn, ticker=None):
             # seed happened to start the cluster: the greedy pass can chain
             # unrelated rows together, and it is the keeper that survives.
             victims = [r for r in cl["rows"]
-                       if r is not keeper and not r[6] and _dup_pair_matches(keeper, r)]
+                       if r is not keeper
+                       and (allow_pushed_victims or not r[6])
+                       and _dup_pair_matches(keeper, r)]
             if victims:
                 groups.append({"keeper": keeper, "victims": victims,
                                "cluster_size": len(cl["rows"])})
@@ -1987,6 +2048,88 @@ def _print_duplicate_groups(groups, removed, dry_run):
     # dry run and then asks the user before deleting anything. Parsing the
     # prose above would break the moment the wording changed.
     print(f"  [purge-dups] GROUPS={len(groups)} ROWS={removed}")
+
+
+def regroup_events(conn, ticker=None, dry_run=True, config=None, secrets=None,
+                   max_rows=60):
+    """
+    Collapse the ARCHIVE's same-event rows with the AI (one call per ticker).
+
+    Needed because the archive predates the one-row-per-event pipeline: a single
+    announcement stored from 12 outlets stays as 12 rows until retention expires,
+    and no mechanical rule can merge them safely - the strict matcher rightly
+    refuses (those rows are worded very differently), while a looser same-day
+    rule starts merging genuinely distinct stories (three separate Fed remarks,
+    a data release and its revision).
+
+    Returns (groups, victims, error). With dry_run the database is only read.
+    """
+    if conn is None:
+        return [], [], "no database"
+    key = (secrets or {}).get("ai_api_key", "")
+    if not key:
+        return [], [], "no AI key configured"
+    config = config or {}
+    sql = ("SELECT id, ticker, COALESCE(NULLIF(title_raw,''), title_en), importance,"
+           " pushed, first_seen FROM news")
+    params = ()
+    if ticker:
+        sql += " WHERE ticker=?"
+        params = (ticker,)
+    sql += " ORDER BY first_seen DESC"
+    rows = conn.execute(sql, params).fetchall()
+    by_ticker = {}
+    for r in rows:
+        by_ticker.setdefault(r[1], []).append(r)
+
+    base = config.get("ai_base_url") or DEFAULT_AI_BASE
+    model = config.get("ai_model") or DEFAULT_AI_MODEL
+    groups, victims = [], []
+    for tk, items in sorted(by_ticker.items()):
+        if len(items) < 2:
+            continue
+        batch = items[:max_rows]
+        listing = [{"id": r[0], "date": str(r[5])[:10], "title": (r[2] or "")[:180]}
+                   for r in batch]
+        prompt = (
+            "Group these stored news headlines into EVENTS. Two headlines belong "
+            "to the same event when they report the SAME thing happening - a "
+            "regulator's announcement covered by several outlets, the same data "
+            "release, the same filing. Being about the same topic or industry is "
+            "NOT the same event; a different fact, a different date or a "
+            "different actor is a different event.\n"
+            'Return ONLY {"groups": [[id, id, ...], [id], ...]} listing EVERY id '
+            "exactly once. Put a single id in its own group when it is its own "
+            "event.\n\nHEADLINES:\n" + json.dumps(listing, ensure_ascii=False))
+        content = _chat(base, model, key,
+                        "You are a precise JSON-returning news editor.", prompt)
+        parsed = _parse_json_object(content) if content else None
+        if not parsed or not isinstance(parsed.get("groups"), list):
+            return groups, victims, f"AI returned nothing usable for {tk}"
+        known = {r[0]: r for r in batch}
+        seen_ids = set()
+        for grp in parsed["groups"]:
+            ids = []
+            for x in (grp if isinstance(grp, list) else [grp]):
+                try:
+                    i = int(x)
+                except (TypeError, ValueError):
+                    continue
+                if i in known and i not in seen_ids:
+                    ids.append(i)
+                    seen_ids.add(i)
+            if len(ids) < 2:
+                continue
+            members = [known[i] for i in ids]
+            keeper = min(members, key=lambda r: (0 if r[4] else 1, -(r[3] or 0)))
+            drop = [r for r in members if r is not keeper]
+            groups.append({"ticker": tk, "keeper": keeper, "victims": drop})
+            victims.extend(drop)
+        # Rows the model forgot are left alone on purpose (never delete on a gap).
+    if victims and not dry_run:
+        conn.executemany("DELETE FROM news WHERE id=?", [(v[0],) for v in victims])
+        conn.commit()
+    return groups, victims, ""
 
 
 def dedupe_same_story(items):
@@ -2279,6 +2422,14 @@ def ingest_items(conn, all_new, source, items, ticker, since_dt, max_age_hours,
         # browser).
         if is_junk_host(item.get("url", "")) or is_junk_host(item.get("origin", "")):
             bump("junk_host")
+            continue
+        # Claim-farming and quote/valuation template pages. These are not news
+        # about the business ("Stockholder Alert: ... LLP Informs Investors of the
+        # Qfin Holdings Class Action", "Lufax (LU) Stock Price, News, Quote &
+        # History"). They were scoring 7 and reaching the digest, so they are
+        # dropped here rather than stored and scored.
+        if is_junk_content(f"{item.get('title', '')} {item.get('title_en', '')}"):
+            bump("junk_content")
             continue
         if not is_new(conn, ticker, item["source"], item["id"], item["title"]):
             bump("already_seen")
@@ -5264,6 +5415,9 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
         # of them also showed up with no importance at all.
         if market_noise(hay):
             continue
+        # Claim-farming / quote-page filler is not macro news either.
+        if is_junk_content(f"{it.get('title', '')} {it.get('title_en', '')}"):
+            continue
         # Same speaker, same run -> one story, but keyed PER SOURCE: the two wires
         # often carry different remarks from the same ministry, and one shared set
         # silently collapsed them into a single item.
@@ -5622,6 +5776,9 @@ def adhoc_collect(ticker, meta, config, secrets, days=ADHOC_DEFAULT_DAYS):
         # scan NEVER touches the database, so that safety net never ran here and
         # a content farm linked from Google News went straight into the overview.
         if is_junk_host(it.get("url", "")):
+            continue
+        # Claim-farming / quote-page filler has no place in a research overview.
+        if is_junk_content(f"{it.get('title', '')} {it.get('title_en', '')}"):
             continue
         # For an ad-hoc scan we keep sector-relevant items too (the user is
         # researching), but never anything unrelated to the company or sector.
@@ -6523,50 +6680,119 @@ def main():
         sys.exit(0)
 
     if any(a == "--purge-junk" or a.startswith("--purge-junk=") for a in sys.argv):
-        # One-time cleanup of stored trash (never-pushed items scored at or
-        # below the junk bar). Run this after a filter fix to clean history.
-        threshold = 2
+        # Archive clean-up. Run this after a filter fix: age-based pruning keeps
+        # rows for 21 days, so everything the OLD gates let through would linger
+        # for weeks - and a junk row the old gate scored 7-8 looked legitimate.
+        #
+        # FOUR rules, and the last three deliberately ignore `pushed`: a delivered
+        # claim-farming alert or a "Stock Price, News, Quote & History" page is
+        # still junk, and the user asked for it gone from the browse view. The
+        # dedup memory (seen / pushed_stories) is untouched, so nothing comes back.
+        #   1. never-pushed rows scored at or below the junk bar
+        #   2. MACRO rows that no longer pass the macro/sector gate
+        #   3. claim-farming / quote-page filler (JUNK_CONTENT_PATTERNS)
+        #   4. per-ticker rows the CURRENT relevance gate rejects
+        threshold, preview = 2, False
         for a in sys.argv:
             if a.startswith("--purge-junk"):
                 parts = a.split("=", 1)
                 if len(parts) == 2 and parts[1].strip().isdigit():
                     threshold = int(parts[1].strip())
-        if NO_WRITE:
+                elif len(parts) == 2 and parts[1].strip() in ("preview", "dry-run"):
+                    preview = True
+        if NO_WRITE and not preview:
             print("  [purge] --no-write set - nothing deleted.")
             sys.exit(0)
-        conn = _db()
-        cur = conn.execute(
-            "DELETE FROM news WHERE pushed=0 AND importance IS NOT NULL "
-            "AND importance <= ?", (threshold,))
-        deleted = cur.rowcount
+        conn = _readonly_db() if preview else _db()
+        rules = {"low_score": set(), "off_topic_macro": set(),
+                 "junk_content": set(), "unrelated": set()}
+        meta_all = load_config().get("ticker_meta") or {}
+        for rid, tk, raw, en, snippet, imp, pushed in conn.execute(
+                "SELECT id, ticker, title_raw, title_en, snippet, importance, pushed "
+                "FROM news").fetchall():
+            title = f"{raw or ''} {en or ''}".strip()
+            text = f"{title} {snippet or ''}"
+            if is_junk_content(title):
+                rules["junk_content"].add(rid)
+                continue
+            if (tk or "").upper() == "MACRO":
+                if not (wants_macro_tier(text) or is_sector_regulation(text)):
+                    rules["off_topic_macro"].add(rid)
+                continue
+            meta = meta_all.get((tk or "").upper())
+            # The relevance rule only removes rows that were NEVER delivered.
+            # Re-checking the gate can disagree with the judgement the run made
+            # at the time (a peer's news, a parent-group entity), and deleting
+            # something the user actually received is the one irreversible
+            # mistake here. Junk content and off-topic macro are different: those
+            # are junk whether or not they were sent.
+            if meta and not pushed and passes_relevance(
+                    {"ticker": tk, "title": raw or "", "snippet": snippet or ""},
+                    meta, resolve_relevance(meta)) == "unrelated":
+                rules["unrelated"].add(rid)
+            elif not pushed and imp is not None and imp <= threshold:
+                rules["low_score"].add(rid)
+        victims = sorted(set().union(*rules.values()))
+        if preview:
+            print(f"  [purge] PREVIEW - nothing deleted. {len(victims)} of the "
+                  f"stored rows would go:")
+            for name, ids in rules.items():
+                print(f"    {name:18} {len(ids):4} row(s)")
+                for rid in sorted(ids)[:3]:
+                    row = conn.execute("SELECT ticker, title_raw, pushed FROM news "
+                                       "WHERE id=?", (rid,)).fetchone()
+                    if row:
+                        print(f"        [{row[0]}] {'pushed' if row[2] else 'stored'} "
+                              f"{(row[1] or '')[:60]}")
+            conn.close()
+            sys.exit(0)
+        for i in range(0, len(victims), 200):
+            chunk = victims[i:i + 200]
+            conn.execute("DELETE FROM news WHERE id IN (%s)"
+                         % ",".join("?" * len(chunk)), chunk)
         conn.commit()
-        # Also clear STORED MACRO rows that no longer pass the gate. After the
-        # 2026-10-15 macro overhaul the archive still held the old firehose
-        # (Houthi strikes, KFC/Pepsi, Alcoa, hurricanes) because age-based pruning
-        # keeps rows for 21 days - and a high-scored one from the old gate would
-        # linger for weeks. Pushed rows are kept (they really were delivered).
-        stale_macro = []
-        try:
-            rows = conn.execute(
-                "SELECT id, title_raw, title_en, snippet FROM news "
-                "WHERE ticker='MACRO' AND pushed=0").fetchall()
-            for rid, raw, en, snippet in rows:
-                text = f"{raw or ''} {en or ''} {snippet or ''}"
-                if wants_macro_tier(text) or is_sector_regulation(text):
-                    continue
-                stale_macro.append(rid)
-            for i in range(0, len(stale_macro), 200):
-                chunk = stale_macro[i:i + 200]
-                conn.execute(
-                    "DELETE FROM news WHERE id IN (%s)"
-                    % ",".join("?" * len(chunk)), chunk)
-            conn.commit()
-        except sqlite3.Error as exc:
-            print(f"  [purge] macro cleanup skipped: {exc}", file=sys.stderr)
         conn.close()
-        print(f"  [purge] deleted {deleted} stored junk item(s) "
-              f"(pushed=0, importance <= {threshold}) and {len(stale_macro)} "
-              f"off-topic MACRO row(s) that no longer pass the gate.")
+        print(f"  [purge] removed {len(victims)} row(s): "
+              f"{len(rules['low_score'])} low-score, "
+              f"{len(rules['off_topic_macro'])} off-topic MACRO, "
+              f"{len(rules['junk_content'])} claim-farming/quote-page, "
+              f"{len(rules['unrelated'])} unrelated-to-the-company.")
+        sys.exit(0)
+
+    if any(a.startswith("--regroup-events") for a in sys.argv):
+        # ONE-OFF archive tidy: ask the AI which stored rows are the same event
+        # and keep one row per event. The archive predates the one-row-per-event
+        # pipeline, so an announcement stored from 12 outlets is still 12 rows -
+        # and no mechanical rule merges them safely (see regroup_events).
+        ticker_arg = None
+        for a in sys.argv:
+            if a.startswith("--regroup-events"):
+                parts = a.split("=", 1)
+                if len(parts) == 2 and parts[1].strip():
+                    ticker_arg = parts[1].strip().upper()
+        dry = "--dry-run" in sys.argv or NO_WRITE
+        config, secrets = load_config(), load_secrets()
+        conn = _readonly_db() if dry else _db()
+        groups, victims, err = regroup_events(conn, ticker=ticker_arg, dry_run=True,
+                                              config=config, secrets=secrets)
+        if err:
+            print(f"  [regroup] {err}")
+        verb = "would remove" if dry else "removing"
+        print(f"  [regroup] {len(groups)} event group(s); {verb} {len(victims)} row(s).")
+        for g in groups[:25]:
+            k = g["keeper"]
+            print(f"    keep [{'P' if k[4] else ' '}] ⭐{k[3]} {(k[2] or '')[:72]}")
+            for v in g["victims"]:
+                print(f"    drop [{'P' if v[4] else ' '}] ⭐{v[3]} {(v[2] or '')[:72]}")
+        if len(groups) > 25:
+            print(f"    ... and {len(groups) - 25} more group(s)")
+        if not dry and victims:
+            conn.executemany("DELETE FROM news WHERE id=?", [(v[0],) for v in victims])
+            conn.commit()
+        # Stable machine-readable line for the panel (it sizes the job with a dry
+        # run and asks before deleting anything).
+        print(f"  [regroup] GROUPS={len(groups)} ROWS={len(victims)}")
+        conn.close()
         sys.exit(0)
 
     if any(a == "--rediscover" or a.startswith("--rediscover=") for a in sys.argv):
