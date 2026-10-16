@@ -283,39 +283,69 @@ MACRO_TRIAGE_POOL_MAX = 60
 # The relevance test handed to the model for the macro/global tiers. Written
 # from the user's own junk reports, because "is this macro?" is not the question -
 # "does this change anything for MY portfolio?" is.
-RELEVANCE_TEST_PROMPT = (
-    "RELEVANCE TEST - you are filtering a Chinese financial newswire for ONE "
-    "investor whose portfolio is US-listed Chinese ADRs, mainly consumer-lending "
-    "fintech (QFIN/奇富科技, LX/乐信, LU/陆金所), plus consumer insurance and "
-    "industrials. For each item decide relevant=true ONLY if it could change what "
-    "that investor thinks about those holdings or their sector. Be STRICT: the "
-    "wire prints thousands of items a day and a false positive is worse than a "
-    "false negative.\n"
+#
+# The holdings list is built from the CONFIG, not baked in. It used to name three
+# tickers of one specific portfolio ("QFIN/奇富科技, LX/乐信, LU/陆金所 ... consumer-
+# lending fintech"), which quietly mis-tested any other watchlist: add a US stock
+# or a retailer and the model was still told to care about Chinese consumer
+# lending. `portfolio_note` (config) lets the user describe the focus in their own
+# words; without it the test still works from the ticker names alone.
+RELEVANCE_TEST_HEADER = (
+    "RELEVANCE TEST - you are filtering a financial newswire for ONE investor "
+    "whose watchlist is: {holdings}. For each item decide relevant=true ONLY if it "
+    "could change what that investor thinks about those holdings or their sector. "
+    "Be STRICT: the wire prints thousands of items a day and a false positive is "
+    "worse than a false negative.\n"
     "relevant=TRUE examples:\n"
-    "  - China monetary/fiscal policy: LPR, RRR, 国常会, 政治局, 财政部 stimulus\n"
-    "  - China financial regulation, especially lending/consumer finance/credit "
-    "reporting/assisted lending: 金融监管总局, 助贷, 消费金融, 征信, 小额贷款, "
-    "rate caps, licence actions\n"
-    "  - CSRC/PBoC rules, ADR/delisting/index rules affecting 中概股\n"
-    "  - a Federal Reserve rate decision or a US inflation/labour surprise that "
-    "moves rate expectations (CPI/PPI/payrolls), major US-China tariffs, "
-    "sanctions or export controls\n"
+    "  - policy or regulation that directly governs those companies' business, "
+    "their market or their funding\n"
+    "  - central-bank rate decisions and inflation/labour surprises that move "
+    "rate expectations in the market where they are listed\n"
+    "  - tariffs, sanctions, export controls, delisting or listing rules that "
+    "affect them or their home market\n"
     "  - news about one of the holdings' own sector peers that changes the "
     "competitive picture\n"
     "relevant=FALSE examples (these are the ones to reject):\n"
     "  - ANY other country's purely domestic news: 'Sri Lanka RMB clearing bank "
     "opened in Colombo', India fuel taxes, KFC/Pepsi deals, Alcoa results\n"
     "  - geopolitics, military action, disasters, accidents, sport\n"
-    "  - industrial/energy/technology policy with no link to finance "
+    "  - industrial/energy/technology policy with no link to these businesses "
     "('three ministries approve hydrogen pilots in five city clusters')\n"
     "  - an index recap that lists constituent moves ('Nasdaq Golden Dragon "
     "China Index falls 0.5%; X -7.5%, Y -4.3%')\n"
-    "  - a single A-share company's announcement (a placement approval, a "
-    "director's share sale, an unrelated company's penalty)\n"
-    "  - a foreign data point with no rate implication (New York manufacturing "
-    "index, money-market fund assets, foreign central banks' Treasury holdings)\n"
+    "  - a single unrelated listed company's announcement (a placement approval, "
+    "a director's share sale, someone else's penalty)\n"
+    "  - a data point with no rate or demand implication for those businesses "
+    "(a regional manufacturing index, money-market fund assets, foreign central "
+    "banks' Treasury holdings)\n"
     "  - small talk from a central-bank official with no policy signal\n"
 )
+
+
+def portfolio_brief(config, limit=14):
+    """
+    One line naming the user's holdings, built from THEIR config.
+
+    Used by the macro relevance test and the impact framing, so the model is
+    always told about the actual watchlist instead of a hardcoded one.
+    """
+    tickers = [str(t).strip().upper() for t in (config.get("tickers") or [])
+               if str(t).strip()]
+    meta_all = config.get("ticker_meta") or {}
+    parts = []
+    for t in tickers[:limit]:
+        meta = meta_all.get(t) or {}
+        label = str(meta.get("name_zh") or meta.get("name_en") or "").strip()
+        parts.append(f"{t} ({label})" if label else t)
+    note = str(config.get("portfolio_note") or "").strip()
+    if not parts:
+        return note or "the companies on the user's watchlist"
+    return ", ".join(parts) + (f" - {note}" if note else "")
+
+
+def relevance_test_prompt(config):
+    """The relevance test with THIS user's holdings in it (see above)."""
+    return RELEVANCE_TEST_HEADER.format(holdings=portfolio_brief(config))
 # Near-duplicate detection: two items for the same ticker whose titles share
 # this much of their token sets are the SAME story from different outlets.
 STORY_JACCARD_MIN = 0.6
@@ -1023,6 +1053,15 @@ def mark_seen(conn, ticker, source, item_id, title, url):
     conn.commit()
 
 
+# A US-style ticker symbol. Used to decide whether EDGAR is worth a request at
+# all: a Hong Kong, Shanghai, Tokyo or London symbol has no US filings.
+#
+# The dot form is restricted to the US class-share / rights suffixes, because
+# "VOD.L" (London) and "BRK.B" (NYSE class B) are indistinguishable otherwise -
+# a first version accepted any ".X" and happily queried EDGAR for Vodafone.
+US_SYMBOL_RE = re.compile(r"^[A-Z]{1,5}$|^[A-Z]{1,5}\.(?:A|B|C|U|WS|RT|PR)$")
+
+
 def stage_item(conn, item):
     """
     Land a fetched item in the STAGING area (not in `news` yet).
@@ -1152,23 +1191,34 @@ def promote_run(conn, items, run_id=None):
     return len(canonical), copies, known
 
 
-def promote_stale_staging(conn, keep_hours=48):
+def promote_stale_staging(conn, keep_hours=48, current_run_id=None):
     """
     Recover a run that died between staging and promotion.
 
     Its items are already marked `seen`, so without this they would be dropped
     silently. They are promoted UNSCORED (importance stays NULL) and
     rescue_orphans scores them on the next run.
+
+    `current_run_id` makes the recovery IMMEDIATE: promote_run marks every row of
+    its own run as handled when it finishes, so an un-promoted row carrying a
+    DIFFERENT run id can only mean that run never finished. Waiting `keep_hours`
+    for those (the old behaviour) meant a crashed run's news sat invisible for up
+    to two runs - and since runs are 8-14h apart, 48h was uncomfortably close to
+    prune_staging's 3-day deletion, i.e. a genuine risk of losing it.
     """
     if NO_WRITE or conn is None:
         return 0
     cutoff = (datetime.now(EASTERN) - timedelta(hours=keep_hours)) \
         .strftime("%Y-%m-%d %H:%M:%S")
+    sql = ("SELECT id, ticker, source, lang, item_hash, title_raw, snippet, url,"
+           " published_at FROM staging WHERE promoted=0 AND (first_seen < ?")
+    params = [cutoff]
+    if current_run_id:
+        sql += " OR (run_id != ? AND run_id != '')"
+        params.append(str(current_run_id))
+    sql += ")"
     try:
-        rows = conn.execute(
-            "SELECT id, ticker, source, lang, item_hash, title_raw, snippet, url,"
-            " published_at FROM staging WHERE promoted=0 AND first_seen < ?",
-            (cutoff,)).fetchall()
+        rows = conn.execute(sql, tuple(params)).fetchall()
     except sqlite3.Error:
         return 0
     promoted = 0
@@ -2266,8 +2316,18 @@ def mentions_company(hay, names):
             continue
         if name in _GENERIC_NAME_WORDS:
             continue
-        if re.search(r"(?<![a-z0-9])" + re.escape(name) + r"(?![a-z0-9])", hay):
-            return True
+        if not re.search(r"(?<![a-z0-9])" + re.escape(name) + r"(?![a-z0-9])", hay):
+            continue
+        # A name token that is also ordinary English prose ("five", "open",
+        # "play", "love", "true") is not evidence on its own - "Five reasons the
+        # rally may stall" was matching Five Below. Require a market-story signal
+        # in the same headline, or symbol-style usage.
+        if name.lower() in PROSE_COLLISION_WORDS:
+            if not (any(re.search(r"(?<![a-z])" + re.escape(w) + r"(?![a-z])", hay)
+                        for w in CORPORATE_CONTEXT_WORDS)
+                    or _formal_symbol_form(name.lower(), hay)):
+                continue
+        return True
     return False
 
 
@@ -2371,9 +2431,26 @@ def passes_relevance(item, meta, resolved):
     # let one- and two-letter symbols collide with ordinary words in a noisy
     # excerpt ("lx", "lu", "yb"), which is how unrelated pages were classified
     # as being about the company.
+    #
+    # A SHORT ALPHABETIC TICKER IS USUALLY AN ENGLISH WORD, and that is not
+    # limited to one or two letters. Measured with real US tickers:
+    #   OPEN (Opendoor): "Markets open higher as inflation cools"  -> company
+    #   KEY  (KeyCorp):  "Key question for markets in 2027"        -> company
+    #   ALL  (Allstate): "All eyes on the Fed this week"           -> company
+    #   NOW  (ServiceNow): "Now is the time to buy bonds"          -> company
+    #   FIVE (Five Below): "Five reasons the rally may stall"      -> company
+    # Each would have been stored and pushed as news about that holding. So for
+    # any ticker of up to 5 Latin letters, the symbol only counts when the
+    # headline ALSO looks like a market story (a corporate/finance word) or uses
+    # a formal symbol form - "OPEN reports Q3 results", "KeyCorp (KEY) announces
+    # buyback", "NASDAQ:OPEN", "$KEY". Longer symbols (LexinFintech, AAPL) and
+    # any symbol containing a digit or dot (0700.HK, BRK.B) are unambiguous.
     ticker = str(item.get("ticker") or "").lower()
     if ticker and re.search(r"(?<![a-z0-9])" + re.escape(ticker) + r"(?![a-z0-9])", title_l):
-        if len(ticker) > 2:
+        ambiguous = (len(ticker) <= 2) or (ticker in PROSE_COLLISION_WORDS)
+        if not ambiguous:
+            return "company"
+        if _formal_symbol_form(ticker, title_l):
             return "company"
         # Even in the title, a one/two-letter symbol is usually an ordinary word
         # or another company: "Lu Xun's former residence", "Lu Zhiqiang resigns
@@ -2631,7 +2708,58 @@ CORPORATE_CONTEXT_WORDS = (
     "ceo", "cfo", "dividend", "buyback", "acquisition", "merger", "ipo",
     "regulator", "regulatory", "penalty", "fine", "investigation", "license",
     "delisting", "lawsuit", "partnership", "launch", "expands", "expansion",
+    # Analyst vocabulary and the standard market verbs: for a word-like ticker
+    # ("KEY upgraded to buy at Citi", "OPEN falls after guidance") these are what
+    # separate a story about the company from ordinary English.
+    "upgrade", "upgrades", "upgraded", "downgrade", "downgrades", "downgraded",
+    "target", "rating", "initiates", "coverage", "overweight", "underweight",
+    "outperform", "underperform", "surges", "plunges", "slides", "falls",
+    "rises", "jumps", "sinks", "soars", "tumbles", "insider", "shareholder",
+    "board", "appoints", "resigns", "hires", "layoffs", "restructuring",
+    "bankruptcy", "default", "settlement", "probe", "audit", "sanction",
 )
+
+
+# Words that are common in ordinary English news prose AND are plausible company
+# names or tickers. A match on one of these is not evidence that a headline is
+# about the company: "Key question for markets", "Five reasons the rally may
+# stall", "Markets open higher", "All eyes on the Fed", "Now is the time to buy".
+#
+# This is a LANGUAGE list, not a news-relevance one - it exists because English
+# has words that double as symbols, and it is applied to both the ticker and the
+# company-name match. Real brand names of the same length are unaffected
+# (Apple, Tesla, Visa, Uber, Meta, Nvidia, Opendoor, LexinFintech), which a
+# blanket "short tickers need context" rule would have broken.
+PROSE_COLLISION_WORDS = frozenset("""
+open five play love true move live good nice hope blue bell rock gold sand cash
+home tech food life time work week year day way own new old big low high free
+full best more most only just much many same next last first call plan post
+deal star park ship note mail shop room tree wave wind wine wood yard iron jade
+leaf mint navy oak palm peak pine rose sage silk snow soil steel stone west
+word line page list name case fact test term side sign site size type unit rate
+data fund trust group power water light money price value key all now any one
+off out top buy sell hold gain lose rise fall drop jump
+""".split())
+
+
+def _formal_symbol_form(ticker, title_l):
+    """
+    Does the title use the ticker as a SYMBOL rather than as a word?
+
+    "(OPEN)", "NASDAQ:OPEN", "$KEY", "KEY stock", "OPEN shares", "OPEN - Q3
+    results" are symbol usage. A bare "open" in ordinary prose is not, and that
+    distinction is what stops word-like tickers from matching every headline.
+    """
+    t = re.escape(ticker)
+    patterns = (
+        r"[\(\[]\s*" + t + r"\s*[\)\]]",                 # (OPEN) / [KEY]
+        r"(?:nasdaq|nyse|amex|otc|hkex|sehk|lse|tsx)\s*[:\-]\s*" + t,
+        r"\$" + t + r"(?![a-z0-9])",                     # $OPEN
+        r"(?<![a-z0-9])" + t + r"\s*[-–—]\s*\S",         # "OPEN - Q3 results"
+        r"(?<![a-z0-9])" + t + r"\s+(?:stock|shares?|ads|adr|equity|ticker|"
+        r"holdings?|inc|corp|ltd|plc)\b",
+    )
+    return any(re.search(p, title_l) for p in patterns)
 
 
 def company_stems(terms):
@@ -4794,19 +4922,28 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
                        if mode == "macro" else
                        "You are a global-markets analyst. Below are US/global "
                        "market news items that could move Chinese ADRs.\n")
+        if mode in ("macro", "global"):
+            # Macro tiers: framed around impact on the user's ACTUAL holdings -
+            # this used to name three tickers of one portfolio, so any other
+            # watchlist got its impact lines written about the wrong companies.
+            holdings = portfolio_brief(config)
+            analyst = ("You are a China macro analyst. Below are major China "
+                       "policy / market news items found today (already gated "
+                       "as macro-relevant).\n"
+                       if mode == "macro" else
+                       "You are a global-markets analyst. Below are US/global "
+                       "market news items that could move the user's holdings.\n")
             impact_scope = (
-                "what this means for US-listed Chinese fintech/consumer-lending "
-                "companies like 奇富科技 QFIN, 乐信 LX, 陆金所 LU - e.g. 'cheaper "
-                "funding for 分期乐's lending' or 'tighter assisted-loan rules "
+                f"what this means for the user's holdings ({holdings}) - e.g. "
+                "'cheaper funding for its lending arm' or 'tighter loan rules "
                 "pressure origination volume'; empty string if not applicable"
                 if mode == "macro" else
-                "what this means for US-listed Chinese ADRs, especially "
-                "consumer-lending fintechs (奇富科技 QFIN, 乐信 LX, 陆金所 LU); "
+                f"what this means for the user's holdings ({holdings}); "
                 "empty string if not applicable")
             prompt = (
                 analyst
                 + prompt_extra
-                + RELEVANCE_TEST_PROMPT
+                + relevance_test_prompt(config)
                 + "For EACH item return one JSON object with keys:\n"
                 "  number, relevant (true/false - see the RELEVANCE TEST above), "
                 "title_en (concise English translation), summary (one "
@@ -6053,7 +6190,7 @@ def analyze_macro(macro_items, config, secrets, conn, run_start, pseudo="MACRO")
     # call now (the wiring of relevant=false -> not stored lives in
     # analyze_macro). Without a key there is no triage, so the strict keyword
     # gate below stands in for it.
-    extra = RELEVANCE_TEST_PROMPT + "\n"
+    extra = relevance_test_prompt(config) + "\n"
     # The global-markets tier gets its own ⭐ scale: a systemic Fed/macro item
     # (8-10) versus an ordinary US session recap (2-4), so the cap keeps the
     # right ones.
@@ -7223,7 +7360,7 @@ def main():
     # Staging housekeeping: recover a run that died between staging and
     # promotion (its items are already marked `seen`, so they would vanish
     # otherwise), then drop the temporary rows the rolling cleanup owes.
-    promote_stale_staging(conn)
+    promote_stale_staging(conn, current_run_id=run_start)
     stale = prune_staging(conn)
     if stale:
         print(f"  [staging] pruned {stale} temporary row(s).")
@@ -7354,9 +7491,19 @@ def main():
 
         # 1) SEC filings (English, ADR regulatory coverage). A filing IS about
         #    the company by definition - no relevance filter needed.
+        #
+        #    Only for US-style symbols. EDGAR has nothing for "0700.HK" or
+        #    "600519.SS", and the lookup does not fail cleanly: it returns None,
+        #    which the fetch layer reads as "fetch failed" and therefore refuses
+        #    to advance the delta - so a non-US ticker logged a SEC warning and
+        #    burned an EDGAR request on EVERY run, forever.
         if src_on("sec"):
-            fetch_source("SEC", lambda sd: fetch_sec_filings(ticker, sd, conn=conn),
-                         src_status("sec", strict=False))
+            if US_SYMBOL_RE.match(ticker or ""):
+                fetch_source("SEC", lambda sd: fetch_sec_filings(ticker, sd, conn=conn),
+                             src_status("sec", strict=False))
+            else:
+                print(f"  {ticker}: not a US-listed symbol - skipping SEC "
+                      f"(nothing in EDGAR).")
 
         # 2) Chinese sources (the alpha) - require Chinese search terms.
         if zh_terms:
@@ -7389,27 +7536,37 @@ def main():
                              lambda sd: fetch_baidu_news(zh_terms[0], sd, terms=zh_terms),
                              src_status("baidu", strict=False))
 
-            # Tavily news search - the scarce resource. Skipped when the free
-            # sources (GoogleNewsZH/Eastmoney/Baidu) already covered this
-            # ticker this run, plus daily/monthly caps enforced inside.
-            if src_on("tavily"):
-                # Count only items THIS run found: rescued orphans are re-queued
-                # from previous runs, and letting them satisfy the "free sources
-                # already covered it" test silently skipped the paid searches
-                # (run history showed rescued_items 8 on a single run).
-                free_count = sum(1 for it in all_new
-                                 if it.get("ticker") == ticker and not it.get("rescued"))
-                min_free = _cfg_int(config, "tavily_min_free_items", TAVILY_MIN_FREE_ITEMS)
-                if free_count >= min_free:
-                    print(f"  {ticker}: free sources already found {free_count} "
-                          f"item(s) this run - skipping Tavily (saving credits).")
-                else:
-                    tav_query = " OR ".join(zh_terms[:2] + en_terms[:2])
-                    fetch_source(
-                        "Tavily",
-                        lambda sd: fetch_tavily(tav_query, secrets, config, sd,
-                                                terms=zh_terms + en_terms),
-                        src_status("tavily", strict=False))
+        # 2.4) Tavily news search - the scarce resource (free plan = 1,000
+        #      credits/month). Skipped when the free sources already covered this
+        #      ticker this run, plus daily/monthly caps enforced inside.
+        #
+        #      OUTSIDE the zh_terms block on purpose: it used to sit inside it,
+        #      which meant Tavily NEVER ran for a ticker with no Chinese name -
+        #      i.e. every US/European stock, and any Chinese company whose
+        #      Chinese name discovery had not run yet. Those tickers were left
+        #      with SEC + Google News EN only.
+        if src_on("tavily"):
+            # Count only items THIS run found: rescued orphans are re-queued
+            # from previous runs, and letting them satisfy the "free sources
+            # already covered it" test silently skipped the paid searches
+            # (run history showed rescued_items 8 on a single run).
+            tav_terms = zh_terms + en_terms
+            free_count = sum(1 for it in all_new
+                             if it.get("ticker") == ticker and not it.get("rescued"))
+            min_free = _cfg_int(config, "tavily_min_free_items", TAVILY_MIN_FREE_ITEMS)
+            if not tav_terms:
+                print(f"  {ticker}: no company terms yet - skipping Tavily "
+                      f"(a search with no terms would return anything).")
+            elif free_count >= min_free:
+                print(f"  {ticker}: free sources already found {free_count} "
+                      f"item(s) this run - skipping Tavily (saving credits).")
+            else:
+                tav_query = " OR ".join((zh_terms[:2] + en_terms[:2]) or [ticker])
+                fetch_source(
+                    "Tavily",
+                    lambda sd: fetch_tavily(tav_query, secrets, config, sd,
+                                            terms=tav_terms),
+                    src_status("tavily", strict=False))
 
         # 2.5) Google News restricted to the company's OWN websites (site:)
         #      - catches official announcements / press releases that no news

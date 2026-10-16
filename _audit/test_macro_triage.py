@@ -151,8 +151,16 @@ check("pool default is 60 candidates", nu.MACRO_TRIAGE_POOL_MAX == 60,
 check("storage cap stays small", nu.MACRO_STORE_MAX_PER_RUN <= 12,
       nu.MACRO_STORE_MAX_PER_RUN)
 check("the relevance test names the reject categories",
-      all(w in nu.RELEVANCE_TEST_PROMPT for w in
+      all(w in nu.RELEVANCE_TEST_HEADER for w in
           ("Sri Lanka", "hydrogen", "index recap", "geopolitics")))
+check("the relevance test is built from the USER's config, not hardcoded",
+      "QFIN" not in nu.relevance_test_prompt({"tickers": ["AAPL"],
+                                              "ticker_meta": {}})
+      and "AAPL" in nu.relevance_test_prompt({"tickers": ["AAPL"],
+                                              "ticker_meta": {}}))
+check("the real config names every holding",
+      all(t in nu.portfolio_brief(config) for t in config.get("tickers", [])),
+      nu.portfolio_brief(config))
 
 for suffix in ("", "-wal", "-shm"):
     if os.path.exists(path + suffix):

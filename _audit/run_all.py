@@ -43,6 +43,7 @@ OFFLINE = [
     ("py", "test_adhoc_events.py", []),
     ("py", "test_archive_cleanup.py", []),
     ("py", "test_macro_triage.py", []),
+    ("py", "test_stock_types.py", []),
     ("py", "test_crash_record.py", []),
     ("py", "test_purge_duplicates.py", []),
     ("py", "test_hosted_build.py", []),
