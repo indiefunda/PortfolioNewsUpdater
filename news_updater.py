@@ -953,7 +953,7 @@ def stage_item(conn, item):
     item["_staging_id"] = cur.lastrowid
 
 
-def _event_groups(items):
+def _event_groups(items, drop_known=True):
     """
     Group the run's items into EVENTS using the AI's own same-event judgement.
 
@@ -961,6 +961,11 @@ def _event_groups(items):
     THIS batch that describes the same event) and `known_event` (same as an
     already-delivered story). Nothing used that for storage - which is why one
     announcement from eight outlets became eight rows.
+
+    `drop_known=False` keeps `known_event` items as their own events instead of
+    discarding them: in the live pipeline "known" means "already delivered to
+    you" (so it is redundant), but in a read-only research scan it means
+    "recycled/older story" - history the user asked to see, just flagged.
 
     Returns (canonical_items, dropped_items). A dropped item is either a copy of
     a canonical item in this batch, or a recycled story already delivered.
@@ -972,7 +977,7 @@ def _event_groups(items):
         by_num[it["_number"]] = it
     dropped, copies = [], {}
     for it in items:
-        if it.get("is_known"):
+        if it.get("is_known") and drop_known:
             it["_drop_reason"] = "already_delivered"
             dropped.append(it)
             continue
@@ -5613,6 +5618,11 @@ def adhoc_collect(ticker, meta, config, secrets, days=ADHOC_DEFAULT_DAYS):
     items, seen = [], set()
     for it in collected:
         it.setdefault("ticker", ticker)
+        # Junk-host filter. The live pipeline is protected by insert_news, but a
+        # scan NEVER touches the database, so that safety net never ran here and
+        # a content farm linked from Google News went straight into the overview.
+        if is_junk_host(it.get("url", "")):
+            continue
         # For an ad-hoc scan we keep sector-relevant items too (the user is
         # researching), but never anything unrelated to the company or sector.
         verdict = passes_relevance({"ticker": ticker, "title": it.get("title", ""),
@@ -5641,14 +5651,24 @@ def adhoc_collect(ticker, meta, config, secrets, days=ADHOC_DEFAULT_DAYS):
 def adhoc_analyze(items, ticker, meta, config, secrets):
     """
     Score + label every article (ONE batched AI call) and then summarise the
-    overall recent sentiment (a second small call). Returns (articles, overall).
+    overall recent sentiment (a second small call). Returns (articles, overall,
+    merged) where `merged` counts same-event copies folded away.
+
+    The AI's same-event judgement is applied HERE too, not just in the live
+    pipeline: the scan used to list every copy it found, so a 12-outlet
+    announcement produced 12 identical rows in the overview AND skewed the
+    sentiment summary, because one event counted 12 times.
     """
     if not items:
-        return [], {}
+        return [], {}, 0
     enriched = ai_analyze(items, config, secrets, {ticker: meta},
                           conn=None, run_start=None, prompt_mode="ticker")
+    # One entry per EVENT (canonical item + the other outlets attached).
+    # `drop_known=False`: a scan is read-only research, so a recycled story is
+    # history to show (flagged), not a duplicate to discard.
+    canonical, dropped = _event_groups(enriched, drop_known=False)
     articles = []
-    for it in enriched:
+    for it in canonical:
         articles.append({
             "title": it.get("title", ""),
             "title_en": it.get("title_en") or it.get("title", ""),
@@ -5661,19 +5681,32 @@ def adhoc_analyze(items, ticker, meta, config, secrets):
             "category": it.get("category", ""),
             "reason": it.get("reason", ""),
             "impact": it.get("impact", ""),
+            "sources_count": it.get("sources_count") or 1,
+            "also_seen": it.get("also_seen") or [],
+            # The model flags a recycled old story (known_event). It stays in
+            # the list for reference but sorts last and is kept out of the
+            # sentiment read, so stale news cannot flatter the picture.
+            "recycled": bool(it.get("is_known")),
         })
+    # Most important first (the point of an overview), newest as the tiebreak,
+    # with recycled stories at the bottom.
+    articles.sort(key=lambda a: (1 if a["recycled"] else 0,
+                                 -(a.get("importance") or 0),
+                                 a.get("date") or ""), reverse=False)
 
     # ---- overall sentiment: one small call over the scored headlines ----
     overall = {}
     key = secrets.get("ai_api_key", "")
-    if key and articles:
+    fresh = [a for a in articles if not a["recycled"]] or articles
+    if key and fresh:
         base = config.get("ai_base_url") or DEFAULT_AI_BASE
         model = config.get("ai_model") or DEFAULT_AI_MODEL
         name_zh = meta.get("name_zh") or ticker
         brief = [
             {"n": i, "title": a["title_en"], "importance": a["importance"],
-             "sentiment": a["sentiment"], "date": a["date"], "category": a["category"]}
-            for i, a in enumerate(articles, 1)
+             "sentiment": a["sentiment"], "date": a["date"], "category": a["category"],
+             "outlets": a.get("sources_count") or 1}
+            for i, a in enumerate(fresh, 1)
         ]
         prompt = (
             f"Below are the {len(brief)} most relevant news items about the stock "
@@ -5698,7 +5731,7 @@ def adhoc_analyze(items, ticker, meta, config, secrets):
         parsed = _parse_json_object(content) if content else None
         if parsed:
             counts = {"positive": 0, "negative": 0, "neutral": 0}
-            for a in articles:
+            for a in fresh:
                 s = (a.get("sentiment") or "neutral").lower()
                 counts[s if s in counts else "neutral"] += 1
             overall = {
@@ -5709,7 +5742,7 @@ def adhoc_analyze(items, ticker, meta, config, secrets):
                 "drivers": parsed.get("drivers") or [],
                 "counts": counts,
             }
-    return articles, overall
+    return articles, overall, len(dropped)
 
 
 def adhoc_scan(ticker, config, secrets, days=ADHOC_DEFAULT_DAYS, refresh_profile=True):
@@ -5754,9 +5787,10 @@ def adhoc_scan(ticker, config, secrets, days=ADHOC_DEFAULT_DAYS, refresh_profile
     items, cost = adhoc_collect(ticker, meta, config, secrets, days=days)
 
     # 3) score + label, then summarise.
-    articles, overall = adhoc_analyze(items, ticker, meta, config, secrets)
+    articles, overall, merged = adhoc_analyze(items, ticker, meta, config, secrets)
     if secrets.get("ai_api_key"):
         cost["ai_calls"] = (1 if articles else 0) + (1 if overall else 0)
+    cost["duplicates_merged"] = merged
     result["articles"] = articles
     result["overall"] = overall
     result["cost"] = cost

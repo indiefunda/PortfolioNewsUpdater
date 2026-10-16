@@ -121,5 +121,7 @@ for suffix in ("", "-wal", "-shm"):
         os.remove(path + suffix)
 print()
 print("FAILURES:", len(fails), fails)
+print("RESULT: " + ("ALL TESTS PASSED" if not fails
+                    else f"{len(fails)} FAILURE(S)"))
 sys.exit(1 if fails else 0)
 

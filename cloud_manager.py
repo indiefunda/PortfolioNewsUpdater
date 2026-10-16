@@ -1289,7 +1289,9 @@ function renderAdhoc(d){
           escapeHtml(p.name_zh||'')+(p.name_en?' / '+escapeHtml(p.name_en):'')+
           '<br><b>Names searched:</b> '+escapeHtml(zh)+(en?'<br><b>EN:</b> '+escapeHtml(en):'')+
           '<br><span style="color:var(--muted)">Lookback '+escapeHtml(d.lookback_days)+' days · '+
-          escapeHtml(String((d.articles||[]).length))+' article(s) · cost: '+
+          escapeHtml(String((d.articles||[]).length))+' article(s)'+
+          ((c.duplicates_merged)?' ('+escapeHtml(String(c.duplicates_merged))+' same-event copies merged)':'')+
+          ' · cost: '+
           escapeHtml(String(c.tavily_searches||0))+' Tavily search(es), '+
           escapeHtml(String(c.ai_calls||0))+' AI call(s) · nothing saved</span></div>';
   if(o.summary){
@@ -1309,12 +1311,18 @@ function renderAdhoc(d){
     let body = '';
     for(const a of rows){
       const imp = a.importance!=null ? '⭐'+a.importance : '—';
-      body += '<tr><td>'+escapeHtml(a.date||'')+'</td>'+
+      const outlets = a.sources_count||1;
+      const outletBadge = outlets>1
+        ? ' <span class="badge" title="'+escapeHtml((a.also_seen||[]).join(' | '))+'">'+outlets+' outlets</span>' : '';
+      const recycledBadge = a.recycled
+        ? ' <span class="badge gray" title="The model flagged this as a recycled/older story already covered">recycled</span>' : '';
+      body += '<tr'+(a.recycled?' style="opacity:.6"':'')+'><td>'+escapeHtml(a.date||'')+'</td>'+
         '<td>'+escapeHtml(a.source||'')+'</td>'+
         '<td>'+imp+'</td>'+
         '<td>'+sentiBadge(a.sentiment)+'</td>'+
         '<td>'+escapeHtml(a.category||'')+'</td>'+
         '<td>'+(a.url?'<a href="'+escapeHtml(a.url)+'" target="_blank" rel="noopener">'+escapeHtml(a.title_en||a.title)+'</a>':escapeHtml(a.title_en||a.title))+
+        recycledBadge+outletBadge+
         (a.lang==='zh' && a.url ? ' <a class="btn-x" style="text-decoration:none" target="_blank" rel="noopener" title="Open through Google Translate" href="https://translate.google.com/translate?sl=auto&tl=en&u='+encodeURIComponent(a.url)+'">译</a>' : '')+
         (a.reason?'<div style="color:var(--muted);font-size:11px">'+escapeHtml(a.reason)+'</div>':'')+
         (a.impact?'<div style="color:var(--muted);font-size:11px">→ '+escapeHtml(a.impact)+'</div>':'')+
