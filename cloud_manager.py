@@ -130,6 +130,7 @@ DEFAULT_CONFIG = {
         "exa_macro": True,  # EXA neural macro search (semantic, no regex)
         "regulators": True,  # NFRA/CSRC/PBoC penalty announcements (macro tier)
         "sector_regulation": True,  # industry rules searched by THEME, no company name
+        "macro_triage_pool_max": 60,  # candidates the AI judges for relevance per run
         "baidu": False,  # captcha-blocked from server IPs - off by default
         "tavily": True,
         "google_news_en": True,

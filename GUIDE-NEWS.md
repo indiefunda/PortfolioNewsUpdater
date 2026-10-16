@@ -150,12 +150,25 @@ above), and pushed in its **own digest section at the top**, always (never
 floor-capped), capped at
 `macro_max_per_run` (default 3).
 
-**Cost:** the gate is a **free regex** — no AI is spent filtering. Only the
-few matched items (typically 0–3 per run) get ONE tiny batched AI call that
-translates and scores **impact on your fintech names (奇富科技 QFIN, 乐信 LX,
-陆金所 LU)**. Set `macro_translate: false` for zero AI on macro entirely (raw
-Chinese headline + English tag like `[RATE CUT]`). Add your own watchwords via
-`macro_keywords` (e.g. `["房地产新政", "平台经济"]`).
+**The AI is the filter, not a keyword list.** Each run sends up to
+`macro_triage_pool_max` (default 60) candidates from the tape to ONE AI call that
+answers a direct relevance question — *"could this change what I think about my
+holdings or their sector?"* — with the reject categories spelled out (another
+country's domestic news, geopolitics, industrial/energy pilots, index recaps
+listing constituent moves, a single A-share company's announcement, a foreign
+data point with no rate implication, central-bank small talk). Only items it
+accepts are stored and scored, then **one row per event**: on a live run of 45
+candidates, 33 were rejected and the remaining copies of the same event merged
+into 2 rows. The old keyword gate survives as the **outage fallback** (no AI key
+or an unusable response), and a mechanical tape filter drops price-move listings
+that the model should never have to read.
+
+**Cost:** one call with ~50 items ≈ 3–4k tokens (~0.2¢ off-peak), against the
+few hundred tokens the old 12-item call spent — the difference buys the removal
+of roughly 30 stored junk rows per run. Set `macro_translate: false` for zero AI
+on macro entirely (raw Chinese headline + English tag like `[RATE CUT]`), in
+which case the strict keyword gate decides what is stored. Add your own
+watchwords via `macro_keywords` (e.g. `["房地产新政", "平台经济"]`).
 
 ## Company lookup & auto-discovery (the "alpha" config)
 

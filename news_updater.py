@@ -273,6 +273,49 @@ MACRO_SOURCE_PRIORITY = {
 # routine item scored 4 used to take one of its three places. Configurable:
 # macro_min_importance; 0 disables the floor.
 MACRO_MIN_IMPORTANCE = 6
+# How many candidates the AI gets to judge per run. The regex gate used to do
+# this job with the result that the tape's junk (hydrogen-pilot notices, another
+# country's RMB clearing bank, index recaps) was stored while the model never saw
+# it: the wires were not even filtered by the gate. A wider pool plus the AI's
+# relevance call replaces that judgement. ~60 items is roughly 3-4k tokens.
+MACRO_TRIAGE_POOL_MAX = 60
+
+# The relevance test handed to the model for the macro/global tiers. Written
+# from the user's own junk reports, because "is this macro?" is not the question -
+# "does this change anything for MY portfolio?" is.
+RELEVANCE_TEST_PROMPT = (
+    "RELEVANCE TEST - you are filtering a Chinese financial newswire for ONE "
+    "investor whose portfolio is US-listed Chinese ADRs, mainly consumer-lending "
+    "fintech (QFIN/奇富科技, LX/乐信, LU/陆金所), plus consumer insurance and "
+    "industrials. For each item decide relevant=true ONLY if it could change what "
+    "that investor thinks about those holdings or their sector. Be STRICT: the "
+    "wire prints thousands of items a day and a false positive is worse than a "
+    "false negative.\n"
+    "relevant=TRUE examples:\n"
+    "  - China monetary/fiscal policy: LPR, RRR, 国常会, 政治局, 财政部 stimulus\n"
+    "  - China financial regulation, especially lending/consumer finance/credit "
+    "reporting/assisted lending: 金融监管总局, 助贷, 消费金融, 征信, 小额贷款, "
+    "rate caps, licence actions\n"
+    "  - CSRC/PBoC rules, ADR/delisting/index rules affecting 中概股\n"
+    "  - a Federal Reserve rate decision or a US inflation/labour surprise that "
+    "moves rate expectations (CPI/PPI/payrolls), major US-China tariffs, "
+    "sanctions or export controls\n"
+    "  - news about one of the holdings' own sector peers that changes the "
+    "competitive picture\n"
+    "relevant=FALSE examples (these are the ones to reject):\n"
+    "  - ANY other country's purely domestic news: 'Sri Lanka RMB clearing bank "
+    "opened in Colombo', India fuel taxes, KFC/Pepsi deals, Alcoa results\n"
+    "  - geopolitics, military action, disasters, accidents, sport\n"
+    "  - industrial/energy/technology policy with no link to finance "
+    "('three ministries approve hydrogen pilots in five city clusters')\n"
+    "  - an index recap that lists constituent moves ('Nasdaq Golden Dragon "
+    "China Index falls 0.5%; X -7.5%, Y -4.3%')\n"
+    "  - a single A-share company's announcement (a placement approval, a "
+    "director's share sale, an unrelated company's penalty)\n"
+    "  - a foreign data point with no rate implication (New York manufacturing "
+    "index, money-market fund assets, foreign central banks' Treasury holdings)\n"
+    "  - small talk from a central-bank official with no policy signal\n"
+)
 # Near-duplicate detection: two items for the same ticker whose titles share
 # this much of their token sets are the SAME story from different outlets.
 STORY_JACCARD_MIN = 0.6
@@ -4763,8 +4806,10 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
             prompt = (
                 analyst
                 + prompt_extra
+                + RELEVANCE_TEST_PROMPT
                 + "For EACH item return one JSON object with keys:\n"
-                "  number, title_en (concise English translation), summary (one "
+                "  number, relevant (true/false - see the RELEVANCE TEST above), "
+                "title_en (concise English translation), summary (one "
                 "English sentence), category (one of monetary, fiscal, "
                 "regulatory, fintech_reg, market, geopolitical, other), "
                 "importance (integer 1-10), sentiment "
@@ -4774,6 +4819,8 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
                 "ALREADY SEEN headline), reason (one short English sentence why "
                 "it matters), impact (one short English sentence: "
                 + impact_scope + ").\n"
+                "A relevant=false item still needs its object: set importance 1, "
+                "push false and leave impact empty.\n"
                 "Return ONLY a JSON array of these objects, same order as the items.\n\n"
                 "ALREADY SEEN BEFORE THIS RUN:\n"
                 + ("\n".join(hist_lines) if hist_lines else "(none)")
@@ -4898,6 +4945,16 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
             # store ONE row per event instead of one per outlet.
             it["_number"] = i
             it["_dup_of"] = dup_num
+            # The macro/global tiers ask the model a direct relevance question
+            # (see RELEVANCE_TEST_PROMPT). None means "the model was not asked or
+            # answered nothing" - which the caller must NOT read as "relevant".
+            rel = obj.get("relevant")
+            if isinstance(rel, bool):
+                it["relevant"] = rel
+            elif isinstance(rel, str) and rel.strip().lower() in ("true", "false"):
+                it["relevant"] = rel.strip().lower() == "true"
+            else:
+                it["relevant"] = None
             if not it["is_dup"]:
                 kept_nums.add(i)
             it["title_en"] = str(obj.get("title_en") or it.get("title") or "").strip()
@@ -5445,12 +5502,12 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
         if is_new(conn, "MACRO", it["source"], it["id"], it["title"]):
             candidates.append(it)
 
-    # Store at most macro_store_max_per_run per run (default 12), not every
-    # candidate the wires produced. These are the rows that get an AI score;
-    # the rest never enter the database, so it stays a browsable record of
-    # notable macro news instead of a dump of the tape.
-    store_cap = max(1, _cfg_int(config, "macro_store_max_per_run",
-                                MACRO_STORE_MAX_PER_RUN))
+    # The AI now decides relevance, so the pool is deliberately WIDER than the
+    # storage cap: pool -> AI triage -> keep the relevant ones (capped). The old
+    # 12-item cap meant the model only ever saw whatever the tape printed last,
+    # while everything else (including the junk) was stored unfiltered.
+    store_cap = max(1, _cfg_int(config, "macro_triage_pool_max",
+                                MACRO_TRIAGE_POOL_MAX))
     # Collapse same-story copies BEFORE the cap: one regulatory story arrives from
     # 新浪/搜狐/雪球/界面 with four different headlines, and without this the 12
     # slots held ~6 distinct stories. Keeps the best-sourced copy of each.
@@ -5460,7 +5517,7 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
     if len(candidates) > store_cap:
         # PRIORITY, not insertion order. The cap used to take the first N
         # candidates, and the wires are collected first - so on a busy run the
-        # 12 slots went to wire items and the industry-regulation and regulator
+        # slots went to wire items and the industry-regulation and regulator
         # candidates (the whole point of those sources) were cut off before they
         # could be scored. Sector regulation wins a seat, then regulator
         # penalties, then the semantic/Google macro query, then the wires.
@@ -5469,8 +5526,9 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
             dt = _parse_pub(it.get("published_at") or it.get("date") or "")
             return (prio, -(dt.timestamp() if dt else 0))
         candidates.sort(key=_cap_key)
-        print(f"  [macro] {len(candidates)} candidate(s) passed the quality gate; "
-              f"storing the top {store_cap} by priority (industry/regulator first).")
+        print(f"  [macro] {len(candidates)} candidate(s) from the tape; sending the "
+              f"top {store_cap} to the AI for relevance triage (industry/regulator "
+              f"first).")
         candidates = candidates[:store_cap]
     for it in candidates:
         mark_seen(conn, "MACRO", it["source"], it["id"], it["title"], it.get("url", ""))
@@ -5526,7 +5584,21 @@ ROUTINE_MARKET_PATTERNS = [
     # states a comparison ("同比上涨3.2%", "高于预期") and is kept below.
     r"(上涨|下跌|上升|下降|回落|走高|走低|增长|下滑)\s*[\d.]+\s*(%|％|个百分点|点)",
     r"(数据|通胀数据)(公布|发布)?(后|之后)",
+    # A single-stock quote with a bare move verb: "SK海力士盘前跌3.05%，现报141.65
+    # 美元" (live triage let one through as relevant because its snippet mentioned
+    # a CPI print). The patterns above need a longer verb (下跌/回落) or English
+    # wording, so bare 涨/跌 slipped past.
+    r"(盘前|盘后|现报|收报|早盘|尾盘)?\s*[\u4e00-\u9fffA-Za-z0-9.]{2,12}(涨|跌|升|降)\s*[\d.]+\s*%",
 ]
+# Two or more ticker moves in one headline is a tape recap, not news. Catches
+# bare move verbs too ("SK海力士盘前跌3.05%"), which the longer Chinese patterns
+# above miss.
+_MOVE_RE = re.compile(
+    r"[\u4e00-\u9fffA-Za-z0-9.]{2,12}\s*(涨|跌|升|降)\s*[\d.]+\s*%"
+    r"|[\u4e00-\u9fff]{2,10}\s*[-+]\s*[\d.]+\s*%")
+INDEX_RE = re.compile(r"指数|index", re.IGNORECASE)
+# Words that mark a headline as a session/quote report rather than a story.
+_TAPE_CONTEXT_RE = re.compile(r"盘前|盘后|现报|收报|早盘|尾盘|中概股|premarket|pre-market")
 # A market item that ALSO carries one of these is real macro news and is kept.
 # Deliberately NARROW: an actual policy ACT or a data RELEASE, never the
 # market's reaction to one, and never the market's odds on one.
@@ -5565,6 +5637,15 @@ def market_noise(text):
     """
     if not text:
         return False
+    # A headline that ENUMERATES PRICE MOVES is tape, whatever subject it also
+    # name-drops. This must be checked before the noteworthy list, because such a
+    # recap often carries policy-grade words as context ("...盘前跌3.05%...美国9月
+    # CPI高于预期推升加息与融资成本"), and the noteworthy test used to rescue it.
+    moves = len(_MOVE_RE.findall(text))
+    if moves >= 2:
+        return True
+    if moves >= 1 and (_TAPE_CONTEXT_RE.search(text) or INDEX_RE.search(text)):
+        return True
     if not ROUTINE_MARKET_RE.search(text):
         return False
     return not NOTEWORTHY_MARKET_RE.search(text)
@@ -5968,11 +6049,16 @@ def analyze_macro(macro_items, config, secrets, conn, run_start, pseudo="MACRO")
     if not macro_items:
         return []
     key = secrets.get("ai_api_key", "")
+    # The AI triage needs the relevance test too - it is the whole point of the
+    # call now (the wiring of relevant=false -> not stored lives in
+    # analyze_macro). Without a key there is no triage, so the strict keyword
+    # gate below stands in for it.
+    extra = RELEVANCE_TEST_PROMPT + "\n"
     # The global-markets tier gets its own ⭐ scale: a systemic Fed/macro item
     # (8-10) versus an ordinary US session recap (2-4), so the cap keeps the
     # right ones.
     if pseudo == "GLOBAL":
-        extra = (
+        extra += (
             "IMPORTANCE SCALE (this is the GLOBAL MARKETS tier): 8-10 = a "
             "systemic event that reprices global risk and Chinese ADRs "
             "(a Fed rate decision/pivot, an inflation or payrolls surprise, a "
@@ -5981,25 +6067,61 @@ def analyze_macro(macro_items, config, secrets, conn, run_start, pseudo="MACRO")
             "down 0.3%, premarket futures fell). Score routine recaps LOW and "
             "set push=false for them - the user does not need a daily index "
             "recap.\n")
-    else:
-        extra = ""
     if config.get("macro_translate", True) and key:
         meta = {pseudo: {"name_zh": "中国宏观", "name_en": "China Macro",
                          "subsidiaries_zh": [], "subsidiaries_other": []}}
         if pseudo == "GLOBAL":
             meta = {pseudo: {"name_zh": "全球宏观", "name_en": "Global Markets",
                              "subsidiaries_zh": [], "subsidiaries_other": []}}
+        # THE AI IS THE FILTER (extra = relevance test + scoring scale).
         analyzed = ai_analyze(macro_items, config, secrets, meta,
                               conn=conn, run_start=run_start, prompt_extra=extra)
+        # Storage: keep ONLY what the AI accepted as relevant to this portfolio.
+        # The tape is ~1,400 items a run and the regex gate cannot tell a
+        # hydrogen-pilot notice from a lending regulation (both are Chinese
+        # policy), which is how "Sri Lanka RMB clearing bank opened in Colombo"
+        # got stored. The model is asked the relevance question directly, with
+        # the reject categories spelled out in the prompt.
+        kept, rejected = [], []
+        for it in analyzed:
+            verdict = it.get("relevant")
+            if verdict is False:
+                it["_drop_reason"] = "ai_irrelevant"
+                rejected.append(it)
+                continue
+            if verdict is None:
+                # No verdict (the model was not asked, or the whole response was
+                # unusable). Fall back to the STRICT screen - market chatter plus
+                # the keyword gate - never the raw pool, which is exactly the
+                # firehose this replaced.
+                text = f"{it.get('title', '')} {it.get('title_en', '')} " \
+                       f"{it.get('snippet', '')}"
+                if market_noise(text) or not (wants_macro_tier(text)
+                                              or is_sector_regulation(text)):
+                    it["_drop_reason"] = "no_ai_verdict_strict_screen"
+                    rejected.append(it)
+                    continue
+            kept.append(it)
+        store_cap = max(1, _cfg_int(config, "macro_store_max_per_run",
+                                    MACRO_STORE_MAX_PER_RUN))
+        kept.sort(key=lambda it: it.get("importance") or 0, reverse=True)
+        if len(kept) > store_cap:
+            kept = kept[:store_cap]
+        if rejected or len(analyzed) != len(kept):
+            print(f"  [{pseudo.lower()}] AI triage: {len(kept)} kept, "
+                  f"{len(rejected)} irrelevant -> not stored.")
+            for it in rejected[:6]:
+                print(f"      dropped: {(it.get('title') or '')[:66]}")
         # One row per EVENT: promote the canonical item of each event into
         # `news` before writing the AI fields back (the row must exist first).
-        promoted, copies, known = promote_run(conn, analyzed, run_id=run_start)
+        promoted, copies, known = promote_run(conn, kept, run_id=run_start)
         if copies or known:
-            print(f"  [{pseudo.lower()}] {len(analyzed)} item(s) -> {promoted} "
+            print(f"  [{pseudo.lower()}] {len(kept)} item(s) -> {promoted} "
                   f"event row(s); {copies} same-event copy(ies) + {known} "
                   f"already-delivered repeat(s) not stored again.")
-        for it in analyzed:
+        for it in kept:
             update_news_ai(conn, it)
+        analyzed = kept
         cap = _cfg_int(config, "macro_max_per_run", 3) if pseudo == "MACRO" \
             else _cfg_int(config, "global_markets_max_per_run", GLOBAL_MARKETS_MAX_PER_RUN)
         ranked = sorted(
@@ -6021,15 +6143,31 @@ def analyze_macro(macro_items, config, secrets, conn, run_start, pseudo="MACRO")
                 ranked = [it for it in ranked
                           if (it.get("importance") or 0) >= macro_floor]
         return ranked[:cap]
-    # Zero-AI fallback: raw Chinese + English tag, always pushed (capped).
+    # Zero-AI fallback (no key, or macro_translate off): raw Chinese headline +
+    # English tag, always pushed (capped). No model filtered these, so the STRICT
+    # keyword gate decides what is stored - otherwise this path recreates the
+    # firehose - and the rows must be promoted explicitly, because
+    # collect_macro_items now only STAGES them.
+    keep = []
     for it in macro_items:
+        text = f"{it.get('title', '')} {it.get('snippet', '')}"
+        if market_noise(text):
+            continue
+        if wants_macro_tier(text) or is_sector_regulation(text):
+            keep.append(it)
+    if conn is not None and keep:
+        promote_run(conn, keep, run_id=run_start)
+    if len(macro_items) != len(keep):
+        print(f"  [{pseudo.lower()}] no AI triage: strict gate kept {len(keep)} of "
+              f"{len(macro_items)} candidate(s).")
+    for it in keep:
         it["title_en"] = it.get("title", "")
         it["impact"] = ""
         it["importance"] = 8 if pseudo == "MACRO" else 5
         it["push"] = True
     cap = _cfg_int(config, "macro_max_per_run", 3) if pseudo == "MACRO" \
         else _cfg_int(config, "global_markets_max_per_run", GLOBAL_MARKETS_MAX_PER_RUN)
-    return macro_items[:cap]
+    return keep[:cap]
 
 
 def format_macro(items):

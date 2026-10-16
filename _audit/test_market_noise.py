@@ -45,7 +45,12 @@ CASES = [
     ("State Council: allocate education resources based on school-age population", False),
     ("美国财政部宣布对伊朗相关实体实施新制裁", False),
     ("中国央行下调LPR 应对美联储加息", False),
-    ("【纳斯达克中国金龙指数收跌1.75%】", False),
+    # CHANGED to drop: a bare index close is a daily recap, and the user's own
+    # junk report listed "Nasdaq Golden Dragon China Index falls 0.5%; [movers]".
+    # The GLOBAL tier's prompt already says the user "does not need a daily index
+    # recap", so tape-listing it here is consistent - an index level with a move
+    # is not a story about any holding.
+    ("【纳斯达克中国金龙指数收跌1.75%】", True),
 ]
 fail = 0
 for text, want_drop in CASES:
