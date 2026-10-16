@@ -551,6 +551,48 @@ def _db():
         conn.execute("ALTER TABLE news ADD COLUMN rescues INTEGER DEFAULT 0")
     except Exception:
         pass
+    # Migration: how many outlets carried this EVENT (one row per event now, see
+    # the staging table below), and the other outlets' links, so the archive
+    # still shows that a story was widely reported without storing 12 rows.
+    for _col, _decl in (("sources_count", "INTEGER DEFAULT 1"),
+                        ("also_seen", "TEXT")):
+        try:
+            conn.execute(f"ALTER TABLE news ADD COLUMN {_col} {_decl}")
+        except Exception:
+            pass
+    # ---------------------------------------------------------------------
+    # STAGING: a temporary landing area for everything a run finds
+    # ---------------------------------------------------------------------
+    # Items used to be inserted into `news` the moment they were fetched, and
+    # the AI's same-event judgement (duplicate_of / known_event) was only used
+    # to choose what to PUSH. The archive therefore kept every copy: one
+    # regulatory announcement from 8 outlets became 8 rows, scored 8 separate
+    # times, and the panel could not even show that they were the same story.
+    #
+    # Now each run stages its finds here, the AI decides which are the same
+    # EVENT, and only the canonical item of each event is promoted into `news`.
+    # Writing to staging first (rather than holding everything in memory) keeps
+    # a crashed run recoverable: leftover rows are promoted unscored on the next
+    # run and picked up by rescue_orphans.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS staging (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            source TEXT NOT NULL,
+            lang TEXT DEFAULT 'en',
+            item_hash TEXT NOT NULL,
+            title_raw TEXT,
+            snippet TEXT,
+            url TEXT,
+            published_at TEXT,
+            first_seen TEXT,
+            promoted INTEGER DEFAULT 0
+        )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_staging_run ON staging (run_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_staging_promoted "
+                 "ON staging (promoted, first_seen)")
     # The repeat gate's memory: one row per story actually PUSHED per ticker,
     # so a re-report of the same event (new URL, different outlet, days later)
     # cannot be pushed twice even when the AI does not spot it. This is the
@@ -886,6 +928,191 @@ def mark_seen(conn, ticker, source, item_id, title, url):
     conn.commit()
 
 
+def stage_item(conn, item):
+    """
+    Land a fetched item in the STAGING area (not in `news` yet).
+
+    Everything a run finds goes here first; only the canonical item of each
+    event is promoted into `news` after the AI has grouped them (see
+    promote_run). Written immediately so a crash mid-run loses nothing.
+    """
+    if NO_WRITE:
+        return
+    if is_junk_host(item.get("url", "")):
+        return
+    now = datetime.now(EASTERN).strftime("%Y-%m-%d %H:%M:%S")
+    cur = conn.execute(
+        "INSERT INTO staging (run_id, ticker, source, lang, item_hash, title_raw,"
+        " snippet, url, published_at, first_seen) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (item.get("_run_id") or "", item["ticker"], item["source"],
+         item.get("lang", "en"), _hash_of(item), item.get("title", ""),
+         item.get("snippet", ""), item.get("url", ""),
+         item.get("published_at", ""), now),
+    )
+    conn.commit()
+    item["_staging_id"] = cur.lastrowid
+
+
+def _event_groups(items):
+    """
+    Group the run's items into EVENTS using the AI's own same-event judgement.
+
+    The model already answers `duplicate_of` (the number of the earlier item in
+    THIS batch that describes the same event) and `known_event` (same as an
+    already-delivered story). Nothing used that for storage - which is why one
+    announcement from eight outlets became eight rows.
+
+    Returns (canonical_items, dropped_items). A dropped item is either a copy of
+    a canonical item in this batch, or a recycled story already delivered.
+    """
+    by_num = {}
+    for idx, it in enumerate(items, 1):
+        if not it.get("_number"):
+            it["_number"] = idx
+        by_num[it["_number"]] = it
+    dropped, copies = [], {}
+    for it in items:
+        if it.get("is_known"):
+            it["_drop_reason"] = "already_delivered"
+            dropped.append(it)
+            continue
+        if it.get("is_dup"):
+            canon = by_num.get(it.get("_dup_of"))
+            if canon is not None and canon is not it:
+                copies.setdefault(id(canon), []).append(it)
+                it["_drop_reason"] = "same_event"
+                dropped.append(it)
+                continue
+            # duplicate_of points nowhere usable -> treat it as its own event
+            # rather than losing it.
+            it["is_dup"] = False
+    canon_ids = {id(it) for it in items
+                 if it not in dropped}
+    canonical = [it for it in items if id(it) in canon_ids]
+    for it in canonical:
+        group = copies.get(id(it)) or []
+        if group:
+            it["_copies"] = group
+            it["sources_count"] = len(group) + 1
+            seen_outlets = []
+            for c in group:
+                label = f"{c.get('source', '')}: {c.get('title', '')[:80]}"
+                if c.get("url"):
+                    label += f" ({c['url']})"
+                seen_outlets.append(label)
+            it["also_seen"] = seen_outlets[:10]
+        else:
+            it["sources_count"] = 1
+    return canonical, dropped
+
+
+def promote_run(conn, items, run_id=None):
+    """
+    Promote the canonical item of each event into `news`; drop its copies.
+
+    Call this AFTER the AI has grouped the batch and BEFORE update_news_ai (the
+    row has to exist for the update to land).
+    Returns (promoted, merged_copies, already_delivered).
+    """
+    if NO_WRITE or conn is None or not items:
+        return 0, 0, 0
+    canonical, dropped = _event_groups(items)
+    known = sum(1 for it in dropped
+                if it.get("_drop_reason") == "already_delivered")
+    copies = len(dropped) - known
+    for it in canonical:
+        row = dict(it)
+        insert_news(conn, it)          # carries sources_count / also_seen
+        if it.get("sources_count", 1) > 1:
+            try:
+                conn.execute(
+                    "UPDATE news SET sources_count=?, also_seen=? "
+                    "WHERE ticker=? AND source=? AND item_hash=?",
+                    (it.get("sources_count") or 1,
+                     json.dumps(it.get("also_seen") or [], ensure_ascii=False),
+                     it["ticker"], it["source"], _hash_of(it)))
+                conn.commit()
+            except sqlite3.Error:
+                pass
+        it["_promoted"] = True
+    # Every staged row for this run is now "handled", promoted or not, so the
+    # leftovers pass cannot re-promote it later.
+    try:
+        if run_id:
+            conn.execute("UPDATE staging SET promoted=1 WHERE run_id=?", (run_id,))
+        else:
+            ids = [it.get("_staging_id") for it in items if it.get("_staging_id")]
+            for i in range(0, len(ids), 200):
+                chunk = ids[i:i + 200]
+                conn.execute("UPDATE staging SET promoted=1 WHERE id IN (%s)"
+                             % ",".join("?" * len(chunk)), chunk)
+        conn.commit()
+    except sqlite3.Error:
+        pass
+    return len(canonical), copies, known
+
+
+def promote_stale_staging(conn, keep_hours=48):
+    """
+    Recover a run that died between staging and promotion.
+
+    Its items are already marked `seen`, so without this they would be dropped
+    silently. They are promoted UNSCORED (importance stays NULL) and
+    rescue_orphans scores them on the next run.
+    """
+    if NO_WRITE or conn is None:
+        return 0
+    cutoff = (datetime.now(EASTERN) - timedelta(hours=keep_hours)) \
+        .strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        rows = conn.execute(
+            "SELECT id, ticker, source, lang, item_hash, title_raw, snippet, url,"
+            " published_at FROM staging WHERE promoted=0 AND first_seen < ?",
+            (cutoff,)).fetchall()
+    except sqlite3.Error:
+        return 0
+    promoted = 0
+    for rid, ticker, source, lang, ih, title, snippet, url, pub in rows:
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO news (ticker, source, lang, item_hash,"
+                " title_raw, snippet, url, published_at, first_seen) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (ticker, source, lang, ih, title, snippet, url, pub,
+                 datetime.now(EASTERN).strftime("%Y-%m-%d %H:%M:%S")))
+            conn.execute("UPDATE staging SET promoted=1 WHERE id=?", (rid,))
+            promoted += 1
+        except sqlite3.Error:
+            continue
+    if promoted:
+        conn.commit()
+        print(f"  [staging] recovered {promoted} item(s) from an interrupted run.")
+    return promoted
+
+
+def prune_staging(conn, days=3, promoted_hours=24):
+    """
+    Rolling clean-up for the temporary landing area.
+
+    Un-promoted rows are kept for `days` (crash recovery looks for them), while
+    rows that were already handled are dropped after `promoted_hours` so the
+    staging table stays small.
+    """
+    if NO_WRITE or conn is None:
+        return 0
+    now = datetime.now(EASTERN)
+    old = (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    handled = (now - timedelta(hours=promoted_hours)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        cur = conn.execute(
+            "DELETE FROM staging WHERE first_seen < ? "
+            "OR (promoted=1 AND first_seen < ?)", (old, handled))
+        conn.commit()
+        return cur.rowcount
+    except sqlite3.Error:
+        return 0
+
+
 def insert_news(conn, item):
     """Store a brand-new item in the news database (raw form, pre-AI)."""
     if NO_WRITE:
@@ -898,6 +1125,10 @@ def insert_news(conn, item):
         return
     now = datetime.now(EASTERN).strftime("%Y-%m-%d %H:%M:%S")
     h = _hash_of(item)
+    # NOTE: this column set stays the ORIGINAL one on purpose. `sources_count` is
+    # written by promote_run's guarded UPDATE instead, so the insert also works
+    # against a hand-built or legacy `news` schema without the newer columns
+    # (several audit fixtures create their own table).
     conn.execute(
         "INSERT OR IGNORE INTO news (ticker, source, lang, item_hash, title_raw, "
         "url, snippet, published_at, first_seen) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -974,12 +1205,13 @@ def list_news(conn, ticker=None, limit=300):
     """
     cols = ["ticker", "source", "lang", "title_en", "title_raw", "summary",
             "category", "importance", "sentiment", "pushed", "url",
-            "published_at", "first_seen", "reason", "impact", "item_hash"]
+            "published_at", "first_seen", "reason", "impact", "item_hash",
+            "sources_count", "also_seen"]
     if ticker:
         rows = conn.execute(
             "SELECT ticker, source, lang, title_en, title_raw, summary, category, "
             "importance, sentiment, pushed, url, published_at, first_seen, reason, "
-            "impact, item_hash FROM news WHERE ticker=? "
+            "impact, item_hash, sources_count, also_seen FROM news WHERE ticker=? "
             "ORDER BY first_seen DESC, id DESC LIMIT ?",
             (ticker, limit),
         ).fetchall()
@@ -987,7 +1219,8 @@ def list_news(conn, ticker=None, limit=300):
         rows = conn.execute(
             "SELECT ticker, source, lang, title_en, title_raw, summary, category, "
             "importance, sentiment, pushed, url, published_at, first_seen, reason, "
-            "impact, item_hash FROM news ORDER BY first_seen DESC, id DESC LIMIT ?",
+            "impact, item_hash, sources_count, also_seen FROM news "
+            "ORDER BY first_seen DESC, id DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return [dict(zip(cols, r)) for r in rows]
@@ -2045,7 +2278,12 @@ def ingest_items(conn, all_new, source, items, ticker, since_dt, max_age_hours,
         if not is_new(conn, ticker, item["source"], item["id"], item["title"]):
             bump("already_seen")
             continue
-        insert_news(conn, item)
+        # STAGED, not stored: the item waits here until the AI has grouped the
+        # run's items into events, then only the canonical one is promoted into
+        # `news` (see promote_run). `seen` is still marked now, so a re-fetch in
+        # a later run cannot re-offer it.
+        item["_run_id"] = run_start
+        stage_item(conn, item)
         mark_seen(conn, ticker, item["source"], item["id"], item["title"],
                   item.get("url", ""))
         if sector_items is not None and item.get("_sector"):
@@ -4500,6 +4738,10 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
             except Exception:
                 dup_num = None
             it["is_dup"] = dup_num is not None and dup_num in kept_nums
+            # Kept so promote_run can attach this copy to its canonical item and
+            # store ONE row per event instead of one per outlet.
+            it["_number"] = i
+            it["_dup_of"] = dup_num
             if not it["is_dup"]:
                 kept_nums.add(i)
             it["title_en"] = str(obj.get("title_en") or it.get("title") or "").strip()
@@ -5073,7 +5315,8 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
         candidates = candidates[:store_cap]
     for it in candidates:
         mark_seen(conn, "MACRO", it["source"], it["id"], it["title"], it.get("url", ""))
-        insert_news(conn, it)
+        it["_run_id"] = run_start
+        stage_item(conn, it)          # promoted after the AI groups events
     return candidates
 
 
@@ -5557,6 +5800,13 @@ def analyze_macro(macro_items, config, secrets, conn, run_start, pseudo="MACRO")
                              "subsidiaries_zh": [], "subsidiaries_other": []}}
         analyzed = ai_analyze(macro_items, config, secrets, meta,
                               conn=conn, run_start=run_start, prompt_extra=extra)
+        # One row per EVENT: promote the canonical item of each event into
+        # `news` before writing the AI fields back (the row must exist first).
+        promoted, copies, known = promote_run(conn, analyzed, run_id=run_start)
+        if copies or known:
+            print(f"  [{pseudo.lower()}] {len(analyzed)} item(s) -> {promoted} "
+                  f"event row(s); {copies} same-event copy(ies) + {known} "
+                  f"already-delivered repeat(s) not stored again.")
         for it in analyzed:
             update_news_ai(conn, it)
         cap = _cfg_int(config, "macro_max_per_run", 3) if pseudo == "MACRO" \
@@ -5645,6 +5895,10 @@ def collect_sector_watch(sector_report, conn, config, secrets, run_start,
                                             "2-4 = generic industry commentary. "
                                             "Score generic commentary LOW and "
                                             "set push=false for it.\n"))
+        promoted, copies, known = promote_run(conn, reviewed, run_id=run_start)
+        if copies or known:
+            print(f"  [sector] {len(reviewed)} item(s) -> {promoted} event row(s); "
+                  f"{copies} copy(ies) + {known} repeat(s) not stored again.")
         for it in reviewed:
             update_news_ai(conn, it)
             if it.get("push", True) and (it.get("importance") or 0) >= 5 \
@@ -5873,6 +6127,11 @@ def format_digest(filtered, ticker_count, stored_count=0, run_label=None,
             header += f"  ({category})"
         if importance:
             header += f" ⭐{importance}"
+        # One row per EVENT: say how many outlets carried it, so a merged story
+        # still looks well-sourced instead of suspiciously thin.
+        outlets = item.get("sources_count") or 1
+        if outlets > 1:
+            header += f" · {outlets} outlets"
         # Show the item's own publish date so anything stale is visible at a
         # glance (defense-in-depth against recycled old stories).
         pub = (item.get("published_at")
@@ -6563,6 +6822,13 @@ def main():
               f"(news > {NEWS_RETENTION_DAYS}d, hashes > {SEEN_RETENTION_DAYS}d).")
     if vacuumed:
         print("  [db] VACUUM ran (DB file shrank).")
+    # Staging housekeeping: recover a run that died between staging and
+    # promotion (its items are already marked `seen`, so they would vanish
+    # otherwise), then drop the temporary rows the rolling cleanup owes.
+    promote_stale_staging(conn)
+    stale = prune_staging(conn)
+    if stale:
+        print(f"  [staging] pruned {stale} temporary row(s).")
 
     all_new = []
 
@@ -7091,6 +7357,12 @@ def main():
         # separate semantic-dedup AI call is needed - half the AI calls). ----
         enriched = ai_analyze(all_new, config, secrets, effective_meta,
                               conn=conn, run_start=run_start)
+        # One row per EVENT (same-event copies are recorded on the canonical row
+        # and dropped, not stored separately).
+        promoted, copies, known = promote_run(conn, enriched, run_id=run_start)
+        if copies or known:
+            print(f"  {ticker}: {len(enriched)} item(s) -> {promoted} event row(s); "
+                  f"{copies} copy(ies) + {known} repeat(s) not stored again.")
         # Push selection FIRST: the regulatory force-push mutates importance /
         # category in place, so it must run before update_news_ai persists the
         # boosted values (otherwise the DB would show the pre-boost score).

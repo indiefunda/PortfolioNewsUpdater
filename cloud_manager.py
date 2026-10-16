@@ -1122,12 +1122,17 @@ function renderNews(){
         'href="https://translate.google.com/translate?sl=auto&tl=en&u='+encodeURIComponent(n.url)+'">译</a>' : '';
     const zhSub = (raw && en && en !== raw)
       ? '<div style="color:var(--muted);font-size:11px">'+escapeHtml(raw.slice(0,110))+'</div>' : '';
+    // One row per EVENT now: show how many outlets carried it, and the other
+    // outlets' headlines on hover, so a merged story still looks well-sourced.
+    const outlets = n.sources_count || 1;
+    const outletBadge = outlets > 1
+      ? ' <span class="badge" title="'+escapeHtml(n.also_seen||'')+'">'+outlets+' outlets</span>' : '';
     html += '<tr><td><button class="btn-x" title="Delete this item from the stored news" '+
       'onclick="deleteNews('+idx+')">✕</button></td>'+
       '<td>'+escapeHtml(n.first_seen||'')+'</td><td>'+escapeHtml(n.ticker||'')+'</td>'+
       '<td>'+escapeHtml(src)+'</td><td>'+escapeHtml(n.category||'')+'</td><td>'+imp+'</td>'+
       '<td>'+pushed+'</td><td>'+(n.url?'<a href="'+escapeHtml(n.url)+'" target="_blank" rel="noopener">'+escapeHtml(title)+'</a>':escapeHtml(title))+
-      enBtn+gt+zhSub+'</td></tr>';
+      enBtn+gt+outletBadge+zhSub+'</td></tr>';
   }
   $('newsTableWrap').innerHTML = '<div class="tablewrap"><table><thead><tr><th></th><th>Seen (ET)</th><th>Ticker</th><th>Source</th><th>Cat</th><th>Imp</th><th>Status</th><th>Title</th></tr></thead><tbody>'+html+'</tbody></table></div>';
 }
