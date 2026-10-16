@@ -6247,9 +6247,33 @@ def main():
             "AND importance <= ?", (threshold,))
         deleted = cur.rowcount
         conn.commit()
+        # Also clear STORED MACRO rows that no longer pass the gate. After the
+        # 2026-10-15 macro overhaul the archive still held the old firehose
+        # (Houthi strikes, KFC/Pepsi, Alcoa, hurricanes) because age-based pruning
+        # keeps rows for 21 days - and a high-scored one from the old gate would
+        # linger for weeks. Pushed rows are kept (they really were delivered).
+        stale_macro = []
+        try:
+            rows = conn.execute(
+                "SELECT id, title_raw, title_en, snippet FROM news "
+                "WHERE ticker='MACRO' AND pushed=0").fetchall()
+            for rid, raw, en, snippet in rows:
+                text = f"{raw or ''} {en or ''} {snippet or ''}"
+                if wants_macro_tier(text) or is_sector_regulation(text):
+                    continue
+                stale_macro.append(rid)
+            for i in range(0, len(stale_macro), 200):
+                chunk = stale_macro[i:i + 200]
+                conn.execute(
+                    "DELETE FROM news WHERE id IN (%s)"
+                    % ",".join("?" * len(chunk)), chunk)
+            conn.commit()
+        except sqlite3.Error as exc:
+            print(f"  [purge] macro cleanup skipped: {exc}", file=sys.stderr)
         conn.close()
         print(f"  [purge] deleted {deleted} stored junk item(s) "
-              f"(pushed=0, importance <= {threshold}).")
+              f"(pushed=0, importance <= {threshold}) and {len(stale_macro)} "
+              f"off-topic MACRO row(s) that no longer pass the gate.")
         sys.exit(0)
 
     if any(a == "--rediscover" or a.startswith("--rediscover=") for a in sys.argv):
