@@ -26,6 +26,12 @@ function gate(html) {
   listEl().innerHTML = '<div id="signin">' + html + '</div>';
 }
 
+function esc(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
 if (!cfg || !cfg.apiKey) {
   say('Firebase config missing - this build was not deployed correctly.');
   gate('No Firebase configuration was found in this page.');
@@ -44,6 +50,8 @@ if (!cfg || !cfg.apiKey) {
   const auth = getAuth(app);
   const db = getFirestore(app);
   const CACHE_KEY = 'gl_cache_v1';
+  // Tells the inline watchdog in index.html that the module really started.
+  window.__GL_BOOTED__ = true;
 
   // Complete a sign-in that came back via redirect. Must run on every load:
   // the redirect flow leaves the result here, not in the promise that started it.
@@ -98,11 +106,13 @@ if (!cfg || !cfg.apiKey) {
   function describeAuthError(e) {
     const code = (e && e.code) || '';
     if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+      const here = location.hostname || 'this site';
+      const authHost = (cfg && cfg.authDomain) || '';
       return 'The popup could not hand the result back to this page, which usually '
         + 'means your browser is blocking third-party cookies or partitioning '
         + 'storage for this site. The redirect sign-in above avoids that. If it '
-        + 'still fails, allow cookies for keen-wavelet-275120.web.app and '
-        + 'keen-wavelet-275120.firebaseapp.com and try again.';
+        + 'still fails, allow cookies for ' + here
+        + (authHost && authHost !== here ? ' and ' + authHost : '') + ' and try again.';
     }
     if (code === 'auth/unauthorized-domain') {
       return 'This domain is not in the Firebase authorised-domains list. Add it '
@@ -191,8 +201,20 @@ if (!cfg || !cfg.apiKey) {
     try {
       await load();
     } catch (e) {
-      say('Could not load news: ' + e.message);
-      gate('<p>Could not read the archive.</p><p>' + String(e.message) + '</p>');
+      const code = (e && e.code) || '';
+      if (code === 'permission-denied') {
+        // Firestore rules deny reads unless the signed-in email is in the
+        // page's allowlist (meta/status.allowed_emails).
+        say('This account is not allowed to read the archive.');
+        gate('<p>This account is not on the access list.</p>'
+          + '<p style="font-size:13px;color:#8b93a7">Signed in as <b>'
+          + esc(user.email || 'unknown')
+          + '</b>. Ask the owner to add this email in the panel (Configuration → '
+          + 'Hosted page access) and upload, then run the Firestore sync.</p>');
+      } else {
+        say('Could not load news: ' + e.message);
+        gate('<p>Could not read the archive.</p><p>' + esc(e.message) + '</p>');
+      }
     }
 
     // A small sign-out affordance; the header is otherwise unchanged.
@@ -201,7 +223,13 @@ if (!cfg || !cfg.apiKey) {
     out.href = '#';
     out.textContent = ' sign out';
     out.style.marginLeft = '8px';
-    out.addEventListener('click', (ev) => { ev.preventDefault(); signOut(auth); });
+    out.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      // The cached archive holds every summary this page rendered. Leaving it
+      // behind let the next person on a shared browser read it from devtools.
+      try { localStorage.removeItem(CACHE_KEY); } catch (e) {}
+      signOut(auth);
+    });
     sub.appendChild(out);
   });
 }

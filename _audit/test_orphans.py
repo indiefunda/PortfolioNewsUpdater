@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Test the orphan-recovery fix: unanalyzed rows drain and never loop."""
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import importlib.util
 import os
 import shutil
@@ -10,11 +13,11 @@ from datetime import datetime, timedelta
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 spec = importlib.util.spec_from_file_location(
-    "nu", r"F:\MyRepository\PortfolioNewsUpdater\news_updater.py")
+    "nu", os.path.join(ROOT, "news_updater.py"))
 nu = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nu)
 
-BASE = r"F:\MyRepository\PortfolioNewsUpdater\_audit"
+BASE = os.path.join(ROOT, "_audit")
 COPY = os.path.join(BASE, "_orphan.db")
 shutil.copyfile(os.path.join(BASE, "news.db"), COPY)
 nu.DB_FILE = COPY
@@ -48,7 +51,10 @@ print(f"ORPHAN_RESCUE_LIMIT={nu.ORPHAN_RESCUE_LIMIT} "
 
 print()
 print("=== first rescue pass: every orphan is re-queued (no cap starvation) ===")
-got = nu.rescue_orphans(conn, {})
+# rescue_orphans now only re-queues tickers still in the config: after a
+# watchlist swap, rows for a REMOVED company must not be analysed or pushed.
+CFG = {"tickers": ["ZZORPH"]}
+got = nu.rescue_orphans(conn, CFG)
 ok = len(got) == orphans and orphans > 0
 if not ok:
     fail += 1
@@ -57,10 +63,28 @@ print(f"  rescues counter after pass: "
       f"{[r[0] for r in conn.execute('SELECT DISTINCT rescues FROM news WHERE importance IS NULL')]}")
 
 print()
+print("=== orphans for a ticker that left the watchlist are NOT re-queued ===")
+now_s = datetime.now(nu.EASTERN).strftime("%Y-%m-%d %H:%M:%S")
+conn.execute(
+    "INSERT INTO news (ticker, source, lang, item_hash, title_raw, url, "
+    "published_at, first_seen, rescues) VALUES ('OLDTICK','Tavily','en',?,?,?,?,?,0)",
+    ("removed1", "news for a removed holding", "https://o.example/old", now_s, now_s))
+conn.commit()
+left = nu.rescue_orphans(conn, CFG)
+queued_old = [it for it in left if it.get("ticker") == "OLDTICK"]
+ok = not queued_old
+if not ok:
+    fail += 1
+print(f"  [{'PASS' if ok else 'FAIL'}] removed-ticker orphan re-queued: "
+      f"{len(queued_old)} (must be 0)")
+conn.execute("DELETE FROM news WHERE ticker='OLDTICK'")
+conn.commit()
+
+print()
 print("=== simulate 3 failed runs, then the loop must STOP ===")
 for i in range(nu.ORPHAN_MAX_RESCUES - 1):
-    nu.rescue_orphans(conn, {})
-final = nu.rescue_orphans(conn, {})
+    nu.rescue_orphans(conn, CFG)
+final = nu.rescue_orphans(conn, CFG)
 ok = len(final) == 0
 if not ok:
     fail += 1

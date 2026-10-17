@@ -1,14 +1,14 @@
-# 📱 Reading your news from a phone (hosted, read-only)
+# ðŸ“± Reading your news from a phone (hosted, read-only)
 
-The panel in `cloud_manager.py` is a **control plane** — it runs the updater,
+The panel in `cloud_manager.py` is a **control plane** â€” it runs the updater,
 uploads config, and deletes rows. It must never be the thing exposed to the
 internet. This sets up a separate, read-only view of the archive behind a Google
 sign-in, on a free Firebase Hosting URL.
 
 ```
   VM (cron)                     Firebase                      your phone
-  ─────────                     ────────                      ──────────
-  news.db ──► news_web.py ──►  Firestore  ──► Hosting page ──► Google sign-in
+  â”€â”€â”€â”€â”€â”€â”€â”€â”€                     â”€â”€â”€â”€â”€â”€â”€â”€                      â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  news.db â”€â”€â–º news_web.py â”€â”€â–º  Firestore  â”€â”€â–º Hosting page â”€â”€â–º Google sign-in
               --sync-firebase   (rules:        (index.html +    then read /
                                 auth-only)      firebase-boot.js) filter
 ```
@@ -41,9 +41,9 @@ use three parts of it, all with free tiers:
 | **Firestore** | the database the page reads your news from |
 
 > Console labels drift over time. If a button is named slightly differently,
-> look for the same idea — the *order* and the *decisions* below are what matter.
+> look for the same idea â€” the *order* and the *decisions* below are what matter.
 
-### Step 0 — Try the page first, without Firebase (2 minutes)
+### Step 0 â€” Try the page first, without Firebase (2 minutes)
 
 Do this before investing any time. It proves the page is what you want:
 
@@ -52,14 +52,15 @@ python news_web.py --out=web_local --embed
 start web_local\index.html          # Windows; or just double-click the file
 ```
 
-You get the full view — filters, search, expandable rows. No account, no cloud.
+You get the full view â€” filters, search, expandable rows. No account, no cloud.
 
-### Step 1 — Add Firebase to your EXISTING Google Cloud project
+### Step 1 â€” Add Firebase to your EXISTING Google Cloud project
 
 Go to <https://console.firebase.google.com/> and click **Create a project**.
 
 The first field is the project name and it has a **dropdown**. Open it and
-**select `keen-wavelet-275120`** — do not type a new name.
+**select the project your VM already lives in** (the same id the panel shows
+under "Your server") — do not type a new name.
 
 This is the whole reason the setup is simple: Firebase attaches to the project
 your VM already lives in, so the VM's own service account can write to Firestore
@@ -68,35 +69,36 @@ you'd have to download and guard a credentials file instead.
 
 Next: Google Analytics → **turn it off** (not needed). Then **Create project**.
 
-**Check it worked:** the project picker in the top bar says
-`keen-wavelet-275120`.
+**Check it worked:** the project picker in the top bar shows that same project
+id. Everywhere this guide writes `YOUR-PROJECT-ID`, substitute that id (and put
+it in `.firebaserc` / `firebase-config.json`).
 
-### Step 2 — Create the Firestore database
+### Step 2 â€” Create the Firestore database
 
-Left sidebar → **Build** → **Firestore Database** → **Create database**.
+Left sidebar â†’ **Build** â†’ **Firestore Database** â†’ **Create database**.
 
 - **Location:** choose **`us-east1`** (same region as your VM).
-  ⚠️ **This is permanent.** It cannot be changed later without deleting the
+  âš ï¸ **This is permanent.** It cannot be changed later without deleting the
   database.
-- **Security rules:** choose **Production mode**. Do *not* choose "test mode" —
+- **Security rules:** choose **Production mode**. Do *not* choose "test mode" â€”
   test mode leaves the database open to anyone for 30 days.
 
 **Check it worked:** the Firestore page shows an empty **Data** tab.
 
-### Step 3 — Turn on Google sign-in
+### Step 3 â€” Turn on Google sign-in
 
-Left sidebar → **Build** → **Authentication** → **Get started**.
+Left sidebar â†’ **Build** â†’ **Authentication** â†’ **Get started**.
 
-Go to the **Sign-in method** tab → click **Google** → toggle **Enable** → pick a
-support email → **Save**.
+Go to the **Sign-in method** tab â†’ click **Google** â†’ toggle **Enable** â†’ pick a
+support email â†’ **Save**.
 
 **Check it worked:** Google shows as *Enabled* in the list.
 
-### Step 4 — Register a web app and copy its config
+### Step 4 â€” Register a web app and copy its config
 
-1. Gear icon (top-left) → **Project settings** → **General** tab.
-2. Scroll to **Your apps** → click the **`</>`** (Web) button.
-3. Nickname: `news-reader`. **Leave "Also set up Firebase Hosting" UNCHECKED** —
+1. Gear icon (top-left) â†’ **Project settings** â†’ **General** tab.
+2. Scroll to **Your apps** â†’ click the **`</>`** (Web) button.
+3. Nickname: `news-reader`. **Leave "Also set up Firebase Hosting" UNCHECKED** â€”
    we deploy from a config file instead, and ticking it creates a setup we don't
    want.
 4. **Register app**.
@@ -106,29 +108,29 @@ support email → **Save**.
 ```json
 {
   "apiKey": "AIza...",
-  "authDomain": "keen-wavelet-275120.firebaseapp.com",
-  "projectId": "keen-wavelet-275120",
+  "authDomain": "YOUR-PROJECT-ID.firebaseapp.com",
+  "projectId": "YOUR-PROJECT-ID",
   "appId": "1:1234567890:web:abcdef"
 }
 ```
 
-The other keys it shows (`storageBucket`, `messagingSenderId`) are harmless —
+The other keys it shows (`storageBucket`, `messagingSenderId`) are harmless â€”
 include them or not.
 
 This config is **public by design**; it ships inside the page. Access is
 controlled by the Firestore rules, not by hiding these values.
 
-⚠️ Do **not** paste a **service-account** key here. That is a different file with
+âš ï¸ Do **not** paste a **service-account** key here. That is a different file with
 `"type": "service_account"` and a `private_key`, and putting it in a web page
 would leak write access to your database. The build now refuses it.
 
-### Step 5 — Let the VM write to Firestore
+### Step 5 â€” Let the VM write to Firestore
 
 **There are TWO gates here, and the second one is the one that actually
 blocks you.** This section originally covered only the first, which cost real
 debugging time.
 
-**Gate 1 — IAM (what the identity may do).**
+**Gate 1 â€” IAM (what the identity may do).**
 
 ```bash
 gcloud compute instances describe stock-monitor --zone=us-east1-b \
@@ -136,10 +138,10 @@ gcloud compute instances describe stock-monitor --zone=us-east1-b \
 ```
 
 On this project the answer is `609593941215-compute@developer.gserviceaccount.com`
-— the **default Compute Engine service account**. Check what it already has:
+â€” the **default Compute Engine service account**. Check what it already has:
 
 ```bash
-gcloud projects get-iam-policy keen-wavelet-275120 \
+gcloud projects get-iam-policy YOUR-PROJECT-ID \
   --flatten="bindings[].members" \
   --filter="bindings.members:609593941215-compute@developer.gserviceaccount.com" \
   --format="value(bindings.role)"
@@ -149,7 +151,7 @@ It already holds `roles/editor`, which **includes Firestore read/write**, so no
 role change is needed here. (If yours comes back empty, grant
 `roles/datastore.user` as originally written.)
 
-**Gate 2 — OAuth access scopes (what the token may request).** This is the one
+**Gate 2 â€” OAuth access scopes (what the token may request).** This is the one
 that bites. A GCE instance gets a fixed set of scopes at creation, and IAM being
 permissive means nothing if the token cannot carry the scope. The default set is:
 
@@ -181,32 +183,32 @@ Notes:
 - Add `datastore` to the existing list rather than switching to `cloud-platform`.
   `cloud-platform` is broader than this job needs.
 - **The external IP changes** on restart (it is ephemeral). Nothing in this
-  project depends on the IP — the panel and these docs reach the VM by name — but
+  project depends on the IP â€” the panel and these docs reach the VM by name â€” but
   note the new one if you had it written down.
 - **SSH will prompt about an unknown host key** after the restart. Accept it, or
   pass `--strict-host-key-checking=no` to `gcloud compute ssh`.
-- Check the time first: the news cron jobs run `1-5` (Mon–Fri) at 13:15/21:00 UTC
+- Check the time first: the news cron jobs run `1-5` (Monâ€“Fri) at 13:15/21:00 UTC
   in summer. A weekend is a free window.
 
-### Step 6 — Push the archive to Firestore
+### Step 6 â€” Push the archive to Firestore
 
 Run this **on the VM** (it reads the VM's own metadata server for credentials):
 
 ```bash
-python3 news_web.py --sync-firebase --project=keen-wavelet-275120 --dry-run
+python3 news_web.py --sync-firebase --project=YOUR-PROJECT-ID --dry-run
 ```
 
 Expect a line like `1396 row(s): 1396 to write, 0 to delete, 0 unchanged`. The
 dry run needs no credentials and writes nothing. Then do it for real:
 
 ```bash
-python3 news_web.py --sync-firebase --project=keen-wavelet-275120
+python3 news_web.py --sync-firebase --project=YOUR-PROJECT-ID
 ```
 
-**Check it worked:** Firestore → **Data** shows a `news` collection with ~1,400
+**Check it worked:** Firestore â†’ **Data** shows a `news` collection with ~1,400
 documents and a `meta` collection with one `status` document.
 
-### Step 7 — Install the Firebase CLI and deploy
+### Step 7 â€” Install the Firebase CLI and deploy
 
 On your Windows machine:
 
@@ -224,18 +226,36 @@ firebase deploy --only firestore:rules,hosting
 ```
 
 `.firebaserc` is already committed, so `firebase deploy` knows which project to
-use — no `firebase init` and no `firebase use` needed. The command prints your
+use â€” no `firebase init` and no `firebase use` needed. The command prints your
 Hosting URL when it finishes.
 
-### Step 8 — Open it
+### Step 8 â€” Open it
 
-Go to `https://keen-wavelet-275120.web.app`, click **Sign in with Google**, and
+Go to `https://YOUR-PROJECT-ID.web.app`, click **Sign in with Google**, and
 the archive loads. Bookmark it on your phone's home screen.
+
+### Step 9 — Decide WHO can read it (do this before sharing the URL)
+
+`firestore.rules` no longer accepts "any signed-in Google account". Reads are
+gated by an **email allowlist** published into the `meta/status` document:
+
+1. Panel → **Configuration** → **Hosted page access** → enter your Google
+   email(s), comma separated, then **Upload config to server**.
+2. On the VM, run the sync so the allowlist reaches Firestore:
+   `python3 news_web.py --sync-firebase --project=YOUR-PROJECT-ID`
+3. Only then deploy the rules: `firebase deploy --only firestore:rules`.
+
+**Order matters.** If you deploy the rules before the allowlist exists, the page
+is readable by nobody (fail closed) — that is deliberate. To recover, run the
+sync again, or add your email and repeat steps 1–3.
+
+An empty allowlist means **nobody** can read the archive. The VM keeps syncing
+regardless: its service-account token bypasses security rules by design.
 
 ### Keeping it fed (optional, after the first deploy works)
 
 Add **DST-aware** cron lines on the VM so the archive stays current. Keep them
-separate from the news cron jobs — a failure here must never affect your digest:
+separate from the news cron jobs â€” a failure here must never affect your digest:
 
 ```bash
 crontab -e
@@ -246,10 +266,10 @@ crontab -e
 # so the archive always mirrored the previous run and the last run of the day
 # only appeared the next morning - the page the digest links to was missing
 # exactly the items in the digest.
-30 13 * * 1-5 cd /home/Achilles && /usr/bin/python3 news_web.py --sync-firebase --project=keen-wavelet-275120 >> news_web.log 2>&1
-30 14 * * 1-5 cd /home/Achilles && /usr/bin/python3 news_web.py --sync-firebase --project=keen-wavelet-275120 >> news_web.log 2>&1
-15 21 * * 1-5 cd /home/Achilles && /usr/bin/python3 news_web.py --sync-firebase --project=keen-wavelet-275120 >> news_web.log 2>&1
-15 22 * * 1-5 cd /home/Achilles && /usr/bin/python3 news_web.py --sync-firebase --project=keen-wavelet-275120 >> news_web.log 2>&1
+30 13 * * 1-5 cd $HOME && /usr/bin/python3 news_web.py --sync-firebase --project=YOUR-PROJECT-ID >> news_web.log 2>&1
+30 14 * * 1-5 cd $HOME && /usr/bin/python3 news_web.py --sync-firebase --project=YOUR-PROJECT-ID >> news_web.log 2>&1
+15 21 * * 1-5 cd $HOME && /usr/bin/python3 news_web.py --sync-firebase --project=YOUR-PROJECT-ID >> news_web.log 2>&1
+15 22 * * 1-5 cd $HOME && /usr/bin/python3 news_web.py --sync-firebase --project=YOUR-PROJECT-ID >> news_web.log 2>&1
 ```
 
 **Four lines** (the 09:15 and 17:00 ET runs, in both EDT and EST). The sync has
@@ -261,26 +281,27 @@ rows are never rewritten.
 
 | Symptom | Cause and fix |
 |---|---|
-| "Firebase config missing" on the page | `firebase-config.json` is empty or malformed — rebuild with step 7 |
-| Blank page; console says `auth/unauthorized-domain` | Add the domain: Authentication → Settings → **Authorized domains** |
-| "Missing or insufficient permissions" after signing in | Rules not deployed — `firebase deploy --only firestore:rules` |
+| "Firebase config missing" on the page | `firebase-config.json` is empty or malformed â€” rebuild with step 7 |
+| Blank page; console says `auth/unauthorized-domain` | Add the domain: Authentication â†’ Settings â†’ **Authorized domains** |
+| "Missing or insufficient permissions" after signing in | Either rules not deployed (`firebase deploy --only firestore:rules`) or your email is not in **Hosted page access** — the page now says which account was refused |
+| Rows you deleted still show on the hosted page | The sync deletes only what its manifest remembers. Run `news_web.py --sync-firebase --project=YOUR-PROJECT-ID --reconcile` once; from then on the manifest is complete |
 | Sync fails with `403 PERMISSION_DENIED` | Step 5 gate 1: no Firestore role on the service account |
-| **Sync fails with `ACCESS_TOKEN_SCOPE_INSUFFICIENT`** | **Step 5 gate 2: the VM's OAuth scopes lack `datastore`. IAM alone is not enough — the instance must be stopped to change scopes** |
+| **Sync fails with `ACCESS_TOKEN_SCOPE_INSUFFICIENT`** | **Step 5 gate 2: the VM's OAuth scopes lack `datastore`. IAM alone is not enough â€” the instance must be stopped to change scopes** |
 | Sync fails: cannot reach the metadata server | You ran it off the VM. It must run on the GCP VM |
 | Page shows only "Signed out." | Google provider not enabled (step 3) |
-| **Sign-in fails with `auth/popup-closed-by-user` even though Google login worked** | **See "When the popup sign-in fails" below. The code is misleading — it does not mean the window was closed** |
+| **Sign-in fails with `auth/popup-closed-by-user` even though Google login worked** | **See "When the popup sign-in fails" below. The code is misleading â€” it does not mean the window was closed** |
 | `firebase: command not found` | Reopen the terminal after `npm install -g` |
-| Firestore asks you to upgrade to Blaze | Hosting, Auth and Firestore all have free tiers and this design stays inside them. If it insists, Blaze with a **$0 budget alert** is safe — but check before adding a card |
+| Firestore asks you to upgrade to Blaze | Hosting, Auth and Firestore all have free tiers and this design stays inside them. If it insists, Blaze with a **$0 budget alert** is safe â€” but check before adding a card |
 
 ### When the popup sign-in fails (`auth/popup-closed-by-user`)
 
-Reported in practice: login succeeded, then "sign in failed — Error auth popup
+Reported in practice: login succeeded, then "sign in failed â€” Error auth popup
 closed by user", and switching browser made it work. That is the expected shape
 of this problem.
 
 The popup flow needs the popup and the opener page to **share storage** so the
 result can be handed back. Browsers that partition storage or block third-party
-cookies — Edge and Chrome with strict tracking prevention, Brave, Safari —
+cookies â€” Edge and Chrome with strict tracking prevention, Brave, Safari â€”
 break that handshake. Google authenticates you correctly inside the popup; the
 credential simply never reaches the page. The SDK sees no result, assumes the
 window was closed, and reports `popup-closed-by-user`.
@@ -302,13 +323,13 @@ If it still fails after that:
 > redirect fallback does not rescue it, either relax that browser for these two
 > domains or make the digest link open somewhere else.
 
-## Cost — and why "Blaze" does not mean "you get billed"
+## Cost â€” and why "Blaze" does not mean "you get billed"
 
 Adding Firebase to a project that already has billing enabled forces the Blaze
 (pay-as-you-go) plan; Firebase cannot put a billed project on Spark. That sounds
 alarming, so here is the part that matters, quoted from the pricing page:
 
-> **"No-cost usage from Spark plan included"** — Blaze keeps the same no-cost
+> **"No-cost usage from Spark plan included"** â€” Blaze keeps the same no-cost
 > tier as Spark, calculated **daily**.
 
 So Blaze is not "you pay per request". It is "you have the free tier, and only
@@ -319,7 +340,7 @@ usage *above* it is billed". The no-cost tier, per project per day:
 | Firestore document writes | 20,000 / day | ~1,400 on a cold sync, ~1 per sync after (the manifest skips unchanged rows) |
 | Firestore document reads | 50,000 / day | 1 per visit (cached), ~1,400 on a cold load |
 | Firestore document deletes | 20,000 / day | 0 normally |
-| Firestore stored data | 1 GiB | ~1.4 MB — about 0.14% |
+| Firestore stored data | 1 GiB | ~1.4 MB â€” about 0.14% |
 | Hosting data transfer | 360 MB / day | ~15 KB per page load |
 | Hosting storage | 10 GB | under 100 KB |
 | Authentication (Google sign-in) | 50K monthly active users | 1 |
@@ -334,42 +355,42 @@ your Hosting bucket, so it does not count against the 360 MB/day transfer.
 
 ### Confirming it yourself
 
-- **Firestore → Usage** in the Firebase console shows today's reads/writes/deletes
+- **Firestore â†’ Usage** in the Firebase console shows today's reads/writes/deletes
   against the limits, in real time.
-- **GCP console → Billing → Reports**, filtered to Firestore/Hosting, shows the
-  actual charge — expected to be zero.
-- **Billing → Budgets & alerts**: set a small budget. Be aware this *alerts*; a
+- **GCP console â†’ Billing â†’ Reports**, filtered to Firestore/Hosting, shows the
+  actual charge â€” expected to be zero.
+- **Billing â†’ Budgets & alerts**: set a small budget. Be aware this *alerts*; a
   Google Cloud budget is not a hard spending cap.
 
 ### If you would rather not have a payment method involved at all
 
 Two alternatives, both covered earlier in this repo's discussion:
 
-1. **A separate Firebase project with no billing** (true Spark). Free, no card —
+1. **A separate Firebase project with no billing** (true Spark). Free, no card â€”
    but the VM's service account belongs to this project, so the VM would need a
    service-account key file for the new one. That is a long-lived credential on
    the server, which is exactly what the same-project approach avoids.
-2. **Skip Firebase entirely and use Tailscale** — a private network between the
+2. **Skip Firebase entirely and use Tailscale** â€” a private network between the
    VM and your phone. No cloud database, no card, no Firebase account: Tailscale
    *is* the authentication. You lose the shareable public link and must install
    Tailscale on each device. `news_web.py` would need a small `--serve` mode.
 
 ## Status: deployed and live
 
-`https://keen-wavelet-275120.web.app` is up. What is actually confirmed:
+`https://YOUR-PROJECT-ID.web.app` is up. What is actually confirmed:
 
-**Verified — the live site:**
+**Verified â€” the live site:**
 - `index.html` and `firebase-boot.js` both serve 200 with correct content types
 - the page carries the config, sets `__GL_HOSTED__`, and embeds **no** data
-  (12 KB — the whole archive lives in Firestore)
+  (12 KB â€” the whole archive lives in Firestore)
 - the three security headers from `firebase.json` are present
-- **anonymous access is refused: `403` on both `news` and `meta`** — the rules
+- **anonymous access is refused: `403` on both `news` and `meta`** â€” the rules
   really are doing the work, not just hiding the UI
 - **the sign-in gate renders**: after a real 15-second wait the page reports
   `signinGate: true`, `signInButton: true`, `stats: "Signed out."` and a visible
   "Sign in with Google" button
 
-**Verified — the data path:**
+**Verified â€” the data path:**
 - the sync committed **850 rows + 1 meta document** (851 operations, in two
   batches of the 500 the API allows)
 - read back over REST: `meta/status` says `count 850, pushed 86`, and an
@@ -387,7 +408,7 @@ that boundary is confirmed.
 Do **not** test this page with Chrome's `--virtual-time-budget`. Firebase Auth
 resolves its initial state via IndexedDB and timers, and virtual time breaks
 that: `onAuthStateChanged` never fires and the page appears permanently stuck on
-"Loading…" with no error. That is a **false negative** — I chased it for a while
+"Loadingâ€¦" with no error. That is a **false negative** â€” I chased it for a while
 before switching to `_audit/cdp_probe.js`, which drives a real clock over the
 DevTools protocol. Use that instead.
 
@@ -397,10 +418,10 @@ DevTools protocol. Use that instead.
   nothing else is reachable, and no client can ever write.
 - The VM writes with an IAM service-account token, which bypasses rules by
   design. Note that this project's VM service account holds the GCP default
-  `roles/editor`, which is broader than this job needs — narrowing it to
+  `roles/editor`, which is broader than this job needs â€” narrowing it to
   `roles/datastore.user` would be a genuine hardening step, but check nothing
   else on the VM relies on `editor` first.
-- The page is read-only. There is no delete, no "run now", no config upload —
+- The page is read-only. There is no delete, no "run now", no config upload â€”
   those stay in the local panel where they belong.
 - If you later want the phone to *act* (mark read, delete), that needs new
   authenticated write rules and a different review. Do not add them casually to

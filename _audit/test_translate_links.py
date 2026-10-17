@@ -7,6 +7,9 @@ The digest and the web page both link to
 which is a DEPRECATED Google endpoint. This checks what each candidate really
 returns, using a real Chinese article from the archive.
 """
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import sqlite3
 import sys
 import urllib.parse
@@ -18,7 +21,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
 # A real Chinese article from the local archive copy.
-conn = sqlite3.connect(r"F:\MyRepository\PortfolioNewsUpdater\_audit\news.db")
+conn = sqlite3.connect(os.path.join(ROOT, "_audit/news.db"))
 row = conn.execute(
     "SELECT url, title_raw FROM news WHERE lang='zh' AND url LIKE 'http%' "
     "AND url NOT LIKE '%news.google.com%' LIMIT 1").fetchone()

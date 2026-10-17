@@ -83,3 +83,25 @@ Suite: **29 pass / 0 fail.**
 4. **G7 more theme queries / sector_watch default** — widen unnamed-sector cover.
 5. **Local-language editions** (Google News `hl=ja`, `hl=de`) for non-Chinese
    markets — cheap, but only matters if such tickers are added.
+
+---
+
+## F. Follow-up review — 2026-10-17
+
+A second end-to-end pass (config I/O, panel, hosted page, and a full watchlist
+swap exercised with `AAPL / 0700.HK / 7203.T / MC.PA / BRK.B / BABA`) found 15
+more defects. All are fixed and pinned by tests; the suite is now **31 checks**.
+
+| Area | What was wrong | Now |
+|---|---|---|
+| Config I/O | A UTF-8 **BOM** (PowerShell / VS Code) made `json.load` fail, the error was swallowed, the config looked empty and the panel's Upload could write that emptiness back over the watchlist and keys. | Read as `utf-8-sig`; parse errors are reported, the panel shows them, disables Upload, and refuses an empty watchlist. |
+| Hosted access | `firestore.rules` allowed **any signed-in Google account** to read the archive. | Email allowlist in `meta/status` (from `web_allowed_emails`); empty list = nobody. Rules tested through the Firebase Rules API for allow/deny. |
+| Panel | `Origin: null` and any loopback port passed the CSRF check; a stored secret could never be cleared; `gcloud` timeouts did not kill the Windows child process; two purge routes sent a second 404. | Exact scheme+host+port origin check, dirty-field secret clearing, process-tree kill, `return` after each handler. |
+| Any watchlist | Official English names never matched headline forms ("Toyota Motor Corporation" vs "Toyota"): 12 of 22 tested US headlines were rejected as unrelated. | `aliases_en` plus derived short names, with guard lists; 1 of 22 now needs an explicit alias (Google/Alphabet). |
+| Swapping tickers | Removed tickers' `ticker_meta` was re-seeded and could claim shared brand names; `rescue_orphans` re-queued rows for dropped tickers; the macro tier stayed China-only. | Upload prunes metadata/feeds, the lookup only seeds configured tickers, rescue is ticker-filtered, and the China macro tier auto-skips when no holding has a Chinese name. |
+| No AI key | The per-ticker path pushed unscored headlines (importance 5, push=true). | Fails closed: stored for browsing, never pushed; macro collection is skipped entirely. |
+| Quality | Auto-generated US filler and `javascript:` links. | Filler patterns added; only `http(s)` becomes a link in either reader. |
+| Tests / docs | 67 hardcoded `F:\...` paths (the suite could not run on a clone); setup docs embedded one user's project id and home directory. | Paths derive from `__file__` (verified from a clone); docs de-personalised, with a swap checklist and the access-allowlist deploy order. |
+
+Still open from section C: **G1** cross-tier duplication, **G2** HKEX filings,
+**G3** press-release wires, and local-language editions — unchanged.

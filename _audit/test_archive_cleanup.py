@@ -1,10 +1,12 @@
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Gate: the archive clean-up - junk-content filtering, the multi-rule purge,
 # and the AI event regroup (mocked, so it costs nothing).
 import os
 import sqlite3
 import sys
 
-BASE = r"F:\MyRepository\PortfolioNewsUpdater"
+BASE = ROOT
 sys.path.insert(0, BASE)
 os.chdir(BASE)
 import news_updater as nu

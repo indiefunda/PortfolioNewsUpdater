@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Test the new relevance + dedup gates against the REAL 10-day corpus."""
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import importlib.util
 import json
 import sqlite3
@@ -8,11 +11,11 @@ import sys
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 spec = importlib.util.spec_from_file_location(
-    "nu", r"F:\MyRepository\PortfolioNewsUpdater\news_updater.py")
+    "nu", os.path.join(ROOT, "news_updater.py"))
 nu = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nu)
 
-BASE = r"F:\MyRepository\PortfolioNewsUpdater\_audit"
+BASE = os.path.join(ROOT, "_audit")
 try:
     lookup = json.load(open(BASE + r"\company_lookup.json", encoding="utf-8"))
 except FileNotFoundError:

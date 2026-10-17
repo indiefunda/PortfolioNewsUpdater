@@ -2,13 +2,16 @@
 # -*- coding: utf-8 -*-
 """Verify the documentation's factual claims against the code, mechanically.
 Each check asserts one claim that was previously wrong."""
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import importlib.util
 import io
 import re
 import sys
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-B = r"F:\MyRepository\PortfolioNewsUpdater"
+B = ROOT
 nu_src = io.open(B + r"\news_updater.py", encoding="utf-8").read()
 cm_src = io.open(B + r"\cloud_manager.py", encoding="utf-8").read()
 sh_src = io.open(B + r"\setup_cloud.sh", encoding="utf-8").read()

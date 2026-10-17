@@ -2,15 +2,18 @@
 # -*- coding: utf-8 -*-
 """Test delete_news_item: removes one row, clears the right ledger entry, and
 leaves everything else untouched."""
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import importlib.util, os, shutil, sqlite3, sys
 from datetime import datetime
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 spec = importlib.util.spec_from_file_location(
-    "nu", r"F:\MyRepository\PortfolioNewsUpdater\news_updater.py")
+    "nu", os.path.join(ROOT, "news_updater.py"))
 nu = importlib.util.module_from_spec(spec); spec.loader.exec_module(nu)
 
-BASE = r"F:\MyRepository\PortfolioNewsUpdater\_audit"
+BASE = os.path.join(ROOT, "_audit")
 COPY = os.path.join(BASE, "_del.db")
 shutil.copyfile(os.path.join(BASE, "news.db"), COPY)
 nu.DB_FILE = COPY; nu.NO_WRITE = False

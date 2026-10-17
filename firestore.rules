@@ -3,22 +3,44 @@ rules_version = '2';
 // Firestore rules for the hosted news page.
 //
 // The whole reason the data lives in Firestore instead of a public news.json is
-// so that this rule can exist: an auth-gated page over an unprotected file
+// so that these rules can exist: an auth-gated page over an unprotected file
 // hides only the UI, and anyone with the URL could still fetch the archive.
 //
-// Clients may READ the news and the meta doc once signed in, and may never
-// write. The VM does not go through these rules at all - it writes with an IAM
-// service-account token, which bypasses security rules by design.
+// ACCESS IS AN EMAIL ALLOWLIST, not "any Google account".
+//   - `request.auth != null` alone let ANY Google account that found the URL
+//     read the whole archive; sign-in was GoogleAuthProvider with no check.
+//   - The allowlist lives in the meta/status document, which the VM's
+//     `news_web.py --sync-firebase` writes from config_local.json's
+//     `web_allowed_emails`. So the owner changes access in the panel, not here.
+//   - An EMPTY or missing list denies everyone. That is deliberate: fail closed.
+//   - The VM writes with an IAM service-account token, which bypasses these
+//     rules by design, so syncing still works with nobody on the list.
+//
+// Deploy order matters: set web_allowed_emails in the panel, upload, run the
+// Firestore sync (which writes meta/status), and only then deploy these rules.
+// Deploying them first would lock out the page until the next sync.
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    function signed_in_email() {
+      return request.auth != null && request.auth.token.email != null
+        ? request.auth.token.email.lower()
+        : '';
+    }
+
+    function may_read() {
+      return signed_in_email() != '' &&
+        signed_in_email() in
+          get(/databases/$(database)/documents/meta/status).data.allowed_emails;
+    }
+
     match /news/{itemId} {
-      allow read: if request.auth != null;
+      allow read: if may_read();
       allow write: if false;
     }
 
     match /meta/{docId} {
-      allow read: if request.auth != null;
+      allow read: if may_read();
       allow write: if false;
     }
 

@@ -2,6 +2,9 @@
 # -*- coding: utf-8 -*-
 """Verify: with NO_WRITE set, Tavily/EXA refuse to make a paid call; with it
 clear (the ad-hoc scan path), they do make it."""
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import importlib.util
 import os
 import sys
@@ -9,7 +12,7 @@ import types
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 spec = importlib.util.spec_from_file_location(
-    "nu", r"F:\MyRepository\PortfolioNewsUpdater\news_updater.py")
+    "nu", os.path.join(ROOT, "news_updater.py"))
 nu = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nu)
 

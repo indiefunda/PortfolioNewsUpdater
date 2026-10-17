@@ -43,11 +43,14 @@ window.addEventListener('load', function(){
     var pre = document.createElement('pre');
     pre.id = 'probe';
     pre.textContent = JSON.stringify({
-      ticker: F.ticker, minImp: F.minImp, sort: F.sort,
+      ticker: F.ticker, minImp: F.minImp, sort: F.sort, status: F.status,
       view: VIEW.length,
       wrongTicker: VIEW.filter(function(i){ return i.ticker !== F.ticker; }).length,
       belowFloor: VIEW.filter(function(i){ return i.importance == null || i.importance < 6; }).length,
-      tickerSelect: document.getElementById('ticker').value
+      tickerSelect: document.getElementById('ticker').value,
+      badScheme: safeHref('javascript:alert(1)'),
+      dataScheme: safeHref('data:text/html,<b>x</b>'),
+      goodScheme: safeHref('https://example.test/a')
     });
     document.body.appendChild(pre);
   }, 400);
@@ -55,22 +58,28 @@ window.addEventListener('load', function(){
 </script>
 """
 
-base = open(os.path.join(OUT, "index.html"), encoding="utf-8").read()
-probe_file = os.path.join(tempfile.gettempdir(), "gl_params_probe.html")
-open(probe_file, "w", encoding="utf-8").write(base.replace("</body>", probe + "</body>"))
-
-url = "file:///" + probe_file.replace("\\", "/") + "?ticker=QFIN&minImp=6&sort=importance"
-dom = subprocess.run([EDGE, "--headless=new", "--disable-gpu", "--no-sandbox",
-                      "--virtual-time-budget=8000", "--dump-dom", url],
-                     capture_output=True, text=True, encoding="utf-8",
-                     errors="replace", timeout=180)
-m = re.search(r'<pre id="probe"[^>]*>(.*?)</pre>', dom.stdout or "", re.S)
-if not m:
-    print("no probe output - page did not run")
-    sys.exit(1)
-
 import json  # noqa: E402
-state = json.loads(m.group(1))
+
+
+def run(url_suffix):
+    """Load a copy of the page with a query string and return its state."""
+    base = open(os.path.join(OUT, "index.html"), encoding="utf-8").read()
+    probe_file = os.path.join(tempfile.gettempdir(), "gl_params_probe.html")
+    open(probe_file, "w", encoding="utf-8").write(
+        base.replace("</body>", probe + "</body>"))
+    url = "file:///" + probe_file.replace("\\", "/") + url_suffix
+    dom = subprocess.run([EDGE, "--headless=new", "--disable-gpu", "--no-sandbox",
+                          "--virtual-time-budget=8000", "--dump-dom", url],
+                         capture_output=True, text=True, encoding="utf-8",
+                         errors="replace", timeout=180)
+    m = re.search(r'<pre id="probe"[^>]*>(.*?)</pre>', dom.stdout or "", re.S)
+    if not m:
+        print("no probe output - page did not run")
+        sys.exit(1)
+    return json.loads(m.group(1))
+
+
+state = run("?ticker=QFIN&minImp=6&sort=importance")
 print("  page state:", state)
 check("ticker filter applied from the URL", state["ticker"] == "QFIN", state["ticker"])
 check("importance floor applied", state["minImp"] == 6, str(state["minImp"]))
@@ -79,6 +88,23 @@ check("the dropdown reflects it", state["tickerSelect"] == "QFIN", state["ticker
 check("rows really filtered", state["view"] > 0 and state["wrongTicker"] == 0
       and state["belowFloor"] == 0,
       f"view={state['view']} wrong={state['wrongTicker']} low={state['belowFloor']}")
+
+print()
+print("=== a link naming a removed ticker / unknown filter must not blank the page ===")
+stale = run("?ticker=NOPE&minImp=7&status=bogus&sort=bogus")
+print("  page state:", stale)
+check("unknown ticker resets to All", stale["ticker"] == "", stale["ticker"])
+check("unsupported importance resets to any", stale["minImp"] == 0, str(stale["minImp"]))
+check("unknown status resets", stale["status"] == "", stale["status"])
+check("unknown sort falls back to newest", stale["sort"] == "newest", stale["sort"])
+check("the page still shows rows", stale["view"] > 0, str(stale["view"]))
+
+print()
+print("=== only http(s) URLs may become links (esc() does not stop javascript:) ===")
+check("javascript: is neutralized", state["badScheme"] == "", state["badScheme"])
+check("data: is neutralized", state["dataScheme"] == "", state["dataScheme"])
+check("https: still works", state["goodScheme"].startswith("https://"),
+      state["goodScheme"])
 
 print()
 print(f"RESULT: {'ALL TESTS PASSED' if fail == 0 else str(fail) + ' FAILURE(S)'}")

@@ -10,6 +10,9 @@ mishandles, so if the direct form is reliable it is the better link.
 Tests the construction against real hosts from the archive and verifies the
 proxy actually serves translated content, not an error shell.
 """
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import random
 import sqlite3
 import sys
@@ -35,7 +38,7 @@ def direct_proxy_url(url):
             f"?_x_tr_sl={TR_SL}&_x_tr_tl={TR_TL}&_x_tr_hl={TR_HL}")
 
 
-conn = sqlite3.connect(r"F:\MyRepository\PortfolioNewsUpdater\_audit\news.db")
+conn = sqlite3.connect(os.path.join(ROOT, "_audit/news.db"))
 conn.row_factory = sqlite3.Row
 rows = conn.execute(
     "SELECT DISTINCT url FROM news WHERE lang='zh' AND url LIKE 'http%' "

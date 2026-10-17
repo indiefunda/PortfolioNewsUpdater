@@ -2,6 +2,9 @@
 # -*- coding: utf-8 -*-
 """Structural check of the tabbed panel: every card sits inside exactly one
 pane, panes are balanced, and no id got duplicated by the refactor."""
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import importlib.util
 import re
 import sys
@@ -9,7 +12,7 @@ from html.parser import HTMLParser
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 spec = importlib.util.spec_from_file_location(
-    "cm", r"F:\MyRepository\PortfolioNewsUpdater\cloud_manager.py")
+    "cm", os.path.join(ROOT, "cloud_manager.py"))
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 html = m.HTML

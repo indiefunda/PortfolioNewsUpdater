@@ -6,6 +6,9 @@ The Google proxy works in general (verified on one eastmoney article), so the
 complaint must be URL-specific. This samples the real archive and reports which
 sources translate and which do not.
 """
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import sqlite3
 import sys
 import urllib.parse
@@ -16,7 +19,7 @@ import requests
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
-conn = sqlite3.connect(r"F:\MyRepository\PortfolioNewsUpdater\_audit\news.db")
+conn = sqlite3.connect(os.path.join(ROOT, "_audit/news.db"))
 conn.row_factory = sqlite3.Row
 
 rows = conn.execute(

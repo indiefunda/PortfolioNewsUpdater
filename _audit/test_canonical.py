@@ -6,13 +6,16 @@ Google News links look like:
 The payload is a protobuf whose bytes contain the original URL as a string.
 If the original URL is recoverable, duplicates across sources become a simple
 string comparison instead of fuzzy title matching."""
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import base64
 import re
 import sqlite3
 import sys
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-conn = sqlite3.connect(r"F:\MyRepository\PortfolioNewsUpdater\_audit\news.db")
+conn = sqlite3.connect(os.path.join(ROOT, "_audit/news.db"))
 conn.row_factory = sqlite3.Row
 
 URL_RE = re.compile(rb"https?://[^\s\"'<>\x00-\x1f]{6,600}")

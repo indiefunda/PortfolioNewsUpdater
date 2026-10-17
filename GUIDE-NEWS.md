@@ -159,16 +159,19 @@ listing constituent moves, a single A-share company's announcement, a foreign
 data point with no rate implication, central-bank small talk). Only items it
 accepts are stored and scored, then **one row per event**: on a live run of 45
 candidates, 33 were rejected and the remaining copies of the same event merged
-into 2 rows. The old keyword gate survives as the **outage fallback** (no AI key
-or an unusable response), and a mechanical tape filter drops price-move listings
-that the model should never have to read.
+into 2 rows. If the AI key is present but the response is unusable (an outage),
+the old keyword gate screens the items and they are **stored only, never
+pushed**; with **no AI key at all** the macro tier is skipped entirely. A
+mechanical tape filter drops price-move listings that the model should never
+have to read.
 
 **Cost:** one call with ~50 items ≈ 3–4k tokens (~0.2¢ off-peak), against the
 few hundred tokens the old 12-item call spent — the difference buys the removal
-of roughly 30 stored junk rows per run. Set `macro_translate: false` for zero AI
-on macro entirely (raw Chinese headline + English tag like `[RATE CUT]`), in
-which case the strict keyword gate decides what is stored. Add your own
-watchwords via `macro_keywords` (e.g. `["房地产新政", "平台经济"]`).
+of roughly 30 stored junk rows per run. Set `macro_translate: false` for the
+deliberate zero-AI path on macro (raw Chinese headline + English tag like
+`[RATE CUT]`, stored and pushed under the strict keyword gate); note this only
+works when an AI key exists, because no key means nothing is pushed anywhere.
+Add your own watchwords via `macro_keywords` (e.g. `["房地产新政", "平台经济"]`).
 
 ## Company lookup & auto-discovery (the "alpha" config)
 
@@ -177,7 +180,7 @@ Real alpha is never on the ticker symbol — it's on the **subsidiaries**
 knowledge base in `company_lookup.json` (on the server):
 
 - Each **configured** ticker's profile: `name_zh`, `name_en`, `aliases_zh`,
-  `subsidiaries_zh`, `subsidiaries_other` (non-Chinese brands),
+  **`aliases_en`**, `subsidiaries_zh`, `subsidiaries_other` (non-Chinese brands),
   **`website` / `news_url` / `subsidiary_websites`** (official sites — used
   for `site:` news searches), and `keywords`.
 - **Whenever a new stock is added to the configuration**, the updater checks
@@ -204,8 +207,43 @@ knowledge base in `company_lookup.json` (on the server):
   **"Re-discover subsidiaries now"** button to force an immediate re-search.
   The Configuration tab's names editor shows exactly what is being searched for
   each ticker — everything is merged (your config **plus** what discovery
-  found), and your entries are tried first. Note that list fields are **unioned**:
-  adding a name via config cannot remove a discovered one.
+  found). **Applying the editor makes that list authoritative**: delete a wrong
+  auto-discovered name and it is removed from the search (an empty line clears
+  the list). Without pressing Apply, list fields are unioned, so config entries
+  only ever add.
+
+## Swapping the whole watchlist
+
+The app is built Chinese-first. It runs for any tickers, but the quality depends
+on the market, so expect this when you replace the list:
+
+| New holdings | What you get |
+|---|---|
+| **US-listed Chinese ADRs** | The full design: Chinese wires/portals, English + SEC, Chinese macro. |
+| **HK-listed Chinese names** | Good: Chinese sources + English + SEC-less fundamentals; **no HKEX filings** (documented gap). |
+| **US / UK / EU blue chips** | SEC (US only) + Google News EN + Tavily. English-name matching now derives the headline form, but add `aliases_en` for rebrands. The macro tier is China-specific and is **skipped automatically** when no holding has a Chinese name. |
+| **Japan / other non-English, non-Chinese** | Thin: there is no `hl=ja`/`hl=de` edition, so only English and Chinese coverage is searched. |
+
+Checklist for a swap:
+
+1. **Set the new tickers**, then open **👁 Show what this ticker searches** for
+   each one after the first run. If the derived names look wrong, edit the box
+   and press **Apply** (that makes the list authoritative and removable).
+2. **Add `aliases_en`** for anything whose press name differs from its legal
+   name (Google/Alphabet, LVMH, Toyota).
+3. **Turn off the Chinese-only sources** when the portfolio has no Chinese
+   names: `eastmoney`, `eastmoney_724`, `sina_724`, `regulators`,
+   `sector_regulation`. `macro_enabled` is inferred, but an explicit value in
+   the config always wins.
+4. **Delete stale `ticker_meta` entries** (the panel's JSON box keeps them
+   unless you remove them). Upload now drops metadata for tickers that are no
+   longer in the list, and the lookup ignores removed tickers, so this is a
+   tidy-up rather than a correctness requirement.
+5. **Smoke-test one new ticker with 🔎 Deep search** — a ticker you know is in
+   the news. Zero or one article means the profile/matching needs an alias.
+6. Old archives linger for the retention window (~21 days) and are labelled
+   "(old)" on the hosted page; the repeat/event ledgers for removed tickers are
+   ignored from the next run on.
 
 ## One-time setup
 
@@ -231,23 +269,28 @@ knowledge base in `company_lookup.json` (on the server):
    - **Configuration** → add tickers, pick AI provider, paste Telegram +
      AI keys, and paste your free **Tavily key** (optional but recommended).
    - **Configuration** → **Chinese names (ticker_meta)** → per-ticker JSON with
-     `name_zh`, `aliases_zh`, `subsidiaries_zh`. **This is where the Chinese edge
-     comes from.** The **👁 Show what this ticker searches** button fills in
-     everything discovered so far plus your own entries. Example:
+     `name_zh`, `aliases_zh`, `aliases_en`, `subsidiaries_zh`. **This is where
+     the alpha comes from.** The **👁 Show what this ticker searches** button
+     fills in everything discovered so far plus your own entries. Example:
      ```json
      {
        "LX": {
          "name_zh": "乐信",
          "name_en": "LexinFintech Holdings",
          "aliases_zh": ["乐信集团"],
+         "aliases_en": ["Lexin", "Fenqile"],
          "subsidiaries_zh": ["分期乐", "桔子理财"]
        }
      }
      ```
+     `aliases_en` matters for non-Chinese stocks: the app derives the obvious
+     short form ("Toyota" from Toyota Motor Corporation) but cannot guess a
+     rebrand ("Google" for Alphabet Inc.) — that is what this field is for.
    - **Push mode**: `all` pushes the top-N by AI importance; `score` only
      pushes items ≥ the min score. **Both modes apply the importance floor**
      (`push_min_importance`, default 4) and the per-ticker cap.
-     `max_digest_items` caps the digest.
+     `push_min_score` is **only read in `score` mode** — the panel greys the box
+     out in `all` mode for that reason. `max_digest_items` caps the digest.
    - **Upload config to server** — this is the one step that ships everything:
      it copies `news_updater.py` / `news_web.py` / your config + keys to the VM
      **and re-runs the setup script there**, reinstalling the schedule. It takes
@@ -664,7 +707,8 @@ those jobs running.
 | "Schedule not installed" | Click **Upload config to server**, then **Check schedule**. |
 | An OLD story (weeks/months old) appeared in the digest | Fixed by the freshness gates: every EXA result is now date-verified against the per-source delta window, and ANY item whose publish time is older than `max_news_age_hours` (default **96h**, set in `config_local.json`; 0 disables) is dropped at ingestion no matter which source returned it. The digest also shows each item's 📅 publish date so anything stale is visible at a glance. |
 | New stock added but no Chinese news appears | Check Step 6 (Company lookup) after the next run — the updater auto-discovers the company's Chinese names/subsidiaries and searches them. You can also add them manually in the Step 3 JSON (overrides always win). |
-| No digest arrives | Click **Run now (test)** and read the output. Check Telegram + AI keys. |
+| No digest arrives | Click **Run now (test)** and read the output. Check Telegram + AI keys. With **no AI key** the run deliberately stores items and pushes nothing (fail closed); an AI outage behaves the same way. |
+| Hosted page says **"This account is not on the access list"** | Add that Google email under **Configuration → Hosted page access**, upload, then run `news_web.py --sync-firebase` on the VM. The page prints the signed-in address so you can copy it. Rules only need re-deploying if you changed `firestore.rules` itself. |
 | Tavily not used | Add your Tavily key (free tier) in the panel and re-upload; the run log shows `Tavily daily/monthly cap reached` or `skipping Tavily (saving credits)` when it's budget-skipped. |
 | Too many/too few items | Switch `push_mode` to `score` and raise `push_min_score`, or lower `push_min_importance`/`push_max_per_ticker` (all editable in the panel). `max_items_per_run` and `max_digest_items` have **no panel input** — hand-edit `config_local.json` on the server if you need them. |
 | Out-of-season run skipped | Expected — the DST guard makes the wrong-season cron job a fast no-op. |

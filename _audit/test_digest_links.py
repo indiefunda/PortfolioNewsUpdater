@@ -16,13 +16,16 @@ The HTML mode is the risky part: an escaping miss makes Telegram reject the
 whole message. So this tests the escaping AND the plain-text fallback that keeps
 the digest arriving even then.
 """
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import importlib.util
 import sys
 import urllib.parse
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 spec = importlib.util.spec_from_file_location(
-    "nu", r"F:\MyRepository\PortfolioNewsUpdater\news_updater.py")
+    "nu", os.path.join(ROOT, "news_updater.py"))
 nu = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nu)
 

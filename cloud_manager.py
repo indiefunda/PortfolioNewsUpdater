@@ -75,6 +75,10 @@ DEFAULT_CONFIG = {
     # digest's "N more stored, not pushed" line links here instead of dead-ending,
     # and it is the URL you open on your phone. Empty = no link, plain count.
     "web_url": "",
+    # Google accounts allowed to read the hosted archive. Enforced by
+    # firestore.rules through the meta/status document that --sync-firebase
+    # writes; empty means NOBODY can read it (fail closed).
+    "web_allowed_emails": [],
     # Nothing published longer ago than this is ever pushed (stored only), no
     # matter how the AI scored it - this is the "I already read this days ago"
     # guard for recycled coverage. Regulatory items are exempt. 0 disables.
@@ -130,11 +134,13 @@ DEFAULT_CONFIG = {
         "exa_macro": True,  # EXA neural macro search (semantic, no regex)
         "regulators": True,  # NFRA/CSRC/PBoC penalty announcements (macro tier)
         "sector_regulation": True,  # industry rules searched by THEME, no company name
-        "macro_triage_pool_max": 60,  # candidates the AI judges for relevance per run
         "baidu": False,  # captcha-blocked from server IPs - off by default
         "tavily": True,
         "google_news_en": True,
     },
+    # Candidates the AI judges for relevance per run. This used to sit INSIDE
+    # the `sources` dict, where the updater never looked for it.
+    "macro_triage_pool_max": 60,
     # Per-ticker Chinese identity: the key to finding real Chinese news.
     #   name_zh         -> company's Chinese name (e.g. 乐信)
     #   name_en         -> English name (for the AI prompt)
@@ -166,14 +172,27 @@ MUTATING_API = ("/api/auth", "/api/create_vm", "/api/run_now", "/api/purge_junk"
                 "/api/rediscover")
 
 
+_READ_ERRORS = {}
+
+
 def _read_json(path, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return default
-    return default
+    """
+    Read one JSON file, tolerating a UTF-8 BOM and NEVER failing silently.
+
+    A BOM (PowerShell 5.1 / VS Code "UTF-8 with BOM" / older Notepad) made
+    json.load raise; the old code returned the default, so a valid config looked
+    EMPTY in the panel - every ticker, name and secret blank - and the next
+    Upload wrote that emptiness back. The error is recorded so /api/config can
+    show it and the UI can disable Upload.
+    """
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return json.load(f)
+    except Exception as exc:
+        _READ_ERRORS[path] = str(exc)
+        return default
 
 
 # Serialises read-modify-write of config/secrets. ThreadingHTTPServer serves
@@ -272,46 +291,75 @@ def gcloud_available():
     return _find_gcloud() is not None
 
 
+def _kill_process_tree(proc):
+    """
+    Kill a process AND its children.
+
+    On Windows gcloud is a .cmd wrapper: Popen creates cmd.exe, which starts
+    python.exe as a grandchild that inherits the stdout/stderr pipes. Killing
+    only `proc` leaves the grandchild holding those pipes, and the following
+    communicate() then waits for EOF - so `timeout=25` measurably took 11+
+    seconds longer, and `gcloud auth login` could hang the Authenticate button
+    indefinitely. taskkill /T removes the whole tree.
+    """
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=15)
+        else:
+            import signal
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
 def run_gcloud(args, timeout=120, stdin_devnull=False):
     """
-    Run gcloud and capture its output.
+    Run gcloud and capture its output, bounding the call by `timeout`.
 
     `stdin_devnull` detaches stdin (DEVNULL). Commands that would otherwise stop
     and wait for interactive input - `gcloud auth login` asking for a
     verification code - then fail fast with a clear message instead of hanging
     until the timeout with no output for the user to act on.
+
+    A plain subprocess.run(timeout=...) does NOT bound this on Windows (see
+    _kill_process_tree), so the process is started explicitly and the whole tree
+    is killed on timeout, after which the partial output is still returned -
+    that is how the `gcloud auth login` URL reaches the panel.
     """
     gcloud = _find_gcloud()
     if not gcloud:
         return False, "", "gcloud not found. Install the Google Cloud CLI."
     cmd = [gcloud] + args
     try:
-        # Decode as UTF-8 (gcloud may emit non-ASCII/UTF-8 bytes) and never
-        # crash on a bad byte. Without this, subprocess uses the system locale
-        # (e.g. cp1252 on Windows), which raises a UnicodeDecodeError and can
-        # leave stdout/stderr as None, crashing callers that concatenate them.
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout,
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
             stdin=subprocess.DEVNULL if stdin_devnull else None,
+            start_new_session=(os.name != "nt"),
         )
-        return proc.returncode == 0, proc.stdout or "", proc.stderr or ""
     except FileNotFoundError:
         return False, "", "gcloud not found. Install the Google Cloud CLI."
-    except subprocess.TimeoutExpired as exc:
-        # Return whatever gcloud managed to print before it blocked. This is
-        # how the `gcloud auth login` URL is captured: gcloud prints it and
-        # then waits for a verification code that only the browser knows.
-        partial_out = exc.stdout or ""
-        partial_err = exc.stderr or ""
-        if isinstance(partial_out, bytes):
-            partial_out = partial_out.decode("utf-8", "replace")
-        if isinstance(partial_err, bytes):
-            partial_err = partial_err.decode("utf-8", "replace")
-        return False, partial_out, (partial_err
-                                    or "Command timed out (still waiting?).")
     except OSError as exc:
         # e.g. the interpreter could not spawn the process at all
+        return False, "", f"Could not run gcloud: {exc}"
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode == 0, out or "", err or ""
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        try:
+            out, err = proc.communicate(timeout=15)
+        except Exception:
+            out, err = "", ""
+        return False, out or "", (err or "Command timed out (still waiting?).")
+    except Exception as exc:
+        _kill_process_tree(proc)
         return False, "", f"Could not run gcloud: {exc}"
 
 
@@ -657,17 +705,17 @@ HTML = """<!DOCTYPE html>
     <div class="status" id="metaEditStatus">Pick a ticker to see the company names and subsidiaries the app really searches — including everything auto-discovery found. Edit the lines and press Apply.</div>
     <textarea id="metaEdit" rows="6" style="width:100%;padding:12px;border-radius:8px;border:1px solid var(--border);background:#12151c;color:var(--text);font-family:monospace;font-size:12px;"></textarea>
     <textarea id="tickerMeta" rows="8" style="width:100%;padding:12px;border-radius:8px;border:1px solid var(--border);background:#12151c;color:var(--text);font-family:monospace;font-size:13px;" placeholder='{"LX":{"name_zh":"乐信","name_en":"LexinFintech","aliases_zh":["乐信集团"],"subsidiaries_zh":["分期乐","桔子理财"]}}'></textarea>
-    <div class="hint">Per ticker: Chinese name + aliases + subsidiary brands (e.g. LX → 分期乐). Used to search Google News zh-CN, Eastmoney, Baidu and Tavily. <b>Your entries here always win</b>, and the app does NOT lose what it discovered: config and discovered names are merged, with short brand names tried first (they are what headlines actually use).</div>
+    <div class="hint">Per ticker: Chinese name + aliases + subsidiary brands (e.g. LX → 分期乐). Used to search Google News zh-CN, Eastmoney, Baidu and Tavily. The English aliases are what make English coverage work ("Toyota" for Toyota Motor Corporation). Applying this editor makes the list <b>authoritative</b>: what is in the box is what the app uses, so a wrong auto-discovered name can be removed.</div>
     <div class="row">
       <div style="flex:1">
         <label>Push mode</label>
-        <select id="pushMode">
+        <select id="pushMode" onchange="pushModeChanged()">
           <option value="all">All → push top-N by importance (cap below)</option>
           <option value="score">Only importance ≥ min score</option>
         </select>
       </div>
       <div style="flex:1">
-        <label>Push min importance (1–10, for score mode)</label>
+        <label id="pushMinScoreLabel">Push min importance (1–10, score mode only)</label>
         <input id="pushMinScore" type="number" min="1" max="10" value="7">
       </div>
     </div>
@@ -687,6 +735,13 @@ HTML = """<!DOCTYPE html>
         <input id="webUrl" type="url" placeholder="https://your-project.web.app">
       </div>
     </div>
+    <div class="row">
+      <div style="flex:1">
+        <label>Hosted page access — Google emails (comma separated)</label>
+        <input id="webEmails" type="text" placeholder="you@gmail.com">
+      </div>
+    </div>
+    <div class="hint">Only these Google accounts may read the hosted archive once the Firestore rules are deployed (firestore.rules). Leave it empty and the page is readable by nobody — that is the fail-closed default.</div>
     <div class="row">
       <div style="flex:1">
         <label>News retention (days, rolling)</label>
@@ -840,7 +895,13 @@ async function api(path, body){
   // The panel answers a server-side failure with an HTML error page, so
   // r.json() blows up with "Unexpected token '<'" - a message that names
   // neither the endpoint nor the real problem.
-  if(!r.ok) throw new Error(path + ' -> HTTP ' + r.status);
+  if(!r.ok){
+    // Keep the server's explanation (e.g. "Refusing to save an empty
+    // watchlist") instead of only "HTTP 400".
+    let detail = '';
+    try { const j = await r.json(); detail = (j && j.error) || ''; } catch(e) {}
+    throw new Error(detail || (path + ' -> HTTP ' + r.status));
+  }
   return r.json();
 }
 
@@ -888,6 +949,8 @@ async function load(){
   $('pushMaxPerTicker').value = d.config.push_max_per_ticker || dflt.push_max_per_ticker || 2;
   $('webUrl').value = d.config.web_url || dflt.web_url || '';
   setWebUrl($('webUrl').value);
+  const emails = d.config.web_allowed_emails || [];
+  $('webEmails').value = Array.isArray(emails) ? emails.join(', ') : String(emails || '');
   $('retentionDays').value = d.config.news_retention_days || dflt.news_retention_days || 21;
   $('tavilyDaily').value = d.config.tavily_max_daily_searches || dflt.tavily_max_daily_searches || 30;
   $('tavilyMonthly').value = d.config.tavily_max_monthly_searches || dflt.tavily_max_monthly_searches || 900;
@@ -899,7 +962,23 @@ async function load(){
   window._lookback = d.config.initial_lookback_hours || dflt.initial_lookback_hours || 24;
   window._maxItems = d.config.max_items_per_run || dflt.max_items_per_run || 40;
   window._maxDigest = d.config.max_digest_items || dflt.max_digest_items || 10;
+  // Carried through so an upload does not silently reset a hand-tuned value
+  // (the server preserves keys it is not sent; this used to be hardcoded 30).
+  window._refreshDays = d.config.lookup_refresh_days || dflt.lookup_refresh_days || 30;
+  const readErrors = d.read_errors || {};
+  if (Object.keys(readErrors).length){
+    // The file EXISTS but could not be parsed. Every field below is blank as a
+    // result, so let nothing write that emptiness back over the real config.
+    const bad = Object.keys(readErrors).join(', ');
+    window._configBroken = true;
+    const btn = $('uploadBtn');
+    if (btn){ btn.disabled = true; btn.title = 'Fix '+bad+' first'; }
+    showMsg('⚠️ ' + bad + ' could not be read (' + readErrors[Object.keys(readErrors)[0]] +
+      '). Upload is disabled so your saved watchlist and keys are not overwritten. ' +
+      'Fix the file (UTF-8 without BOM, valid JSON) and reload this panel.', 'err');
+  }
   renderChips();
+  pushModeChanged();
   // NOTHING else loads here on purpose. Every one of these calls shells out to
   // gcloud over ssh, and /api/status alone measured ~8 SECONDS. Firing five of
   // them on page load made the panel feel broken (and they contend for the same
@@ -926,12 +1005,30 @@ function fillSecret(id, value){
   el.value = (value === SECRET_MASK) ? '' : (value || '');
   el.placeholder = (value === SECRET_MASK) ? '•••••••• (saved - type to replace)' : '';
   el.dataset.saved = (value === SECRET_MASK) ? '1' : '';
+  // A field the user has TOUCHED is no longer "the stored value". Without this
+  // flag, emptying a masked field returned the mask again, so a leaked token
+  // could never be cleared from the panel.
+  el.dataset.dirty = '';
+  el.oninput = function(){ el.dataset.dirty = '1'; };
 }
 function secretValue(id){
   const el = $(id);
   const v = el.value.trim();
-  if(!v && el.dataset.saved) return SECRET_MASK;   // untouched -> keep stored key
-  return v;                                        // typed, or deliberately cleared
+  if (!el.dataset.dirty && !v && el.dataset.saved) return SECRET_MASK;
+  return v;                       // typed value, or a deliberate clear
+}
+function pushModeChanged(){
+  // push_min_score is only consulted in "score" mode. Showing it enabled in
+  // "all" mode made a raised threshold look like a broken gate.
+  const mode = $('pushMode').value;
+  const box = $('pushMinScore');
+  const label = $('pushMinScoreLabel');
+  const score = (mode === 'score');
+  box.disabled = !score;
+  box.style.opacity = score ? '1' : '.45';
+  if (label) label.textContent = score
+    ? 'Push min importance (1–10, score mode)'
+    : 'Push min importance (ignored in "all" mode)';
 }
 
 async function refreshStatus(){
@@ -977,6 +1074,14 @@ async function createVM(){
   refreshStatus(); }
 
 async function uploadConfig(){
+  if (window._configBroken){
+    showMsg('Not uploading: the saved configuration could not be read. Fix the file and reload the panel first.', 'err');
+    return;
+  }
+  if (!tickers.length){
+    showMsg('Add at least one ticker before uploading (an empty watchlist is refused).', 'err');
+    return;
+  }
   let tickerMeta = {};
   try { tickerMeta = JSON.parse($('tickerMeta').value || '{}'); }
   catch(e){ showMsg('❌ ticker_meta is not valid JSON: '+e.message, 'err'); return; }
@@ -1011,6 +1116,7 @@ async function uploadConfig(){
       push_min_importance: parseInt($('pushMinImportance').value)||4,
       push_max_per_ticker: parseInt($('pushMaxPerTicker').value)||2,
       web_url: ($('webUrl').value||'').trim(),
+      web_allowed_emails: ($('webEmails').value||'').trim(),
       news_retention_days: parseInt($('retentionDays').value)||21,
       tavily_max_daily_searches: parseInt($('tavilyDaily').value)||30,
       tavily_max_monthly_searches: parseInt($('tavilyMonthly').value)||900,
@@ -1018,7 +1124,7 @@ async function uploadConfig(){
       initial_lookback_hours: window._lookback || undefined,
       max_items_per_run: window._maxItems || undefined,
       max_digest_items: window._maxDigest || undefined,
-      lookup_refresh_days: 30,
+      lookup_refresh_days: window._refreshDays || undefined,
     });
   } catch(e) {
     d = { ok:false, error:String(e && e.message ? e.message : e) };
@@ -1156,7 +1262,7 @@ function renderNews(){
       'onclick="deleteNews('+idx+')">✕</button></td>'+
       '<td>'+escapeHtml(n.first_seen||'')+'</td><td>'+escapeHtml(n.ticker||'')+'</td>'+
       '<td>'+escapeHtml(src)+'</td><td>'+escapeHtml(n.category||'')+'</td><td>'+imp+'</td>'+
-      '<td>'+pushed+'</td><td>'+(n.url?'<a href="'+escapeHtml(n.url)+'" target="_blank" rel="noopener">'+escapeHtml(title)+'</a>':escapeHtml(title))+
+      '<td>'+pushed+'</td><td>'+(safeHref(n.url)?'<a href="'+escapeHtml(safeHref(n.url))+'" target="_blank" rel="noopener">'+escapeHtml(title)+'</a>':escapeHtml(title))+
       enBtn+gt+outletBadge+zhSub+'</td></tr>';
   }
   $('newsTableWrap').innerHTML = '<div class="tablewrap"><table><thead><tr><th></th><th>Seen (ET)</th><th>Ticker</th><th>Source</th><th>Cat</th><th>Imp</th><th>Status</th><th>Title</th></tr></thead><tbody>'+html+'</tbody></table></div>';
@@ -1243,6 +1349,7 @@ function fillMetaEditor(ticker){
     'name_zh: ' + (m.name_zh || ''),
     'name_en: ' + (m.name_en || ''),
     'aliases_zh (comma separated): ' + show(m.aliases_zh),
+    'aliases_en (comma separated): ' + show(m.aliases_en),
     'subsidiaries (comma separated): ' + show(subs),
     'website: ' + (m.website || '')
   ].join(NL);
@@ -1250,7 +1357,8 @@ function fillMetaEditor(ticker){
   $('metaEditStatus').innerHTML =
     '<b>Actually searching '+ticker+' with:</b> '+escapeHtml(zh)+
     (m.search_terms_en && m.search_terms_en.length ? '<br>EN: '+escapeHtml(m.search_terms_en.join(' / ')) : '')+
-    '<br><span style="color:var(--muted)">Edit the lines above and press Apply to make them yours (your entries are tried first). Everything discovery found is shown, so nothing is hidden.</span>';
+    '<br><span style="color:var(--muted)">Applying this box makes it AUTHORITATIVE for '+escapeHtml(ticker)+
+    ': delete a name and it is removed from the search (an empty line clears that list).</span>';
 }
 
 // Turn the editor back into the ticker_meta JSON shape and merge it into the box.
@@ -1266,15 +1374,22 @@ function applyMetaEdit(){
   const split = (s) => String(s||'').split(',').map(x=>x.trim()).filter(Boolean);
   const subs = split(lines['subsidiaries']);
   const entry = Object.assign({}, meta[t] || {});
-  if(lines['name_zh']) entry.name_zh = lines['name_zh'];
-  if(lines['name_en']) entry.name_en = lines['name_en'];
-  if(lines['aliases_zh']) entry.aliases_zh = split(lines['aliases_zh']);
-  if(subs.length){
+  // The editor shows the EFFECTIVE profile (config + discovery), so applying it
+  // is an explicit "this is the truth" action: `authoritative` makes the server
+  // REPLACE the list fields instead of unioning them. Without it a wrong
+  // auto-discovered alias could never be deleted - clearing the line did
+  // nothing, while the panel said "your entries always win".
+  entry.authoritative = true;
+  if (lines['name_zh'] !== undefined) entry.name_zh = lines['name_zh'];
+  if (lines['name_en'] !== undefined) entry.name_en = lines['name_en'];
+  if (lines['aliases_zh'] !== undefined) entry.aliases_zh = split(lines['aliases_zh']);
+  if (lines['aliases_en'] !== undefined) entry.aliases_en = split(lines['aliases_en']);
+  if (lines['subsidiaries'] !== undefined){
     // Keep Chinese and Latin names in the right buckets.
     entry.subsidiaries_zh = subs.filter(s => /[\u4e00-\u9fff]/.test(s));
     entry.subsidiaries_other = subs.filter(s => !/[\u4e00-\u9fff]/.test(s));
   }
-  if(lines['website']) entry.website = lines['website'];
+  if (lines['website'] !== undefined) entry.website = lines['website'];
   meta[t] = entry;
   $('tickerMeta').value = JSON.stringify(meta, null, 2);
   showMsg('✅ '+t+' updated in the JSON below. Press "Upload config to server" to apply.', 'ok');
@@ -1346,7 +1461,7 @@ function renderAdhoc(d){
         '<td>'+imp+'</td>'+
         '<td>'+sentiBadge(a.sentiment)+'</td>'+
         '<td>'+escapeHtml(a.category||'')+'</td>'+
-        '<td>'+(a.url?'<a href="'+escapeHtml(a.url)+'" target="_blank" rel="noopener">'+escapeHtml(a.title_en||a.title)+'</a>':escapeHtml(a.title_en||a.title))+
+        '<td>'+(safeHref(a.url)?'<a href="'+escapeHtml(safeHref(a.url))+'" target="_blank" rel="noopener">'+escapeHtml(a.title_en||a.title)+'</a>':escapeHtml(a.title_en||a.title))+
         recycledBadge+outletBadge+
         (a.lang==='zh' && a.url ? ' <a class="btn-x" style="text-decoration:none" target="_blank" rel="noopener" title="Open through Google Translate" href="https://translate.google.com/translate?sl=auto&tl=en&u='+encodeURIComponent(a.url)+'">译</a>' : '')+
         (a.reason?'<div style="color:var(--muted);font-size:11px">'+escapeHtml(a.reason)+'</div>':'')+
@@ -1473,8 +1588,26 @@ async function loadLogs(){
 }
 
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+// Escaping does not make a URL safe: `javascript:` contains no HTML-special
+// character. Only http(s) may become a link (a feed can carry any scheme).
+// indexOf, not a regex: this HTML lives in a Python string, where the escaped
+// slashes a URL regex needs would be interpreted by Python first.
+function safeHref(u){
+  var s = String(u||'').trim(), low = s.toLowerCase();
+  return (low.indexOf('http://') === 0 || low.indexOf('https://') === 0) ? s : '';
+}
 
-load();
+load().catch(function(e){
+  // Without this, a failed /api/config left every pane hidden and nothing on
+  // screen explaining why - and the next click could have overwritten the
+  // config with the empty form. Show the error, reveal the tab, refuse uploads.
+  window._configBroken = true;
+  const b = $('uploadBtn');
+  if (b){ b.disabled = true; b.title = 'Configuration could not be loaded'; }
+  showMsg('Could not load the configuration: ' + (e && e.message ? e.message : e) +
+    ' - Upload is disabled until this is fixed.', 'err');
+  try { showTab('config'); } catch(_) {}
+});
 </script>
 </body>
 </html>
@@ -1526,28 +1659,51 @@ class Handler(BaseHTTPRequestHandler):
         (DNS rebinding), at which point it is same-origin and can both read
         /api/* and POST to it. So every request must present a loopback Host
         header, and any Origin/Referer that IS present must be the panel's own
-        origin. A plain `fetch` from the panel sends no Origin for same-origin
-        GETs but does send it for POSTs; a cross-site page always sends one.
+        origin - same scheme, host AND port.
+
+        The old check compared hostnames only and treated an unparsable value
+        as "" (which was in the allow-list), so `Origin: null` - what a
+        sandboxed iframe or a file:// page sends - passed, as did any other
+        page on a loopback port. Both are refused now.
         """
-        def host_of(value):
-            try:
-                return (urlparse(value).hostname or "").lower()
-            except Exception:
-                return ""
+        allowed_hosts = ("127.0.0.1", "localhost", "::1", "[::1]")
+        our_port = int(getattr(self.server, "server_port", PORT) or PORT)
 
         host = str(self.headers.get("Host") or "")
         host = host.split(":")[0].strip().lower()
-        if host not in ("127.0.0.1", "localhost", "[::1]", "::1"):
+        if host not in allowed_hosts:
             self._send_json({"ok": False, "error":
                              "Refused: this endpoint only answers requests addressed "
                              "to localhost."}, 403)
             return False
+
+        def same_origin(value):
+            """None = header absent; True/False = parsed verdict."""
+            if value is None:
+                return None
+            text = str(value).strip()
+            if not text or text.lower() == "null":
+                return False
+            try:
+                parsed = urlparse(text)
+            except Exception:
+                return False
+            if parsed.scheme not in ("http", "https"):
+                return False
+            hostname = (parsed.hostname or "").lower()
+            try:
+                port = parsed.port
+            except ValueError:
+                return False
+            if port is None:
+                port = 443 if parsed.scheme == "https" else 80
+            return hostname in allowed_hosts and port == our_port
+
         for header in ("Origin", "Referer"):
-            value = self.headers.get(header)
-            if value and host_of(value) not in ("127.0.0.1", "localhost", "::1", ""):
+            verdict = same_origin(self.headers.get(header))
+            if verdict is False:
                 self._send_json({"ok": False, "error":
-                                 "Refused: cross-site request blocked (Origin %s)."
-                                 % host_of(value)}, 403)
+                                 "Refused: cross-site request blocked."}, 403)
                 return False
         return True
 
@@ -1595,8 +1751,16 @@ class Handler(BaseHTTPRequestHandler):
             for key in SECRET_KEYS:
                 value = str(secrets.get(key) or "")
                 masked[key] = SECRET_MASK if value else ""
-            self._send_json({"config": load_config(), "secrets": masked,
+            # A config file that EXISTS but cannot be parsed is the dangerous
+            # case: the panel would show every field blank and an Upload would
+            # then write that emptiness back. Report it so the UI can refuse.
+            cfg_now = load_config()
+            read_errors = {os.path.basename(p): msg
+                           for p, msg in _READ_ERRORS.items()
+                           if p in (CONFIG_FILE, SECRETS_FILE)}
+            self._send_json({"config": cfg_now, "secrets": masked,
                              "secrets_masked": True,
+                             "read_errors": read_errors,
                              # Single source of truth for the form's fallbacks.
                              "defaults": DEFAULT_CONFIG})
         elif parsed.path == "/api/status":
@@ -2176,8 +2340,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/purge_junk":
             self._handle_purge_junk()
+            return
         elif parsed.path == "/api/purge_duplicates":
             self._handle_purge_duplicates()
+            return
         elif parsed.path == "/api/regroup_events":
             self._handle_regroup_events()
             return
@@ -2224,7 +2390,23 @@ class Handler(BaseHTTPRequestHandler):
             # Sanitize tickers (A-Z 0-9 . -) - also blocks HTML/JS injection.
             cfg["tickers"] = [
                 ''.join(c for c in t.strip().upper() if c.isascii() and (c.isalnum() or c in '.-'))
-                for t in data.get("tickers", []) if t.strip()]
+                for t in data.get("tickers", []) if t.strip()
+            ]
+            # Refuse an EMPTY watchlist. An empty list is almost always a failed
+            # config load or a half-filled form, and saving it would wipe the
+            # watchlist on this PC AND on the VM. Switching the updater off is a
+            # switch, not an empty watchlist.
+            deduped = []
+            for t in cfg["tickers"]:
+                if t and t not in deduped:
+                    deduped.append(t)
+            if not deduped:
+                self._send_json({"ok": False, "error":
+                                 "Refusing to save an empty watchlist. Add at least "
+                                 "one ticker (or switch the updater off instead)."},
+                                400)
+                return
+            cfg["tickers"] = deduped
             cfg["enabled"] = bool(data.get("enabled", True))
             # Only update keys the panel actually sends - this preserves any
             # hand-tuned values (initial_lookback_hours, max_items_per_run,
@@ -2246,7 +2428,35 @@ class Handler(BaseHTTPRequestHandler):
             cfg["ai_provider"] = data.get("ai_provider", cfg.get("ai_provider", "deepseek"))
             cfg["ai_model"] = data.get("ai_model", cfg.get("ai_model", "deepseek-v4-flash"))
             cfg["ai_base_url"] = data.get("ai_base_url", cfg.get("ai_base_url", "https://api.deepseek.com"))
-            cfg["ticker_meta"] = data.get("ticker_meta", cfg.get("ticker_meta", {})) or {}
+            # Ticker metadata follows the watchlist: entries for removed tickers
+            # are dropped here (they used to be re-seeded into company_lookup.json
+            # on every run and could claim brand names belonging to the new set).
+            posted_meta = data.get("ticker_meta")
+            if isinstance(posted_meta, dict):
+                by_upper = {str(k).strip().upper(): v
+                            for k, v in posted_meta.items() if isinstance(v, dict)}
+                cfg["ticker_meta"] = {t: by_upper[t] for t in deduped if t in by_upper}
+            else:
+                old_meta = {str(k).strip().upper(): v
+                            for k, v in (cfg.get("ticker_meta") or {}).items()}
+                cfg["ticker_meta"] = {t: old_meta[t] for t in deduped if t in old_meta}
+            feeds = cfg.get("rss_feeds") or {}
+            by_upper_feeds = {str(k).strip().upper(): v for k, v in feeds.items()}
+            cfg["rss_feeds"] = {t: by_upper_feeds[t] for t in deduped
+                                if t in by_upper_feeds}
+            # The hosted page's email allowlist (see firestore.rules). Only
+            # applied when the browser sends the field.
+            if "web_allowed_emails" in data:
+                raw = data.get("web_allowed_emails")
+                if isinstance(raw, str):
+                    raw = re.split(r"[,\s;]+", raw)
+                emails = []
+                for e in (raw or []):
+                    e = str(e).strip().lower()
+                    if (e and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", e)
+                            and e not in emails):
+                        emails.append(e)
+                cfg["web_allowed_emails"] = emails
             cfg["push_mode"] = data.get("push_mode", cfg.get("push_mode", "all"))
             for key, default in (("push_min_score", 7), ("push_min_importance", 4),
                                  ("push_max_per_ticker", DEFAULT_CONFIG["push_max_per_ticker"]),
@@ -2332,6 +2542,28 @@ def main():
                 return b"portfolio-news-updater" in resp.read(200)
         except Exception:
             return False
+
+    def write_panel_url(u):
+        try:
+            with open(os.path.join(BASE_DIR, PANEL_URL_FILE), "w",
+                      encoding="utf-8") as f:
+                f.write(u)
+        except OSError:
+            pass
+
+    # Probe FIRST. The old code only looked for an existing panel after a bind
+    # failed, so a panel running on 8002 while 8001 was free started a SECOND
+    # panel - the exact two-instances problem the check was meant to prevent -
+    # and the launcher's helper was left with no panel_url.txt to open.
+    for candidate in (PORT, 8002, 8003):
+        if panel_already_running(candidate):
+            url = f"http://localhost:{candidate}"
+            write_panel_url(url)
+            print("=" * 56)
+            print(f" A panel is ALREADY running: {url}")
+            print(" Reusing it (no second panel was started).")
+            print("=" * 56)
+            return
 
     for candidate in (PORT, 8002, 8003):
         try:

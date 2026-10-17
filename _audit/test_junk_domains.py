@@ -7,12 +7,15 @@ The MUST_DROP list is every junk host actually found in the live VM database
 database - a false positive here silently deletes a real story, which is worse
 than letting one spam page through, so both directions are asserted.
 """
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import importlib.util
 import sys
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 spec = importlib.util.spec_from_file_location(
-    "nu", r"F:\MyRepository\PortfolioNewsUpdater\news_updater.py")
+    "nu", os.path.join(ROOT, "news_updater.py"))
 nu = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nu)
 
@@ -153,7 +156,7 @@ import sqlite3  # noqa: E402
 from collections import Counter  # noqa: E402
 from pathlib import Path as _Path  # noqa: E402
 
-_CORPUS = _Path(r"F:\MyRepository\PortfolioNewsUpdater\_audit\news.db")
+_CORPUS = _Path(os.path.join(ROOT, "_audit/news.db"))
 if not _CORPUS.exists():
     print("  SKIPPED - needs the local private fixture _audit/news.db")
     _urls = []

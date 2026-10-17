@@ -1,5 +1,6 @@
 {
   "web_url": "",
+  "web_allowed_emails": [],
   "tickers": [],
   "enabled": true,
   "initial_lookback_hours": 24,
@@ -25,6 +26,7 @@
   "macro_max_per_run": 3,
   "macro_translate": true,
   "macro_keywords": [],
+  "portfolio_note": "",
   "sources": {
     "sec": true,
     "google_news_zh": true,

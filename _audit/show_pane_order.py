@@ -9,12 +9,15 @@ only one tab ever appears to work.
 
 Exit code 0 = sequential (correct), 1 = nested (broken).
 """
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import io
 import re
 import sys
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-SRC = r"F:\MyRepository\PortfolioNewsUpdater\cloud_manager.py"
+SRC = os.path.join(ROOT, "cloud_manager.py")
 src = io.open(SRC, encoding="utf-8").read()
 
 # Find every pane div in the whole file rather than slicing at "HTML = ".

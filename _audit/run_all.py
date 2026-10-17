@@ -44,6 +44,7 @@ OFFLINE = [
     ("py", "test_archive_cleanup.py", []),
     ("py", "test_macro_triage.py", []),
     ("py", "test_stock_types.py", []),
+    ("py", "test_swap_ready.py", []),
     ("py", "test_crash_record.py", []),
     ("py", "test_purge_duplicates.py", []),
     ("py", "test_hosted_build.py", []),
@@ -58,6 +59,7 @@ OFFLINE = [
     ("py", "show_pane_order.py", []),
     ("py", "verify_docs.py", []),
     ("node", "test_tabs.js", []),
+    ("node", "test_panel_guard.js", []),
 ]
 # Needs live API keys / network, so it is opt-in.
 NETWORK = [

@@ -1,3 +1,5 @@
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Gate: does the pipeline behave for ANY type of stock, not just Chinese ADRs?
 # Findings from the 2026-10-16 review, each pinned here as a regression guard.
 import os
@@ -5,7 +7,7 @@ import re
 import sqlite3
 import sys
 
-BASE = r"F:\MyRepository\PortfolioNewsUpdater"
+BASE = ROOT
 sys.path.insert(0, BASE)
 os.chdir(BASE)
 import news_updater as nu

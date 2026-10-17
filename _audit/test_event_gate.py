@@ -2,6 +2,9 @@
 # -*- coding: utf-8 -*-
 """Test the EVENT-level guard: one earnings event = one push, however many
 outlets cover it afterwards under their own URL and wording."""
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import importlib.util
 import os
 import shutil
@@ -11,11 +14,11 @@ from datetime import datetime, timedelta
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 spec = importlib.util.spec_from_file_location(
-    "nu", r"F:\MyRepository\PortfolioNewsUpdater\news_updater.py")
+    "nu", os.path.join(ROOT, "news_updater.py"))
 nu = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nu)
 
-BASE = r"F:\MyRepository\PortfolioNewsUpdater\_audit"
+BASE = os.path.join(ROOT, "_audit")
 COPY = os.path.join(BASE, "_event.db")
 shutil.copyfile(os.path.join(BASE, "news.db"), COPY)
 nu.DB_FILE = COPY

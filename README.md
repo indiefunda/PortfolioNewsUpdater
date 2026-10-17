@@ -18,6 +18,13 @@ an event you already have, and cross-outlet copies of the same story are
 dropped or collapsed before they can reach you. A story about the insurance
 industry is not a HUIZ alert.
 
+**Any watchlist, not just this one:** each ticker's Chinese name, English short
+form and `aliases_en` are used to match headlines, so a legal name like "Toyota
+Motor Corporation" still matches "Toyota". Swapping the whole portfolio works —
+with Chinese/HK names the Chinese sources carry it; for US names you get
+SEC + Google News + Tavily and the China-macro tier switches itself off. See
+**Swapping the whole watchlist** in GUIDE-NEWS.md for the checklist.
+
 **Two ways to use it:** the scheduled watchlist above; and the panel's
 **🔎 Deep search** tab for a one-off look at *any* ticker — it discovers that
 company's brands on the fly, searches the last 1–6 months, scores each article,
@@ -120,5 +127,9 @@ Full details, troubleshooting and all knobs: **GUIDE-NEWS.md**.
   (Host + Origin validated, mutating routes are POST-only) and `/api/config`
   returns masked placeholders, never your real keys. It binds to
   `127.0.0.1` only, so it is never exposed to the network.
+- **The hosted archive is an email allowlist**, not "any Google account":
+  `web_allowed_emails` is published with the sync and enforced by
+  [firestore.rules](firestore.rules). Empty means nobody can read it — fail
+  closed. See SETUP-WEB.md step 9 before deploying the rules.
 - Run `--dry-run` freely: it makes **no paid calls at all** (no Tavily, no EXA)
   and writes nothing.

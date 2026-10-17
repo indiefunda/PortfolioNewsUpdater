@@ -1,9 +1,11 @@
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Throwaway: does the staging pipeline turn the user's 12 rows into events?
 import os
 import sqlite3
 import sys
 
-BASE = r"F:\MyRepository\PortfolioNewsUpdater"
+BASE = ROOT
 sys.path.insert(0, BASE)
 os.chdir(BASE)
 import news_updater as nu

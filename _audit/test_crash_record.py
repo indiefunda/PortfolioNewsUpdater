@@ -10,6 +10,9 @@ Two things were wrong with it:
      as 0 tickers / 0 new / 0 sent / no duration - reading like "it ran and
      found nothing" instead of "it died before counting".
 """
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import errno
 import importlib.util
 import sys
@@ -17,7 +20,7 @@ from datetime import datetime, timedelta
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 spec = importlib.util.spec_from_file_location(
-    "nu", r"F:\MyRepository\PortfolioNewsUpdater\news_updater.py")
+    "nu", os.path.join(ROOT, "news_updater.py"))
 nu = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nu)
 

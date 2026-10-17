@@ -1,3 +1,5 @@
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Gate: the Deep search tab must get the same anti-crap treatment as the
 # pipeline - junk hosts filtered, same-event copies merged, recycled stories
 # flagged and kept out of the sentiment read. Offline: sources and the AI are
@@ -5,7 +7,7 @@
 import os
 import sys
 
-BASE = r"F:\MyRepository\PortfolioNewsUpdater"
+BASE = ROOT
 sys.path.insert(0, BASE)
 os.chdir(BASE)
 import news_updater as nu

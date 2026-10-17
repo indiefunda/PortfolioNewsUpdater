@@ -2,13 +2,16 @@
 # -*- coding: utf-8 -*-
 """Check the base64 payloads: do ANY contain a URL, and how do Google News
 links relate to the direct outlet links for the same story?"""
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import base64
 import re
 import sqlite3
 import sys
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-conn = sqlite3.connect(r"F:\MyRepository\PortfolioNewsUpdater\_audit\news.db")
+conn = sqlite3.connect(os.path.join(ROOT, "_audit/news.db"))
 conn.row_factory = sqlite3.Row
 
 URL_RE = re.compile(rb"https?://")

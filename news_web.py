@@ -20,6 +20,7 @@ The same index.html is the UI for the hosted (Firebase) version: the data
 loader checks for a Firestore handle first and falls back to news.json, so
 hosting it only changes the loader, not the page.
 """
+import hashlib
 import json
 import os
 import sqlite3
@@ -61,13 +62,41 @@ def read_items(db_path):
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30)
     try:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(ITEM_SQL).fetchall()
+        try:
+            rows = conn.execute(ITEM_SQL).fetchall()
+        except sqlite3.Error as exc:
+            # A fresh/partial database has no `news` table. A raw traceback here
+            # was the first thing a new user saw from --sync-firebase.
+            raise SystemExit(f"cannot read the news table in {db_path}: {exc}. "
+                             f"Has the updater run at least once?")
     finally:
         conn.close()
     return [dict(r) for r in rows]
 
 
 CONFIG_NAME = "config_local.json"
+
+
+def load_config(db_path=None):
+    """The project config, from the DB's directory or this script's directory.
+
+    utf-8-sig on purpose: a Windows-edited config may carry a BOM, and this
+    module now reads the same file the panel/the updater do.
+    """
+    candidates = []
+    if db_path:
+        candidates.append(os.path.join(
+            os.path.dirname(os.path.abspath(db_path)), CONFIG_NAME))
+    candidates.append(os.path.join(BASE_DIR, CONFIG_NAME))
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                cfg = json.load(fh)
+        except Exception:
+            continue
+        if isinstance(cfg, dict):
+            return cfg
+    return {}
 
 
 def configured_tickers(db_path=None):
@@ -80,24 +109,32 @@ def configured_tickers(db_path=None):
     from the configured tickers and adds any ticker that still has stored rows
     (the page marks those as old).
     """
-    candidates = []
-    if db_path:
-        candidates.append(os.path.join(
-            os.path.dirname(os.path.abspath(db_path)), CONFIG_NAME))
-    candidates.append(os.path.join(BASE_DIR, CONFIG_NAME))
-    for path in candidates:
-        try:
-            with open(path, encoding="utf-8") as fh:
-                cfg = json.load(fh)
-        except Exception:
-            continue
-        out = []
-        for t in (cfg.get("tickers") or []):
-            t = str(t).strip().upper()
-            if t and t not in out:
-                out.append(t)
-        return out
-    return []
+    cfg = load_config(db_path)
+    out = []
+    for t in (cfg.get("tickers") or []):
+        t = str(t).strip().upper()
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+def allowed_emails(db_path=None):
+    """Google accounts allowed to read the hosted page (lowercased).
+
+    Published into the meta/status document; firestore.rules checks it. An
+    empty list means NOBODY can read the archive - fail closed - because the
+    alternative (the old `request.auth != null`) let any Google account in.
+    """
+    cfg = load_config(db_path)
+    raw = cfg.get("web_allowed_emails") or []
+    if isinstance(raw, str):
+        raw = raw.replace(";", ",").split(",")
+    out = []
+    for e in raw:
+        e = str(e).strip().lower()
+        if e and "@" in e and e not in out:
+            out.append(e)
+    return out
 
 
 def build_payload(items, configured=None):
@@ -242,6 +279,34 @@ function esc(s){
   });
 }
 
+// Escaping does not make a URL safe: `javascript:` and `data:` contain no
+// HTML-special character, so they survived esc() and rendered as clickable
+// "Original" links. Only http(s) may become an anchor.
+function safeHref(u){
+  u = String(u == null ? '' : u).trim();
+  return /^https?:\/\//i.test(u) ? u : '';
+}
+
+// URL params and saved filters can name a ticker that no longer exists, or a
+// value the <select> has no option for. The old page then filtered everything
+// out and showed "Nothing matches these filters." with no visible cause.
+function sanitizeFilters(){
+  function has(selectId, value){
+    var el = document.getElementById(selectId);
+    if (!el) return true;
+    return Array.prototype.some.call(el.options, function(o){ return o.value === value; });
+  }
+  if (!has('ticker', F.ticker)) F.ticker = '';
+  if (!has('status', F.status)) F.status = '';
+  if (!has('sentiment', F.sentiment)) F.sentiment = '';
+  if (!has('sort', F.sort)) F.sort = 'newest';
+  var imp = document.getElementById('minImp');
+  if (imp && !Array.prototype.some.call(imp.options, function(o){
+        return (parseInt(o.value, 10) || 0) === (parseInt(F.minImp, 10) || 0); })){
+    F.minImp = 0;
+  }
+}
+
 function fmtDate(s){
   // "2026-09-11 17:00:58" -> "09-11 17:00" (no timezone maths; already ET)
   if (!s || s.length < 16) return s || '';
@@ -300,10 +365,11 @@ function updateStats(){
 
 function rowHtml(it){
   var links = [];
-  if (it.url) links.push('<a href="' + esc(it.url) + '" target="_blank" rel="noopener">Original</a>');
-  if (it.url && it.lang === 'zh')
+  var url = safeHref(it.url);
+  if (url) links.push('<a href="' + esc(url) + '" target="_blank" rel="noopener">Original</a>');
+  if (url && it.lang === 'zh')
     links.push('<a href="https://translate.google.com/translate?sl=auto&amp;tl=en&amp;u=' +
-      encodeURIComponent(it.url) + '" target="_blank" rel="noopener">Translate</a>');
+      encodeURIComponent(url) + '" target="_blank" rel="noopener">Translate</a>');
   var body = [];
   if (it.summary) body.push('<p class="sum">' + esc(it.summary) + '</p>');
   if (it.title_raw && it.title_raw !== it.title)
@@ -329,7 +395,9 @@ function renderMore(){
   var slice = VIEW.slice(SHOWN, SHOWN + PAGE);
   if (!slice.length){
     if (SHOWN === 0)
-      document.getElementById('list').innerHTML = '<div class="empty">Nothing matches these filters.</div>';
+      document.getElementById('list').innerHTML = '<div class="empty">' +
+        (ALL.length ? 'Nothing matches these filters.' : 'The archive is empty.') +
+        '</div>';
     document.getElementById('more').style.display = 'none';
     return;
   }
@@ -396,6 +464,7 @@ window.__glSetData = function(data){
   });
 
   if (!WIRED){ loadFilters(); applyUrlParams(); wire(); WIRED = true; }
+  sanitizeFilters();
   applyFilters();
 };
 
@@ -459,6 +528,21 @@ HOSTED_HEAD = """<script>
   // auth module below, not from news.json.
   window.__GL_HOSTED__ = true;
   window.__GL_FIREBASE_CONFIG__ = __FIREBASE_CONFIG__;
+  // Watchdog for a module that never executes: a blocked CDN, an offline
+  // device or a 404 on firebase-boot.js used to leave the page saying
+  // "Loading…" forever with no error anywhere.
+  window.__GL_BOOTED__ = false;
+  setTimeout(function(){
+    if (window.__GL_BOOTED__) return;
+    var s = document.getElementById('stats');
+    var l = document.getElementById('list');
+    if (s && /Loading/.test(s.textContent))
+      s.textContent = 'Could not start the reader - the sign-in module did not load.';
+    if (l && !l.innerHTML)
+      l.innerHTML = '<div class="empty">The authentication module could not load. '
+        + 'This is usually a blocked CDN, an ad-blocker, or an offline device. '
+        + 'Reload once the connection is back.</div>';
+  }, 12000);
 </script>
 <script type="module" src="firebase-boot.js"></script>"""
 
@@ -591,15 +675,51 @@ def _manifest_path(db_path):
     return os.path.join(os.path.dirname(os.path.abspath(db_path)), MANIFEST_NAME)
 
 
-def sync_firestore(db_path, project, dry_run=False):
+def _fs_list_news_ids(project, token):
+    """Every document id currently in the `news` collection.
+
+    Only used by --reconcile, which is the answer to a missing/rotated
+    manifest: without it, deletions are derived from the previous manifest
+    alone, so rows purged from news.db stayed on the hosted page forever.
+    """
+    import requests
+    ids, page = [], None
+    url = FS_BASE.format(project=project) + "/news"
+    while True:
+        params = {"pageSize": 300, "mask.fieldPaths": "ticker"}
+        if page:
+            params["pageToken"] = page
+        resp = requests.get(url, params=params, timeout=60,
+                            headers={"Authorization": f"Bearer {token}"})
+        if resp.status_code == 404:
+            return ids
+        if resp.status_code >= 300:
+            raise SystemExit(f"  [firebase] list failed {resp.status_code}: "
+                             f"{resp.text[:300]}")
+        data = resp.json() or {}
+        for doc in (data.get("documents") or []):
+            name = str(doc.get("name") or "")
+            if name:
+                ids.append(name.rstrip("/").rsplit("/", 1)[-1])
+        page = data.get("nextPageToken")
+        if not page:
+            return ids
+
+
+def sync_firestore(db_path, project, dry_run=False, reconcile=False):
     """Mirror news.db into Firestore. Returns (written, deleted, unchanged)."""
     items = read_items(db_path)
     manifest_file = _manifest_path(db_path)
     try:
-        with open(manifest_file, encoding="utf-8") as fh:
+        with open(manifest_file, encoding="utf-8-sig") as fh:
             previous = json.load(fh)
-    except Exception:
+        if not isinstance(previous, dict):
+            previous = {}
+    except Exception as exc:
         previous = {}
+        print(f"  [firebase] WARNING: no readable sync manifest ({exc}). "
+              f"Deletions cannot be derived from it; run with --reconcile to "
+              f"remove documents that are no longer in the database.")
 
     wanted, writes, unchanged = {}, [], 0
     for it in items:
@@ -612,24 +732,54 @@ def sync_firestore(db_path, project, dry_run=False):
         writes.append({"update": {
             "name": f"projects/{project}/databases/(default)/documents/news/{key}",
             "fields": _fs_fields(it)}})
+    # Keys starting with "_" are manifest bookkeeping, not row ids.
     deletes = [{"delete": f"projects/{project}/databases/(default)/documents/news/{k}"}
-               for k in previous if k not in wanted]
+               for k in previous
+               if not str(k).startswith("_") and k not in wanted]
 
     # One tiny meta doc so the page can tell whether its cache is stale with a
     # single read instead of re-fetching every row on every visit. It also
-    # carries the CONFIGURED tickers: the page's dropdown must offer a stock the
-    # user just added, which by definition has no news rows yet.
-    meta = {"generated_at": datetime.now(EASTERN).strftime("%Y-%m-%d %H:%M:%S %Z"),
-            "count": len(items),
-            "pushed_count": sum(1 for i in items if i["pushed"]),
-            "tickers": configured_tickers(db_path)}
-    writes.append({"update": {
-        "name": f"projects/{project}/databases/(default)/documents/meta/status",
-        "fields": {k: _fs_value(v) for k, v in meta.items()}}})
+    # carries the CONFIGURED tickers (the dropdown must offer a stock the user
+    # just added) and the ACCESS ALLOWLIST enforced by firestore.rules.
+    allowed = allowed_emails(db_path)
+    rows_hash = hashlib.sha1(
+        "|".join(f"{k}:{wanted[k]}" for k in sorted(wanted)).encode("utf-8")
+    ).hexdigest() if wanted else hashlib.sha1(b"").hexdigest()
+    meta_core = {
+        "count": len(items),
+        "pushed_count": sum(1 for i in items if i["pushed"]),
+        "tickers": configured_tickers(db_path),
+        "allowed_emails": allowed,
+        "rows_hash": rows_hash,
+    }
+    prev_meta = previous.get("_meta") if isinstance(previous.get("_meta"), dict) else {}
+    # generated_at must only move when something actually changed: the page
+    # compares it to decide whether to re-read the whole collection, and
+    # rewriting it on every sync forced every device to re-read twice a day.
+    meta_changed = {k: prev_meta.get(k) for k in meta_core} != meta_core
+    meta = dict(meta_core)
+    meta["generated_at"] = (
+        prev_meta.get("generated_at")
+        or datetime.now(EASTERN).strftime("%Y-%m-%d %H:%M:%S %Z")
+    ) if not meta_changed else datetime.now(EASTERN).strftime("%Y-%m-%d %H:%M:%S %Z")
+    if meta_changed:
+        writes.append({"update": {
+            "name": f"projects/{project}/databases/(default)/documents/meta/status",
+            "fields": {k: _fs_value(v) for k, v in meta.items()}}})
+    else:
+        print("  [firebase] meta unchanged (cache invalidation stays quiet).")
+    if not allowed:
+        print("  [firebase] WARNING: web_allowed_emails is empty. With the "
+              "current firestore.rules NOBODY can read the hosted page. Add your "
+              "Google email in the panel's Configuration tab.")
 
-    print(f"  [firebase] {len(items)} row(s): {len(writes) - 1} to write, "
-          f"{len(deletes)} to delete, {unchanged} unchanged")
+    print(f"  [firebase] {len(items)} row(s): "
+          f"{len([w for w in writes if 'meta/status' not in w['update']['name']])} "
+          f"row(s) to write, {len(deletes)} to delete, {unchanged} unchanged")
     if dry_run:
+        if reconcile:
+            print("  [firebase] --dry-run: reconcile needs a real run (it must "
+                  "list the collection); nothing sent.")
         print("  [firebase] --dry-run: nothing sent.")
         return len(writes), len(deletes), unchanged
 
@@ -638,6 +788,16 @@ def sync_firestore(db_path, project, dry_run=False):
         return 0, 0, unchanged
     import requests
     token = _fs_token()
+    if reconcile:
+        existing = set(_fs_list_news_ids(project, token))
+        orphans = sorted(existing - set(wanted))
+        if orphans:
+            print(f"  [firebase] reconcile: {len(orphans)} document(s) no longer "
+                  f"in news.db -> delete")
+            deletes.extend({"delete": f"projects/{project}/databases/(default)/"
+                                      f"documents/news/{k}"} for k in orphans)
+        else:
+            print("  [firebase] reconcile: no orphaned documents.")
     url = FS_BASE.format(project=project) + ":commit"
     ops = writes + deletes
     sent = 0
@@ -655,8 +815,10 @@ def sync_firestore(db_path, project, dry_run=False):
 
     # Record the manifest only after Firestore accepted everything, so a failed
     # run retries next time instead of silently skipping those rows forever.
+    manifest = dict(wanted)
+    manifest["_meta"] = meta
     with open(manifest_file, "w", encoding="utf-8") as fh:
-        json.dump(wanted, fh)
+        json.dump(manifest, fh)
     print(f"  [firebase] synced. manifest -> {manifest_file}")
     return len(writes), len(deletes), unchanged
 
@@ -677,15 +839,16 @@ def main():
     if "--sync-firebase" in sys.argv:
         if not project:
             print("Usage: python3 news_web.py --sync-firebase --project=PROJECT "
-                  "[--db=PATH] [--dry-run]")
+                  "[--db=PATH] [--dry-run] [--reconcile]")
             sys.exit(2)
-        sync_firestore(db_path, project, dry_run="--dry-run" in sys.argv)
+        sync_firestore(db_path, project, dry_run="--dry-run" in sys.argv,
+                       reconcile="--reconcile" in sys.argv)
         return
 
     if not out_dir:
         print("Usage: python3 news_web.py --out=DIR [--db=PATH] [--embed]")
         print("       python3 news_web.py --out=DIR --hosted --firebase-config=FILE")
-        print("       python3 news_web.py --sync-firebase --project=PROJECT [--dry-run]")
+        print("       python3 news_web.py --sync-firebase --project=PROJECT [--dry-run] [--reconcile]")
         sys.exit(2)
     firebase_config = None
     for a in sys.argv:

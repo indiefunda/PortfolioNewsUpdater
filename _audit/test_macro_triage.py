@@ -1,3 +1,5 @@
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Gate: the macro tier must be filtered by the AI's relevance verdict, not by a
 # keyword list - and must never fall back to storing the raw tape.
 # Offline: the AI is mocked, so it costs nothing.
@@ -5,7 +7,7 @@ import os
 import sqlite3
 import sys
 
-BASE = r"F:\MyRepository\PortfolioNewsUpdater"
+BASE = ROOT
 sys.path.insert(0, BASE)
 os.chdir(BASE)
 import news_updater as nu

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Test the AGE gate and the REPEAT gate on a COPY of the live news.db."""
+import os
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import importlib.util
 import os
 import shutil
@@ -10,11 +13,11 @@ from datetime import datetime, timedelta
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 spec = importlib.util.spec_from_file_location(
-    "nu", r"F:\MyRepository\PortfolioNewsUpdater\news_updater.py")
+    "nu", os.path.join(ROOT, "news_updater.py"))
 nu = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nu)
 
-BASE = r"F:\MyRepository\PortfolioNewsUpdater\_audit"
+BASE = os.path.join(ROOT, "_audit")
 COPY = os.path.join(BASE, "_test_copy.db")
 shutil.copyfile(os.path.join(BASE, "news.db"), COPY)
 # Run the real migration path against the copy so pushed_stories / rescues

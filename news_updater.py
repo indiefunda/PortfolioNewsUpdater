@@ -399,6 +399,13 @@ JUNK_CONTENT_PATTERNS = (
     r"sets new (?:12|twelve)-month (?:low|high)",
     r"stock (?:holds|holding) (?:ground|steady)",
     r"here'?s what happened", r"stock price today",
+    # US auto-generated filler (Zacks/Yahoo/MarketBeat templates). A non-Chinese
+    # watchlist is dominated by these: they mention the ticker, are published
+    # daily, and carry no information about the business.
+    r"what you should know", r"shares? (?:sold|bought|acquired|purchased) by",
+    r"(?:gains?|falls?|slides?|rises?|drops?|jumps?) as (?:the )?market",
+    r"stock price (?:down|up|falls?|rises?|jumps?|drops?|slides?)",
+    r"should you (?:buy|sell|hold)", r"time to buy",
     r"press releases?$", r"earnings calendar for", r"options chain",
 )
 
@@ -497,14 +504,30 @@ def _parse_pub(s, naive_tz=EASTERN):
 # ---------------------------------------------------------------------------
 # File helpers
 # ---------------------------------------------------------------------------
+_READ_ERRORS = {}
+
+
 def _read_json(path, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return default
-    return default
+    """
+    Read one JSON file, tolerating a UTF-8 BOM and NEVER failing silently.
+
+    `encoding="utf-8-sig"` matters on Windows: PowerShell 5.1, VS Code's
+    "UTF-8 with BOM" and older Notepad all write a BOM, and plain utf-8 makes
+    json.load raise. The old code swallowed that and returned {} - so a valid
+    config file looked EMPTY, the run printed "No config_local.json found.",
+    and the panel showed blank fields that one upload then wrote back over the
+    real watchlist and keys.
+    """
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return json.load(f)
+    except Exception as exc:
+        _READ_ERRORS[path] = str(exc)
+        print(f"  [error] could not read {os.path.basename(path)}: {exc} "
+              f"- using defaults for this file", file=sys.stderr)
+        return default
 
 
 def _write_json(path, data):
@@ -1586,17 +1609,27 @@ def rescue_orphans(conn, config):
     """
     if NO_WRITE or conn is None:
         return []
+    # Only tickers still in the config: after a watchlist swap the archive
+    # still holds unanalyzed rows for the REMOVED names, and re-queueing them
+    # would spend AI tokens on, and potentially push, news for a company the
+    # user no longer follows.
+    configured = [str(t).strip().upper()
+                  for t in (config.get("tickers") or []) if str(t).strip()]
+    if not configured:
+        return []
     cutoff = (datetime.now(EASTERN)
               - timedelta(days=NEWS_RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
     limit = ORPHAN_RESCUE_LIMIT
     try:
+        marks = ",".join("?" * len(configured))
         rows = conn.execute(
             "SELECT ticker, source, item_hash, title_raw, url, snippet, lang, "
             "published_at, first_seen FROM news "
             "WHERE importance IS NULL AND pushed=0 AND first_seen >= ? "
             "AND COALESCE(rescues, 0) < ? "
+            "AND UPPER(ticker) IN (" + marks + ") "
             "ORDER BY first_seen DESC LIMIT ?",
-            (cutoff, ORPHAN_MAX_RESCUES, limit),
+            tuple([cutoff, ORPHAN_MAX_RESCUES] + configured + [limit]),
         ).fetchall()
     except Exception as exc:
         print(f"  [warn] orphan-rescue query failed: {exc}", file=sys.stderr)
@@ -2263,25 +2296,144 @@ def dedupe_same_story(items):
     return kept, collapsed
 
 
+# Legal-entity forms that never identify a company on their own. Stripped to
+# derive the name a headline actually uses ("Toyota Motor Corporation" ->
+# "Toyota Motor").
+_NAME_ENTITY_SUFFIX_RE = re.compile(
+    r"(?i)\b(inc|corp|corporation|ltd|limited|holdings?|group|company|co|plc|"
+    r"sa|se|nv|ag|lp|llc|berhad|bhd|kk|s\.?a\.?)\b\.?")
+
+# Industry/descriptor words that follow (or precede) a distinctive brand token.
+# "Toyota Motor" -> the remainder "Motor" is a descriptor, so "Toyota" is the
+# headline name. This list is deliberately about corporate/industry form, never
+# about ownership: a wrong short form creates false positives.
+_NAME_DESCRIPTOR_WORDS = frozenset("""
+motor motors automotive air airlines airways lines air lines rail systems
+industries industrial enterprises pharmaceuticals pharmaceutical pharma
+telecom telecommunications energy media entertainment resources materials
+networks network solutions brands foods food beverages beverage software
+labs laboratories partners trust platforms technologies technology
+wholesale stores retail holdings insurance financial bancorp
+""".split())
+
+# Additional words that must never become a standalone alias: they are either
+# ordinary English, a geography, or a whole-sector noun that would make any
+# industry story look like company news ("solar", "bank", "energy").
+_GENERIC_ALIAS_EXTRA = frozenset("""
+africa america american asia asian australia britain british canada canadian
+china chinese europe european france french general germany german global hong
+india indian japan japanese korea korean singapore taiwan uk united world
+worldwide bank banking bancorp capital credit credits energy financial fintech
+foods fund gold growth health healthcare home industries industry insurance
+international investment investments media national natural oil power public
+retail securities solar steel storage technology tech telecom digital cloud
+data mobile online platform platforms utilities wholesale chase gamble first
+# Common given names: "Charles Schwab" may derive "Schwab", never "Charles"
+# (King Charles is not a brokerage story).
+charles john james william george henry david michael robert thomas richard
+daniel joseph andrew edward peter paul mary anne elizabeth
+""".split())
+
+
+def _alias_is_usable(value):
+    """A derived short name is usable when it is a real, distinctive token."""
+    text = str(value or "").strip()
+    if len(text) < 4:
+        return False
+    low = text.lower()
+    if low in _NAME_DESCRIPTOR_WORDS or low in _GENERIC_ALIAS_EXTRA:
+        return False
+    # The generic/prose lists are defined below this function; resolve them at
+    # CALL time so module import order does not matter. PROSE_COLLISION_WORDS
+    # is deliberately NOT checked here: a word-like company name ("Visa") is
+    # still the company's own name - mentions_company() applies the extra
+    # corporate-context requirement for those.
+    if low in _GENERIC_NAME_WORDS:
+        return False
+    return True
+
+
+def _latin_name_variants(name):
+    """
+    Every safe way a headline may refer to one Latin-script company name.
+
+    The old matcher only stripped a tiny suffix list, so the OFFICIAL name
+    ("Ford Motor Company", "Toyota Motor Corporation", "LVMH Moet Hennessy
+    Louis Vuitton SE", "Amazon.com, Inc.") never matched the short form a
+    headline uses. Measured on 22 S&P-style headlines, 12 were rejected as
+    "unrelated" - the single biggest quality loss for a non-Chinese watchlist.
+
+    Derived forms, each guarded by _alias_is_usable:
+      * the name itself, minus a leading "The" and a domain-ish tail (.com)
+      * the name with legal-entity suffixes removed
+      * an ALL-CAPS acronym head (LVMH)
+      * the first token when everything after it is a descriptor
+        (Toyota Motor -> Toyota)
+      * a distinctive final token (Walt Disney -> Disney, Charles Schwab ->
+        Schwab). This is a heuristic and the guard list is what keeps it safe.
+    """
+    raw = re.sub(r"\s+", " ", str(name or "")).strip(" .,&")
+    if not raw or is_chinese(raw):
+        return []
+    found, seen = [], set()
+
+    def add(value):
+        value = re.sub(r"\s+", " ", str(value or "")).strip(" .,&")
+        value = re.sub(r"(?i)^the\s+", "", value)
+        if not value or not _alias_is_usable(value):
+            return
+        key = value.lower()
+        if key not in seen:
+            seen.add(key)
+            found.append(value)
+
+    add(raw)
+    core = re.sub(r"\s+", " ", _NAME_ENTITY_SUFFIX_RE.sub(" ", raw)).strip(" .,&")
+    # "Amazon.com" -> "Amazon": the domain tail survives suffix stripping.
+    core = re.sub(r"(?i)\.(com|net|org|co|cn|hk|us)$", "", core).strip(" .,&")
+    add(core)
+    words = [w for w in core.split() if w.lower() not in ("&", "and", "of", "the")]
+    if words:
+        first = words[0]
+        rest = words[1:]
+        if first.isupper() and len(first) >= 2:
+            add(first)
+        if rest and all(w.lower() in _NAME_DESCRIPTOR_WORDS for w in rest):
+            add(first)
+        if len(words) >= 2:
+            last = words[-1]
+            if len(last) >= 5 and last.lower() not in _NAME_DESCRIPTOR_WORDS:
+                add(last)
+            # Two-word brand names: the first token is usually the headline
+            # form ("Exxon profit", "JPMorgan raises forecast", "Goldman
+            # cuts"), so add it when it is distinctive. The common-given-name
+            # blocklist keeps "Charles" from becoming a Schwab alias.
+            first = words[0]
+            if len(words) == 2 and len(first) >= 5:
+                add(first)
+    return found
+
+
 def _company_name_tokens(names):
     """
     Normalised, abbreviated forms of the company's OWN names used for the
-    relevance check. Alphabet-only suffixes ('Inc', 'Holdings', 'Ltd') are
-    dropped so 'Yuanbao Inc.' matches a title that says 'Yuanbao'; short
-    forms are only used when they are at least 4 characters, so a bare
-    'LU'/'YB' ticker cannot make every article look relevant.
+    relevance check.
+
+    CJK names are kept whole (the CJK substring guard in _term_in_text decides
+    those). Latin names go through _latin_name_variants, so an official legal
+    name also matches the short form a headline uses. Short forms are at least
+    4 characters, so a bare 'LU'/'YB' ticker cannot make every article match.
     """
     out = set()
     for nm in names:
         nm = re.sub(r"\s+", " ", str(nm or "").strip())
         if not nm:
             continue
-        out.add(nm.lower())
-        stripped = re.sub(r"(?i)\b(inc|corp|corporation|ltd|limited|holdings?|"
-                          r"group|company|co|technolog(y|ies)|plc|sa|nv)\b\.?", "", nm)
-        stripped = re.sub(r"\s+", " ", stripped).strip(" .,-")
-        if len(stripped) >= 4:
-            out.add(stripped.lower())
+        if is_chinese(nm):
+            out.add(nm.lower())
+            continue
+        for variant in _latin_name_variants(nm):
+            out.add(variant.lower())
     return out
 
 
@@ -2377,6 +2529,10 @@ def resolve_relevance(meta):
     """
     names = [str(meta.get("name_zh") or ""), str(meta.get("name_en") or "")]
     names += [str(x) for x in (meta.get("aliases_zh") or [])]
+    # English aliases/brands are first-class now: a legal name like "Toyota
+    # Motor Corporation" cannot match the headline form "Toyota", and aliases
+    # are the only reliable way to supply that (see _latin_name_variants).
+    names += [str(x) for x in (meta.get("aliases_en") or [])]
     names = [n.strip() for n in names if n and n.strip()]
     return {
         "names": names,
@@ -2667,28 +2823,41 @@ def build_zh_terms(meta):
 
 def build_en_terms(meta):
     """
-    Non-Chinese search terms from a company profile: name_en +
+    Non-Chinese search terms from a company profile: name_en, the short forms a
+    headline uses (Toyota Motor -> Toyota), explicit aliases_en,
     subsidiaries_other (e.g. Fenqile, Fenqile Indonesia) and Latin keywords.
-    Used for Tavily and Google News EN, so subsidiary news is found even when
-    it never mentions the ticker symbol or the Chinese name.
+    Used for Tavily and Google News EN, so company news is found even when it
+    never mentions the ticker symbol or the Chinese name.
     """
     terms = []
+
+    def add(value, derived=False):
+        v = str(value or "").strip()
+        if not v or v in terms or is_chinese(v):
+            return
+        # Skip bare tickers/market symbols ("YB.US", "LX") - common English
+        # words return noise, the ticker is already searched by the Google News
+        # EN query itself.
+        if re.fullmatch(r"[A-Z0-9.\-]{1,8}", v):
+            return
+        # A DERIVED short form must survive the same guard as the relevance
+        # matcher, or a generic token ("Fintech", "General") becomes a search.
+        if derived and not _alias_is_usable(v):
+            return
+        terms.append(v)
+
     if meta:
-        v = str(meta.get("name_en") or "").strip()
-        if v and v not in terms:
-            terms.append(v)
+        add(meta.get("name_en"))
+        # The headline form first: an official name is often not what the press
+        # writes, and the query budget is small.
+        for v in _latin_name_variants(meta.get("name_en") or ""):
+            add(v, derived=True)
+        for v in (meta.get("aliases_en") or []):
+            add(v)
         for key in ("subsidiaries_other", "keywords"):
             for v in (meta.get(key) or []):
-                v = str(v or "").strip()
-                if not v or v in terms or is_chinese(v):
-                    continue
-                # Skip bare tickers/market symbols ("YB.US", "LX") - common
-                # English words return noise, the ticker is already searched by
-                # the Google News EN query itself.
-                if re.fullmatch(r"[A-Z0-9.\-]{1,8}", v):
-                    continue
-                terms.append(v)
-    return terms[:5]
+                add(v)
+    return terms[:6]
 
 
 # Words too generic to identify a company on their own when used as a stem
@@ -2705,6 +2874,10 @@ CORPORATE_CONTEXT_WORDS = (
     "report", "reports", "reported", "announce", "announces", "announced",
     "earnings", "results", "revenue", "profit", "loss", "guidance", "outlook",
     "quarter", "quarterly", "fiscal", "q1", "q2", "q3", "q4", "shares", "stock",
+    # Result verbs: "GM beats expectations" is a company story even though the
+    # ticker is a 2-letter word ("beats" alone would not be, but the ticker must
+    # also be present for this path to matter).
+    "beats", "misses", "tops", "lags", "forecast",
     "ceo", "cfo", "dividend", "buyback", "acquisition", "merger", "ipo",
     "regulator", "regulatory", "penalty", "fine", "investigation", "license",
     "delisting", "lawsuit", "partnership", "launch", "expands", "expansion",
@@ -2739,6 +2912,10 @@ leaf mint navy oak palm peak pine rose sage silk snow soil steel stone west
 word line page list name case fact test term side sign site size type unit rate
 data fund trust group power water light money price value key all now any one
 off out top buy sell hold gain lose rise fall drop jump
+# Names that are also ordinary words: a bare match needs corporate context
+# ("Visa rules for tourists" is not Visa Inc.; "Visa expands settlement" is).
+# Kept in the PROSE list (not dropped as an alias): it IS the company's name.
+visa delta gap
 """.split())
 
 
@@ -2839,10 +3016,20 @@ def seed_lookup_from_config(config, lookup):
     gaps). This keeps the knowledge base alive even if the lookup file is
     fresh/deleted, and lets the panel's explicit overrides propagate.
     Returns (lookup, changed).
+
+    ONLY configured tickers are seeded. A watchlist swap leaves the old
+    ticker_meta entries in the config (the panel's JSON box is edited by hand),
+    and re-seeding them made removed companies compete with the new ones for
+    shared brand names - going as far as stripping a live ticker's brand in
+    prune_cross_ticker_keywords().
     """
+    configured = {str(t).strip().upper()
+                  for t in (config.get("tickers") or []) if str(t).strip()}
     meta_map = config.get("ticker_meta", {}) or {}
     changed = False
     for ticker, meta in meta_map.items():
+        if str(ticker).strip().upper() not in configured:
+            continue
         entry = lookup.setdefault(ticker, {})
         for k, v in (meta or {}).items():
             # Only mark changed when a value actually differs, so we don't
@@ -2877,7 +3064,8 @@ def _merge_lookup_entry(existing, parsed):
         v = str((parsed or {}).get(k) or "").strip()
         if v:
             merged[k] = v
-    for k in ("aliases_zh", "subsidiaries_zh", "subsidiaries_other", "keywords"):
+    for k in ("aliases_zh", "aliases_en", "subsidiaries_zh",
+              "subsidiaries_other", "keywords"):
         vals = [str(x).strip() for x in (parsed or {}).get(k) or [] if str(x).strip()]
         old = [str(x).strip() for x in (merged.get(k) or [])]
         merged[k] = list(dict.fromkeys(old + vals))[:12]
@@ -3048,7 +3236,7 @@ def brand_like_names(names, limit=8):
     return out
 
 
-def prune_cross_ticker_keywords(lookup, max_tickers=1):
+def prune_cross_ticker_keywords(lookup, max_tickers=1, active=None):
     """
     A brand name may belong to only ONE ticker in the lookup.
 
@@ -3063,6 +3251,10 @@ def prune_cross_ticker_keywords(lookup, max_tickers=1):
       * otherwise it is genuinely ambiguous and is dropped from every ticker
         (the ticker-specific names, which are what actually find news, stay).
 
+    `active` (the configured tickers) excludes entries left behind by a
+    previous watchlist: a removed company must not claim a name the current
+    portfolio needs, which is exactly what happened after a full swap.
+
     Deterministic and cheap, so it runs on every discovery.
     """
     def owned_by(ticker, entry, name):
@@ -3075,8 +3267,11 @@ def prune_cross_ticker_keywords(lookup, max_tickers=1):
                 return True
         return False
 
+    active_set = {str(t).strip().upper() for t in active} if active else None
     owners = {}
     for ticker, entry in (lookup or {}).items():
+        if active_set is not None and str(ticker).strip().upper() not in active_set:
+            continue
         for k in ("keywords", "subsidiaries_zh", "subsidiaries_other"):
             for name in (entry.get(k) or []):
                 name = str(name or "").strip()
@@ -3291,6 +3486,7 @@ def discover_company(ticker, config, secrets, existing=None, persist=True):
         "name_zh": name_hint,
         "name_en": str(existing.get("name_en") or "").strip(),
         "aliases_zh": list(existing.get("aliases_zh", []) or []),
+        "aliases_en": list(existing.get("aliases_en", []) or []),
         "subsidiaries_zh": list(existing.get("subsidiaries_zh", []) or []),
         "subsidiaries_other": list(existing.get("subsidiaries_other", []) or []),
         "keywords": list(existing.get("keywords", []) or []),
@@ -3329,6 +3525,10 @@ def discover_company(ticker, config, secrets, existing=None, persist=True):
             "  name_en: official English name\n"
             "  aliases_zh: other Chinese names/abbreviations the company is called\n"
             "    (e.g. 乐信集团, 乐信金融)\n"
+            "  aliases_en: other ENGLISH names/abbreviations headlines use - the\n"
+            "    short form of the legal name (Toyota for Toyota Motor Corporation,\n"
+            "    LVMH for LVMH Moet Hennessy Louis Vuitton, Disney for The Walt\n"
+            "    Disney Company). This is what makes English coverage work.\n"
             "  subsidiaries_zh: Chinese subsidiary names. List the SHORT BRAND\n"
             "    names FIRST (分期乐, 桔子理财, 提钱乐, 平安普惠, 鼎盛资产, 云犀科技),\n"
             "    then the legal entities. Include platforms, apps, microlending\n"
@@ -3355,7 +3555,8 @@ def discover_company(ticker, config, secrets, existing=None, persist=True):
         parsed = _parse_json_object(content) if content else None
         if parsed:
             # Anti-hallucination: keep only names the snippets actually support.
-            for k in ("aliases_zh", "subsidiaries_zh", "subsidiaries_other", "keywords"):
+            for k in ("aliases_zh", "aliases_en", "subsidiaries_zh",
+                      "subsidiaries_other", "keywords"):
                 before = [str(x) for x in (parsed.get(k) or [])]
                 if not before:
                     continue
@@ -3466,7 +3667,8 @@ def discover_company(ticker, config, secrets, existing=None, persist=True):
     # ownership (asked for HUIZ's brands it once listed "LU Global", which is
     # Lufax's), so names claimed by several tickers are dropped from all of
     # them. Without this, one company's news looks like another's.
-    ambiguous = prune_cross_ticker_keywords(lookup)
+    ambiguous = prune_cross_ticker_keywords(
+        lookup, active=[t for t in (config.get("tickers") or []) if str(t).strip()])
     if ambiguous:
         print(f"  [discovery] dropped {ambiguous} name(s) claimed by more than one "
               f"ticker (ambiguous ownership).")
@@ -3543,22 +3745,35 @@ def ensure_company_meta(ticker, config, secrets, force=False, persist=True,
     # Explicit config ticker_meta overrides the discovered entry.
     #
     # Scalar fields (name_zh, name_en, website...) are replaced outright, which
-    # is what "override" should mean. LIST fields are UNIONED instead, because
-    # replacing them silently discards everything discovery had found: a config
-    # entry with `subsidiaries_zh: []` would otherwise throw away the 8 CAAS
-    # entities the lookup had discovered. Nothing is lost, the user's own names
-    # are simply added.
+    # is what "override" should mean. LIST fields are UNIONED by default,
+    # because replacing them silently discards everything discovery had found:
+    # a config entry with `subsidiaries_zh: []` would otherwise throw away the
+    # 8 CAAS entities the lookup had discovered.
+    #
+    # `authoritative: true` (set by the panel's names editor) flips that: the
+    # panel shows the EFFECTIVE list, so what the user leaves in the box is the
+    # whole truth and removing a wrong auto-discovered alias actually removes
+    # it. Without this the editor could only ever add.
     cfg_meta = config.get("ticker_meta", {}).get(ticker, {}) or {}
     merged = dict(entry or {})
-    list_keys = ("aliases_zh", "subsidiaries_zh", "subsidiaries_other", "keywords")
+    list_keys = ("aliases_zh", "aliases_en", "subsidiaries_zh",
+                 "subsidiaries_other", "keywords")
+    authoritative = bool(cfg_meta.get("authoritative"))
     for k, v in cfg_meta.items():
-        if v in (None, "", [], {}):
+        if k == "authoritative":
             continue
         if k in list_keys and isinstance(v, list):
-            old = list(merged.get(k) or [])
-            merged[k] = list(dict.fromkeys([str(x).strip() for x in v if str(x).strip()]
-                                           + [str(x).strip() for x in old if str(x).strip()]))
-        else:
+            cleaned = [str(x).strip() for x in v if str(x).strip()]
+            if authoritative:
+                merged[k] = list(dict.fromkeys(cleaned))
+            else:
+                old = [str(x).strip() for x in (merged.get(k) or [])
+                       if str(x).strip()]
+                merged[k] = list(dict.fromkeys(cleaned + old))
+        elif authoritative:
+            if v is not None:
+                merged[k] = v
+        elif v not in (None, "", [], {}):
             merged[k] = v
     return merged
 
@@ -3785,9 +4000,13 @@ def validate_sec_tickers(tickers):
         return set()
     resolved = set()
     unresolved = []
+    # Only US-style symbols: EDGAR has nothing for 0700.HK / 7203.T / MC.PA, and
+    # asking anyway burned a request and printed a "could not resolve" error for
+    # every non-US ticker, once a week, forever.
+    checkable = [t for t in tickers if US_SYMBOL_RE.match(t or "")]
     try:
         set_identity(SEC_IDENTITY)
-        for ticker in tickers:
+        for ticker in checkable:
             try:
                 company = Company(ticker)
                 cik = str(getattr(company, "cik", "") or "").strip()
@@ -4849,15 +5068,21 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
     model = config.get("ai_model") or DEFAULT_AI_MODEL
     key = secrets.get("ai_api_key", "")
     if not key:
-        print("  [warn] No AI API key set - storing items without AI analysis.")
+        # FAIL CLOSED, for the same reason an AI outage does (below): without a
+        # model there is no relevance/importance judgement at all. This branch
+        # used to give every item importance 5 and push=True, so a missing or
+        # mistyped key produced a digest of raw, unscored headlines - and with
+        # push_mode=all (the default) nothing else stopped them.
+        print("  [warn] No AI API key set - items will be STORED but NOT pushed.",
+              file=sys.stderr)
         for it in items:
             it["title_en"] = it.get("title", "")
             it["summary"] = ""
             it["category"] = "other"
-            it["importance"] = 5
+            it["importance"] = 1
             it["sentiment"] = "neutral"
-            it["push"] = True
-            it["reason"] = ""
+            it["push"] = False
+            it["reason"] = "No AI API key - stored only"
             it["impact"] = ""
             it["is_dup"] = False
             it["is_known"] = False
@@ -4914,14 +5139,6 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
                                else "global" if ticker == "GLOBAL"
                                else "sector" if ticker.endswith("~SECTOR")
                                else "ticker")
-        if mode in ("macro", "global"):
-            # Macro tiers: framed around impact on the user's fintech names.
-            analyst = ("You are a China macro analyst. Below are major China "
-                       "policy / market news items found today (already gated "
-                       "as macro-relevant).\n"
-                       if mode == "macro" else
-                       "You are a global-markets analyst. Below are US/global "
-                       "market news items that could move Chinese ADRs.\n")
         if mode in ("macro", "global"):
             # Macro tiers: framed around impact on the user's ACTUAL holdings -
             # this used to name three tickers of one portfolio, so any other
@@ -5484,6 +5701,12 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
     (one last_fetched record per source); the caller re-labels the global ones.
     """
     if not config.get("macro_enabled", True):
+        return []
+    if not secrets.get("ai_api_key"):
+        # Nothing here can be pushed without the relevance triage (analyze_macro
+        # fails closed), so collecting ~120 regulator/industry candidates per
+        # run would be pure waste.
+        print("  [macro] skipped: no AI API key, so the relevance triage cannot run.")
         return []
     extra = [str(k) for k in (config.get("macro_keywords") or []) if str(k).strip()]
 
@@ -6297,6 +6520,21 @@ def analyze_macro(macro_items, config, secrets, conn, run_start, pseudo="MACRO")
     if len(macro_items) != len(keep):
         print(f"  [{pseudo.lower()}] no AI triage: strict gate kept {len(keep)} of "
               f"{len(macro_items)} candidate(s).")
+    if not key:
+        # No key at all (as opposed to the deliberate macro_translate=false
+        # opt-out, which keeps its zero-AI delivery): nothing judged these, so
+        # they are stored for browsing and NOT pushed. The strict regex gate is
+        # not a substitute for the relevance test - it is the gate that let the
+        # Sri Lanka RMB clearing bank and hydrogen-pilot notices through.
+        print(f"  [{pseudo.lower()}] no AI key - {len(keep)} item(s) stored, "
+              f"nothing pushed (no relevance triage available).", file=sys.stderr)
+        for it in keep:
+            it["title_en"] = it.get("title", "")
+            it["impact"] = ""
+            it["importance"] = 1
+            it["push"] = False
+            it["reason"] = "No AI API key - stored only"
+        return []
     for it in keep:
         it["title_en"] = it.get("title", "")
         it["impact"] = ""
@@ -6723,6 +6961,15 @@ def select_push_items(enriched, config, conn=None, now=None):
     # used to omit the floor and seat drops entirely, which made "N stored"
     # unexplainable.
     thresh = max(floor, min_score) if push_mode == "score" else floor
+    # Make the knob explicit in the run log: in the default "all" mode the
+    # minimum-score setting does not apply, and a user who raised it was seeing
+    # no effect and assuming the gate was broken.
+    if push_mode == "score":
+        print(f"  [push] mode=score: pushing importance >= {thresh} "
+              f"(floor {floor}, min score {min_score}).")
+    elif min_score > floor:
+        print(f"  [push] mode=all: pushing importance >= {floor}; push_min_score "
+              f"({min_score}) only applies in 'score' mode.")
     candidates = []
     for it in unique:
         if not it.get("push", True):
@@ -7154,6 +7401,7 @@ def main():
                     "name_zh": meta.get("name_zh") or "",
                     "name_en": meta.get("name_en") or "",
                     "aliases_zh": list(meta.get("aliases_zh") or []),
+                    "aliases_en": list(meta.get("aliases_en") or []),
                     "subsidiaries_zh": list(meta.get("subsidiaries_zh") or []),
                     "subsidiaries_other": list(meta.get("subsidiaries_other") or []),
                     "keywords": list(meta.get("keywords") or []),
@@ -7318,8 +7566,17 @@ def main():
 
     config = load_config()
     if not config:
-        print("No config_local.json found.")
-        record["status"] = "error"; record["error"] = "No config."
+        if os.path.exists(CONFIG_FILE):
+            # The file is THERE; it just could not be parsed (a BOM, a trailing
+            # comma, a half-written edit). Saying "not found" sent the user
+            # looking in the wrong place.
+            print("config_local.json exists but could not be read - fix the JSON "
+                  "or encoding error reported above.")
+            record["status"] = "error"
+            record["error"] = "config_local.json is unreadable (invalid JSON/encoding)."
+        else:
+            print("No config_local.json found.")
+            record["status"] = "error"; record["error"] = "No config."
         append_run_record(record); return
 
     enabled = config.get("enabled", False)
@@ -7731,6 +7988,19 @@ def main():
     print(f"  {len(all_new)} new item(s) found (all stored in the news DB).")
 
     # ---- China macro + global markets: the "I HAVE TO KNOW" tiers ----
+    # The tier is China-policy by design: Chinese wires, PBoC/CSRC/NFRA
+    # regulator documents and Chinese-language macro queries. For a watchlist
+    # with no Chinese exposure that is pure cost (and an EXA credit per run), so
+    # when the user has NOT set macro_enabled explicitly, infer it from the
+    # portfolio instead of defaulting to on. An explicit true/false always wins.
+    if "macro_enabled" not in config:
+        china_exposure = (any(build_zh_terms(m) for m in effective_meta.values())
+                          or "china" in str(config.get("portfolio_note") or "").lower())
+        config["macro_enabled"] = china_exposure
+        print(f"  [macro] {'enabled' if china_exposure else 'skipped'} - inferred "
+              f"from the watchlist (Chinese names: "
+              f"{sum(1 for m in effective_meta.values() if build_zh_terms(m))}/"
+              f"{len(effective_meta)}). Set macro_enabled in the config to override.")
     # Huge China policy news (rate cuts, stimulus, assisted-loan regulation)
     # gated FREE by regex; matched items reach one tiny batched AI call. The
     # gate now requires a strong China-policy pattern (or two distinct hits),
