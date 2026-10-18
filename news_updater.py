@@ -3622,7 +3622,11 @@ def discover_company(ticker, config, secrets, existing=None, persist=True):
             if website and deepseek_enabled(secrets, config):
                 page = fetch_deepseek_page(website, secrets, config)
                 if page:
-                    snippets.append(f"- OFFICIAL SITE {website}: {page[:1500]}")
+                    # INSERT at the front: discover_brands() reads snippets[:14],
+                    # and by now the list is usually already full, so appending
+                    # would put the company's own words exactly where the model
+                    # never looks.
+                    snippets.insert(0, f"- OFFICIAL SITE {website}: {page[:1500]}")
                     print(f"  [discovery] {ticker}: read the official site "
                           f"({len(page)} chars) for brand extraction.")
             # Second, brand-focused pass: the profile pass above is dominated by
