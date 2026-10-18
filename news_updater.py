@@ -207,6 +207,23 @@ DEEPSEEK_PRESS_DAYS = 7
 # after: returns the paper's own articles (measured on 证券时报).
 DEEPSEEK_PRESS_SITES = ("stcn.com", "cls.cn", "yicai.com", "21jingji.com",
                         "cnstock.com")
+# The corporate/HK queries return a lot of profile and quote pages for a quiet
+# name (measured: "奇富科技 (QFIN) 公司做什麼", "03660.HK奇富科技-S", HKEX PDF
+# covers). A result must carry an EVENT word to be worth ingesting; otherwise
+# it is a fact sheet, not news.
+DEEPSEEK_CORP_TERMS = (
+    "合股", "并股", "拆股", "ads", "退市", "私有化", "回购", "分红", "派息",
+    "供股", "盈利预警", "盈警", "业绩预告", "业绩快报", "亏损", "财报",
+    "公告", "委任", "辞任", "董事", "股东", "减持", "增持", "诉讼", "罚",
+    "监管", "停牌", "复牌", "要约", "收购", "出售",
+    # English titles from HKEX summaries and English wires.
+    "appointment", "cfo", "resign", "dividend", "buyback", "reverse split",
+    "delisting", "profit warning", "earnings", "annual general meeting",
+)
+DEEPSEEK_PRESS_TERMS = DEEPSEEK_CORP_TERMS + (
+    "业绩", "营收", "净利", "目标价", "评级", "分析师", "股价", "下跌",
+    "上涨", "传闻", "回应", "合作", "发布", "推出",
+)
 # Account-level QPS is 5 (shared by Search and Fetch), and our calls are
 # sequential, so no throttling is needed. A 402 means the balance is empty:
 # stop calling for the rest of the run instead of retrying every ticker.
@@ -436,6 +453,11 @@ JUNK_CONTENT_PATTERNS = (
     # "乐信(NASDAQ:LX)-公司资料-美股-搜狐", "...-财务概况-英为财情".
     r"个股概览", r"实时行情", r"走势图", r"行情走势", r"公司资料",
     r"公司概况", r"财务概况",
+    # Profile / quote pages the new DeepSeek fan-out surfaced for quiet names.
+    r"公司做什麼|公司做什么", r"首页概览|首頁概覽", r"过往股价|過往股價",
+    r"公司简介|公司簡介", r"公司概览|公司概覽",
+    r"stock price ?& ?overview", r"quote and record", r"historical prices",
+    r"股价、新闻、报价|股價、新聞、報價", r"^[0-9]{4,5}\.hk",
     # A bare "Company (TICKER)" title and an F10 fact sheet are quote pages,
     # not news. DeepSeek's index returns both for a quiet name (measured:
     # "元保 (YB)" and "元保_F10"), and they were being stored at importance 2.
@@ -2706,6 +2728,11 @@ def ingest_items(conn, all_new, source, items, ticker, since_dt, max_age_hours,
 
     for item in items:
         item["ticker"] = ticker
+        # The caller's source is authoritative: a DeepSeek fan-out query
+        # (Corp/HK/Press) returns items tagged DeepSeekSearch by the fetch
+        # helper, and storing them all as "DeepSeekSearch" hid which query
+        # found them.
+        item["source"] = source
         pub_dt = _parse_pub(item.get("date", ""))
         if since_dt is not None and pub_dt and pub_dt < since_dt:
             bump("older_than_delta")
@@ -5054,9 +5081,30 @@ def deepseek_press_site(now=None):
     return DEEPSEEK_PRESS_SITES[now.timetuple().tm_yday % len(DEEPSEEK_PRESS_SITES)]
 
 
+def _event_terms_hit(hay, terms):
+    """
+    Does the text contain one of the event words?
+
+    ASCII terms need word boundaries: a bare `ads` must not match "loads", while
+    Chinese terms are plain substrings.
+    """
+    text = str(hay or "").lower()
+    for term in terms or []:
+        word = str(term).strip().lower()
+        if not word:
+            continue
+        if re.fullmatch(r"[a-z0-9 .\-]+", word):
+            if re.search(r"(?<![a-z0-9])" + re.escape(word) + r"(?![a-z0-9])",
+                         text):
+                return True
+        elif word in text:
+            return True
+    return False
+
+
 def fetch_deepseek_search(query, secrets, config, since_dt=None, limit=10,
                           terms=None, lang=None, ori_question=None,
-                          require_date=None):
+                          require_date=None, event_terms=None):
     """
     One DeepSeek Search request.
 
@@ -5142,6 +5190,7 @@ def fetch_deepseek_search(query, secrets, config, since_dt=None, limit=10,
     items = []
     stems = company_stems(terms)
     dropped = junk = 0
+    dropped_event = 0
     for r in results:
         title = str(r.get("title") or "").strip()
         url = str(r.get("url") or "").strip()
@@ -5152,6 +5201,11 @@ def fetch_deepseek_search(query, secrets, config, since_dt=None, limit=10,
             continue
         if terms and not tavily_term_match(title, terms, stems):
             continue
+        summary = str(r.get("summary") or "").strip()
+        if event_terms:
+            if not _event_terms_hit(f"{title} {summary}", event_terms):
+                dropped_event += 1
+                continue
         date = str(r.get("date") or "") or _date_from_url(url)
         pub_dt = _parse_pub(date)
         if since_dt is not None:
@@ -5183,6 +5237,9 @@ def fetch_deepseek_search(query, secrets, config, since_dt=None, limit=10,
               f"(delta window starts {since_dt.strftime('%Y-%m-%d %H:%M')}).")
     if junk:
         print(f"  [deepseek] dropped {junk} junk-domain result(s).")
+    if dropped_event:
+        print(f"  [deepseek] dropped {dropped_event} result(s) with no event "
+              f"word (profile/quote pages).")
     return items
 
 
@@ -8336,6 +8393,7 @@ def main():
                 lambda sd: fetch_deepseek_search(
                     deepseek_corp_query(display, sd), secrets, config, sd,
                     limit=10, terms=ds_terms,
+                    event_terms=DEEPSEEK_CORP_TERMS,
                     ori_question=f"Any corporate action for {display}: reverse "
                                  f"split, ADS ratio, buyback, delisting?"),
                 src_status("deepseek_corp", strict=False),
@@ -8353,7 +8411,8 @@ def main():
                 "DeepSeekHK",
                 lambda sd: fetch_deepseek_search(
                     deepseek_hk_query(hk_code, display, sd), secrets, config, sd,
-                    limit=10, terms=ds_terms),
+                    limit=10, terms=ds_terms,
+                    event_terms=DEEPSEEK_CORP_TERMS),
                 src_status("deepseek_hk", strict=False),
                 since_override=datetime.now(EASTERN)
                 - timedelta(days=DEEPSEEK_CORP_DAYS))
@@ -8368,7 +8427,8 @@ def main():
                 "DeepSeekPress",
                 lambda sd: fetch_deepseek_search(
                     deepseek_press_query(display, site, sd), secrets, config, sd,
-                    limit=8, terms=ds_terms),
+                    limit=8, terms=ds_terms,
+                    event_terms=DEEPSEEK_PRESS_TERMS),
                 src_status("deepseek_press", strict=False),
                 since_override=datetime.now(EASTERN)
                 - timedelta(days=DEEPSEEK_PRESS_DAYS))

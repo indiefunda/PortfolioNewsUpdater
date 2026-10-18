@@ -204,12 +204,34 @@ for title in ("乐信(LX)_个股概览_股票价格_实时行情_走势图_新�
               "乐信(NASDAQ:LX)-公司资料-美股-搜狐",
               "乐信(LX)财报_财务概况_股票财务指标分析",
               "元保 (YB)",
-              "元保_F10"):
+              "元保_F10",
+              "奇富科技 (QFIN) 公司做什麼",
+              "03660.HK奇富科技-S",
+              "Yuanbao Inc. (YB) Stock Price, News, Quote and Record"):
     check(f"junk: {title[:34]}", nu.is_junk_content(title), title)
 check("a real Chinese headline survives",
       not nu.is_junk_content("乐信发布Q3财报：营收同比增长12%"))
 check("a real headline with a ticker in parentheses survives",
       not nu.is_junk_content("乐信(LX)宣布3亿美元回购计划"))
+check("a reverse-split headline survives",
+      not nu.is_junk_content("陆金所控股拟调整ADS比例至1:20 相当于1比10反向拆股"))
+
+print()
+print("=== event-word gate for the corp/HK/press fan-out ===")
+nu._DEEPSEEK_EXHAUSTED = False
+_next[:] = [Resp(200, {"results": [
+    {"title": "陆金所控股拟调整ADS比例至1:20 相当于1比10反向拆股",
+     "url": "https://news.example.com/lu-split", "date": now_iso(-60 * 24 * 5),
+     "summary": "公司宣布 ADS 比例变更，相当于反向拆股。"},
+    {"title": "陆金所控股投资者关系页面", "url": "https://news.example.com/lu-ir",
+     "date": now_iso(-20), "summary": "公司简介与联系方式。"},
+]})]
+ev = nu.fetch_deepseek_search("陆金所 合股 after:2026-09-27", SEC, CFG,
+                              since_dt=datetime.now(nu.EASTERN) - timedelta(days=21),
+                              terms=["陆金所"], event_terms=["合股", "拆股", "ads"])
+check("event result kept", len(ev) == 1, len(ev))
+check("non-event profile result dropped",
+      ev and "ADS" in ev[0]["title"], ev and ev[0]["title"])
 
 print()
 print("=== caps and fail-closed paths ===")
@@ -275,6 +297,12 @@ check("daily loop calls DeepSeekSearch", '"DeepSeekSearch"' in src)
 check("corporate-action source is wired", '"DeepSeekCorp"' in src)
 check("HK source is wired", '"DeepSeekHK"' in src)
 check("press source is wired", '"DeepSeekPress"' in src)
+check("corp/HK use the event-word gate",
+      "event_terms=DEEPSEEK_CORP_TERMS" in src)
+check("press uses the broader event gate",
+      "event_terms=DEEPSEEK_PRESS_TERMS" in src)
+check("ingest labels the caller's source",
+      'item["source"] = source' in src)
 check("macro tier calls DeepSeekMacro", '"DeepSeekMacro"' in src)
 check("ad-hoc scan records deepseek_searches",
       'cost["deepseek_searches"]' in src)
