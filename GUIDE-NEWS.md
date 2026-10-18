@@ -48,8 +48,9 @@ going on with this name lately?":
    6 months).
 2. It **discovers that company's Chinese name, brands and overseas entities on
    the fly** — the same discovery the watchlist uses.
-3. It deep-searches the window across Google News zh + EN, Eastmoney and Tavily,
-   drops anything unrelated, and collapses the same story from multiple sources.
+3. It deep-searches the window across Google News zh + EN, Eastmoney, Tavily and
+   **DeepSeek Search** (its own Chinese index), drops anything unrelated, and
+   collapses the same story from multiple sources.
 4. Each article gets an ⭐ importance score, a **▲ positive / ▼ negative /
    ● neutral** marker, a category and a one-line "what this means".
 5. Finally a short overall read: **bullish / bearish / neutral / mixed**, a
@@ -64,10 +65,10 @@ python3 news_updater.py --adhoc-scan=FUTU        # default window
 python3 news_updater.py --adhoc-scan=FUTU:120    # last 4 months
 ```
 
-Cost when budgets are available: ~4–6 Tavily credits + ~4 AI calls. If the
-Tavily daily cap is already reached it falls back to the free sources (Google
-News zh + EN, Eastmoney) and costs 0 Tavily credits — still enough to find the
-company and its brands.
+Cost when budgets are available: ~4–6 Tavily credits + one cheap DeepSeek
+Search request + ~4 AI calls. If the Tavily daily cap is already reached it
+falls back to the free sources (Google News zh + EN, Eastmoney) **and DeepSeek
+Search** — still enough to find the company and its brands.
 
 ## What it checks (per ticker, per run — only the "delta" since last time)
 
@@ -106,21 +107,28 @@ company and its brands.
 7. **Tavily** — agent-grade news search (free plan: 1,000 credits/month;
    budgeted hard: max 30/day, max 900/month, and skipped entirely for a
    ticker when the free sources already found enough items that run)
-8. **Google News EN** — kept as a low-priority backup, but now also searches
+8. **DeepSeek Search** (paid, ~$0.30/month; budgeted: max 100/day,
+   2,000/month) — DeepSeek's in-house search engine, the **only paid source
+   with its own Chinese index**. Runs in parallel (one query per ticker, plus
+   a macro query), so it keeps working when Tavily/EXA hit their caps. Chinese
+   tickers query `<name> 新闻 after:<date> lang:zh`; English ones use the short
+   name (`Toyota news after:…`). $0.75 per 1,000 **successful** searches —
+   empty results are free. See the budget section below
+9. **Google News EN** — kept as a low-priority backup, but now also searches
    the company's English brand names (e.g. Fenqile, Temu)
-9. **Google News `site:`** — searches the company's OWN discovered websites
-   (official site, news page, subsidiary sites) so official announcements and
-   press releases are caught even when no news outlet covers them. Note: the
-   news index covers publishers far better than corporate IR pages, so expect
-   little from this source — real IR/newsroom **RSS** feeds (item 10) are the
-   reliable way to catch a company's own announcements
-10. **Primary regulator sources** (`regulators`, on by default) — the
+10. **Google News `site:`** — searches the company's OWN discovered websites
+    (official site, news page, subsidiary sites) so official announcements and
+    press releases are caught even when no news outlet covers them. Note: the
+    news index covers publishers far better than corporate IR pages, so expect
+    little from this source — real IR/newsroom **RSS** feeds (item 13) are the
+    reliable way to catch a company's own announcements
+11. **Primary regulator sources** (`regulators`, on by default) — the
     **NFRA (国家金融监督管理总局)**, **CSRC** and **PBoC** penalty announcements,
     reached through their published documents. These are the highest-signal
     items for lending and insurance names: a fine is news when the regulator
     publishes it, not when a portal writes it up. They land in the 📢 CHINA
     MACRO section
-11. **Industry regulation by THEME** (`sector_regulation`, on by default) — the
+12. **Industry regulation by THEME** (`sector_regulation`, on by default) — the
     fix for sector-wide rules that name no issuer, which every company-name
     query misses: *"中互金协会：15家助贷平台提交专项审计报告"*, *"互联网贷款自律
     筹备组将扩容"*, *"消费金融公司迎来最严检查"*. Searched by theme (助贷 专项审计 /
@@ -128,7 +136,7 @@ company and its brands.
     when a **sector noun AND a policy/action word** are both present, so
     *"助贷概念股大涨"* or a product launch does not qualify. They feed the
     CHINA MACRO section, where the AI writes the impact line for your names
-12. **Company RSS / press-release feeds** (optional, per-ticker — empty by
+13. **Company RSS / press-release feeds** (optional, per-ticker — empty by
     default; add the company's newsroom feed to catch its own announcements)
 
 All new items are stored in `news.db`, translated + summarized + scored by AI
@@ -144,9 +152,9 @@ with each item. Everything else stays in the DB — browse it from the panel
 Huge policy / market news — **rate cuts (降息/降准/LPR), stimulus (万亿/特别国债),
 assisted-loan regulation (助贷/消费金融/利率上限), 金融监管总局 actions, 中概股
 moves, tariffs/sanctions** — is caught in real time from the 7x24 wires, a
-macro Google News query, **EXA's semantic macro search**, the **primary
-regulator sources**, and **industry-theme regulation** (see the source list
-above), and pushed in its **own digest section at the top**, always (never
+macro Google News query, **EXA's semantic macro search**, **DeepSeek Search's Chinese macro query**, the
+**primary regulator sources**, and **industry-theme regulation** (see the source
+list above), and pushed in its **own digest section at the top**, always (never
 floor-capped), capped at
 `macro_max_per_run` (default 3).
 
@@ -173,6 +181,12 @@ deliberate zero-AI path on macro (raw Chinese headline + English tag like
 works when an AI key exists, because no key means nothing is pushed anywhere.
 Add your own watchwords via `macro_keywords` (e.g. `["房地产新政", "平台经济"]`).
 
+**DeepSeek Search in the macro tier:** one extra Chinese query per run
+(`中国 助贷 消费金融 监管 降准 降息 after:<date> lang:zh`) goes through the same
+relevance test. It is keyword-driven (EXA is semantic), dated, and costs about
+$0.00075 when it returns anything — the cheap backstop when EXA's credit is
+gone. Toggle: `sources.deepseek_macro`.
+
 ## Company lookup & auto-discovery (the "alpha" config)
 
 Real alpha is never on the ticker symbol — it's on the **subsidiaries**
@@ -195,6 +209,13 @@ knowledge base in `company_lookup.json` (on the server):
   entities) and each pass asks the AI twice — once for the profile, once for a
   brand-only extraction. New tickers are discovered on their first run; a
   failed lookup retries within ~a week.
+- **DeepSeek Search adds a Chinese angle** (`<name> 子公司 旗下品牌 业务 平台
+  lang:zh`, plus an overseas pass). Measured on 乐信, its first results were the
+  company's **own site pages** ("业务与产品", "集团简介") rather than registry
+  duplicates. Discovery then uses the **Fetch API** to read that official site
+  as Markdown (one call per discovery) before the brand-only AI pass, so brands
+  can be grounded in the company's own words. Budget impact: ~2 searches + 1
+  fetch per discovery, i.e. well under a cent.
 - **Brands, not just registry names**: discovery deliberately prefers the short
   brand names that headlines use (分期乐, 平安普惠, Poni Insurtech, 富途牛牛) over
   legal entity names (深圳市分期乐网络科技有限公司), because only the former are
@@ -627,13 +648,45 @@ Every run prunes the DB:
 Typical usage: ~5–15 searches/day (~150–300/month), leaving most of the free
 allowance unused. Usage is tracked in `tavily_usage.json`.
 
+## DeepSeek Search budget (≈$0.30/month)
+
+DeepSeek's Search API (`POST /v1/tools/search`) uses an **in-house search
+engine** and the **same key as the DeepSeek model API**. It is the cheapest
+paid source by two orders of magnitude:
+
+- **$0.75 per 1,000 successful requests** (¥5). A search that returns **no
+  results is free**, and failures/timeouts are not billed — so the budget counts
+  only billable calls, not attempts.
+- **Caps:** `deepseek_max_daily_searches` (default **100**) and
+  `deepseek_max_monthly_searches` (default **2,000**) — at worst ~$1.50/month,
+  in practice ~$0.30. The panel shows the live meter (DeepSeek: n/100 today…).
+- **Where it runs:** one query per ticker per run (parallel with Tavily/EXA,
+  not only as a fallback), one macro query, one per deep search, and up to two
+  in discovery.
+- **Query shapes:** Chinese tickers use `<name> 新闻 after:<date> lang:zh`
+  (the `lang:`/`after:` operators are what keep it on-topic and fresh);
+  English tickers use the derived short name (`Toyota news after:…`, **not**
+  `AAPL stock`, which returned quote pages).
+- **Why parallel:** it has its own Chinese index, so it adds outlets and
+  official-site pages the other sources miss. It also has its **own budget**, so
+  when Tavily or EXA is capped it keeps working instead of the pipeline going
+  quiet.
+- **Key:** reuses `ai_api_key` when the AI provider is DeepSeek. On Gemini/
+  OpenAI, paste a DeepSeek key in the panel's optional **DeepSeek Search key**
+  field (stored as `deepseek_api_key`), or switch the source off with
+  `sources.deepseek_search: false`.
+- **Failure behaviour:** HTTP 402 (empty balance) disables the source for the
+  rest of that run; 429/5xx leave the delta unadvanced so the window is retried.
+- Usage is tracked in `deepseek_usage.json` (`count` = billable, `attempts`,
+  `fetch_count`).
+
 ## CLI modes (for testing / the panel)
 
 ```bash
 python3 news_updater.py --force           # run now (bypass schedule guard)
 python3 news_updater.py --force --dry-run  # dry run: prints the digest, sends
                                             # nothing, writes nothing AND makes
-                                            # no paid calls (no Tavily/EXA credits)
+                                            # no paid calls (Tavily/EXA/DeepSeek)
 python3 news_updater.py --force --snapshot # real run; if nothing NEW, send a 📊
                                             # snapshot of the current picture instead
 python3 news_updater.py --adhoc-scan=FUTU      # one-off deep search, nothing saved
@@ -642,7 +695,7 @@ python3 news_updater.py --dump-news       # print stored news as JSON (panel bro
 python3 news_updater.py --dump-news=LX    # ... only for LX
 python3 news_updater.py --dump-lookup     # print the company lookup as JSON (panel)
 python3 news_updater.py --dump-effective-meta  # what is ACTUALLY searched per ticker
-python3 news_updater.py --dump-usage      # print Tavily + EXA usage counters (panel meter)
+python3 news_updater.py --dump-usage      # Tavily + EXA + DeepSeek usage (panel meter)
 python3 news_updater.py --rediscover      # force re-discovery of ALL tickers now
 python3 news_updater.py --rediscover=LU   # ... only for LU
 python3 news_updater.py --purge-junk      # delete stored junk (never-pushed, importance<=2)
@@ -710,6 +763,7 @@ those jobs running.
 | No digest arrives | Click **Run now (test)** and read the output. Check Telegram + AI keys. With **no AI key** the run deliberately stores items and pushes nothing (fail closed); an AI outage behaves the same way. |
 | Hosted page says **"This account is not on the access list"** | Add that Google email under **Configuration → Hosted page access**, upload, then run `news_web.py --sync-firebase` on the VM. The page prints the signed-in address so you can copy it. Rules only need re-deploying if you changed `firestore.rules` itself. |
 | Tavily not used | Add your Tavily key (free tier) in the panel and re-upload; the run log shows `Tavily daily/monthly cap reached` or `skipping Tavily (saving credits)` when it's budget-skipped. |
+| DeepSeek Search stops / says **402** | The DeepSeek account balance is empty. Top up at platform.deepseek.com; the source disables itself for that run and resumes next time. (A search with no results is free, so an empty meter is not a spend problem.) |
 | Too many/too few items | Switch `push_mode` to `score` and raise `push_min_score`, or lower `push_min_importance`/`push_max_per_ticker` (all editable in the panel). `max_items_per_run` and `max_digest_items` have **no panel input** — hand-edit `config_local.json` on the server if you need them. |
 | Out-of-season run skipped | Expected — the DST guard makes the wrong-season cron job a fast no-op. |
 | Manual run skipped | The panel's **Run now (test)** always forces a run (`--force`). |

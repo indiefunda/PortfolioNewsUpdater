@@ -49,6 +49,10 @@ nu.fetch_eastmoney_search = lambda term, since=None, terms=None: [
 nu.fetch_tavily = lambda q, sec, cfg, since=None, limit=8, topic="news", terms=None: [
     {"title": t, "url": u, "snippet": "", "date": "2026-10-15", "source": "Tavily", "lang": "en"}
     for t, s, u in COPIES if s == "Tavily"]
+# The DeepSeek source is newer than this fixture; stub it so the test stays
+# offline (a real call with the fake key would log a 401 and hit the network).
+nu.fetch_deepseek_search = lambda *a, **k: []
+nu.fetch_deepseek_page = lambda *a, **k: ""
 
 items, cost = nu.adhoc_collect("LX", meta, config, secrets, days=30)
 urls = [i.get("url", "") for i in items]

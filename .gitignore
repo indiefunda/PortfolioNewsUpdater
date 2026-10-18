@@ -30,6 +30,7 @@ news_run_history.json
 seen.json
 tavily_usage.json
 exa_usage.json
+deepseek_usage.json
 company_lookup.json
 sec_validate.json
 panel_url.txt
@@ -64,7 +65,8 @@ _*.db-wal
 #   news.db / news.db-shm / news.db-wal  snapshot of the real news database
 #   company_lookup.json                  names/subsidiaries of YOUR tickers
 #   config_local.json                    YOUR tickers/holdings
-#   exa_usage.json / tavily_usage.json   your API spend
+#   exa_usage.json
+deepseek_usage.json / tavily_usage.json   your API spend
 #   *.before-*.py                        large pre-change backups
 _audit/*
 # --- private data and scratch (never commit) ---
@@ -74,6 +76,7 @@ _audit/news.db-wal
 _audit/company_lookup.json
 _audit/config_local.json
 _audit/exa_usage.json
+deepseek_usage.json
 _audit/tavily_usage.json
 _audit/news_run_history.json
 _audit/*.before-*.py

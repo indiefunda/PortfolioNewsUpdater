@@ -3,7 +3,8 @@
 A personal stock-news monitor that actually finds the news that matters for
 **US-listed Chinese companies**. It searches **Chinese-language sources**
 (Google News zh-CN, 东方财富/Eastmoney, the **Eastmoney + Sina 7x24
-real-time news wires**, **EXA neural search**, Tavily) using each company's
+real-time news wires**, **EXA neural search**, Tavily, and **DeepSeek Search** —
+DeepSeek's own Chinese index) using each company's
 **Chinese name and its brands/subsidiaries** (e.g. LX → 乐信/分期乐/Fenqile, plus
 their official websites), stores everything in a small database, translates + scores it with AI (with a
 "what this means" impact sentence), and pushes only the most important items
@@ -32,7 +33,8 @@ and gives a short bullish/bearish read. **It saves nothing.**
 
 **The edge:** a penalty to 分期乐, a HK subsidiary's license news, an
 official-site announcement, a flash item on the Chinese wire, a **semantic
-EXA find** ("the Shenzhen-based insurer" → Huize) — or a **huge China macro
+EXA find** ("the Shenzhen-based insurer" → Huize), a **DeepSeek Search find**
+from its own Chinese index — or a **huge China macro
 move (rate cuts, stimulus, assisted-loan regulation) pushed in a dedicated
 📢 CHINA MACRO section** — the stuff US English media never covers, delivered
 hours earlier. (Per-ticker EXA is **off** by default: it cost a credit per
@@ -40,14 +42,16 @@ ticker per run and almost never returned an item about the company. EXA is
 still used for the macro tier and for company discovery.)
 
 - Everything runs on a **free** Google Cloud e2-micro VM ($0).
-- Cost is **$0/month** (see below). No spam: company-relevance gate, age gate,
+- Cost is **under $1/month** (see below): free sources + a tiny DeepSeek Search
+  bill ($0.75 per 1,000 *successful* searches; empty results are free). No
+  spam: company-relevance gate, age gate,
   same-story collapse, a per-event guard (one earnings release reaches you
   once, however many outlets cover it), importance floors, per-ticker seat
   allocation, and regulatory news force-pushed.
 
 ---
 
-## What your friend needs (all free)
+## What your friend needs (all free or near-free)
 
 | Item | Cost | How |
 |------|------|-----|
@@ -56,7 +60,8 @@ still used for the macro tier and for company discovery.)
 | Telegram bot token + chat id | **$0** | @BotFather creates the bot; @userinfobot gives your chat id |
 | Tavily API key | **$0** | tavily.com free plan = 1,000 searches/month (the app budgets itself: max 30/day, 900/month) |
 | EXA AI key | **$0** | exa.ai free plan ≈ 1,000 semantic searches/month (the app budgets itself: max 32/day, 980/month) |
-| AI key — **DeepSeek (only paid item) OR Gemini free tier** | **$0–$2** | DeepSeek: platform.deepseek.com (tiny top-up, lasts months). **Gemini: aistudio.google.com/apikey → free tier is enough.** Pick it in the panel — AI provider → Gemini |
+| DeepSeek Search | **≈$0.30/month** | No extra key: it uses your DeepSeek AI key. $0.75 per 1,000 **successful** searches; empty results are free. Budgeted at 100/day, 2,000/month in the panel |
+| AI key — **DeepSeek (only paid item) OR Gemini free tier** | **$0–$2** | DeepSeek: platform.deepseek.com (tiny top-up, lasts months). **Gemini: aistudio.google.com/apikey → free tier is enough.** Pick it in the panel — AI provider → Gemini. *(Gemini users: the Search source needs a DeepSeek key too; paste one in the panel's "DeepSeek Search key" field or leave it off.)* |
 
 ---
 
@@ -111,6 +116,9 @@ Full details, troubleshooting and all knobs: **GUIDE-NEWS.md**.
 
 - **VM / network / storage: $0** (Google Cloud Always-Free e2-micro).
 - **Tavily: $0** — free plan, hard-budgeted by the app (meter in the panel).
+- **DeepSeek Search: ≈$0.30/month** — 100/day and 2,000/month caps, and a
+  search that returns no results is **free**. It runs in parallel (one query per
+  ticker + one macro query) and keeps working when Tavily/EXA are capped.
 - **AI: $0 with Gemini free tier**, or ~$1–2/year with DeepSeek (the app
   makes ~1 AI call per ticker per run and caches everything in the DB).
 - **Telegram: $0.**
@@ -131,5 +139,5 @@ Full details, troubleshooting and all knobs: **GUIDE-NEWS.md**.
   `web_allowed_emails` is published with the sync and enforced by
   [firestore.rules](firestore.rules). Empty means nobody can read it — fail
   closed. See SETUP-WEB.md step 9 before deploying the rules.
-- Run `--dry-run` freely: it makes **no paid calls at all** (no Tavily, no EXA)
-  and writes nothing.
+- Run `--dry-run` freely: it makes **no paid calls at all** (no Tavily, EXA or
+  DeepSeek requests) and writes nothing.

@@ -122,6 +122,11 @@ DEFAULT_CONFIG = {
     "exa_max_daily_searches": 32,
     "exa_max_monthly_searches": 980,
     "exa_min_free_items": 6,
+    # DeepSeek Search/Fetch: in-house search engine, $0.75 per 1,000 SUCCESSFUL
+    # requests (empty results are free). Counts billable calls only. It is the
+    # cheap parallel/backup source, especially for Chinese coverage.
+    "deepseek_max_daily_searches": 100,
+    "deepseek_max_monthly_searches": 2000,
     "sources": {
         "sec": True,
         "google_news_zh": True,
@@ -132,6 +137,8 @@ DEFAULT_CONFIG = {
         "sina_724": True,  # Sina 7x24 fast-news wire
         "exa": True,  # EXA neural per-ticker impact search
         "exa_macro": True,  # EXA neural macro search (semantic, no regex)
+        "deepseek_search": True,  # DeepSeek Search per ticker (cheap; Chinese index)
+        "deepseek_macro": True,  # DeepSeek Search for the macro tier
         "regulators": True,  # NFRA/CSRC/PBoC penalty announcements (macro tier)
         "sector_regulation": True,  # industry rules searched by THEME, no company name
         "baidu": False,  # captcha-blocked from server IPs - off by default
@@ -155,6 +162,9 @@ DEFAULT_SECRETS = {
     "ai_api_key": "",
     "tavily_api_key": "",
     "exa_api_key": "",
+    # Optional: only needed when the AI provider is NOT DeepSeek but you still
+    # want the DeepSeek Search source.
+    "deepseek_api_key": "",
 }
 # The secret fields the panel round-trips. Placeholder sent to the browser
 # instead of the real value; if an upload echoes it back, the stored key is kept.
@@ -692,8 +702,10 @@ HTML = """<!DOCTYPE html>
     <input id="tavilyKey" type="password" placeholder="paste your free Tavily key (optional)">
     <label>EXA AI key (free: ~1,000 semantic searches/month)</label>
     <input id="exaKey" type="password" placeholder="paste your free EXA key (optional)">
+    <label>DeepSeek Search key (optional — reuses the AI key when the provider is DeepSeek)</label>
+    <input id="dsKey" type="password" placeholder="only needed if your AI provider is Gemini/OpenAI">
     <div class="row">
-      <div class="status" id="tavilyUsage" style="flex:1;margin-bottom:0">Search budget — Tavily | EXA: —</div>
+      <div class="status" id="tavilyUsage" style="flex:1;margin-bottom:0">Search budget — Tavily | EXA | DeepSeek: —</div>
       <button class="btn-ghost" onclick="reload('usage', loadUsage)" style="margin-top:0">↻ Check</button>
     </div>
     <label>Chinese names &amp; subsidiaries — ticker_meta (this is where the Chinese edge comes from)</label>
@@ -762,6 +774,17 @@ HTML = """<!DOCTYPE html>
         <input id="tavilyMinFree" type="number" min="0" value="4">
       </div>
     </div>
+    <div class="row">
+      <div style="flex:1">
+        <label>DeepSeek Search max/day</label>
+        <input id="deepseekDaily" type="number" min="1" value="100">
+      </div>
+      <div style="flex:1">
+        <label>DeepSeek Search max/month</label>
+        <input id="deepseekMonthly" type="number" min="1" value="2000">
+      </div>
+    </div>
+    <div class="hint">DeepSeek Search is the cheap parallel source ($0.75 / 1,000 <b>successful</b> searches; empty results are free). One query per ticker per run plus the macro query, so the default cap costs well under $1/month. It uses the same DeepSeek key as the AI unless you paste a separate one above.</div>
     <div class="toggle" style="margin-top:14px">
       <span>Run the news updater (2x daily)</span>
       <label class="switch"><input type="checkbox" id="enabledToggle"><span class="slider"></span></label>
@@ -939,6 +962,7 @@ async function load(){
   fillSecret('aikey', d.secrets.ai_api_key);
   fillSecret('tavilyKey', d.secrets.tavily_api_key);
   fillSecret('exaKey', d.secrets.exa_api_key);
+  fillSecret('dsKey', d.secrets.deepseek_api_key);
   $('tickerMeta').value = JSON.stringify(d.config.ticker_meta || {}, null, 2);
   $('pushMode').value = d.config.push_mode || 'all';
   // Defaults come from the server's DEFAULT_CONFIG, so the three places that
@@ -957,6 +981,10 @@ async function load(){
   $('tavilyMinFree').value = d.config.tavily_min_free_items || dflt.tavily_min_free_items || 4;
   window._exaDaily = d.config.exa_max_daily_searches || dflt.exa_max_daily_searches || 32;
   window._exaMonthly = d.config.exa_max_monthly_searches || dflt.exa_max_monthly_searches || 980;
+  $('deepseekDaily').value = d.config.deepseek_max_daily_searches || dflt.deepseek_max_daily_searches || 100;
+  $('deepseekMonthly').value = d.config.deepseek_max_monthly_searches || dflt.deepseek_max_monthly_searches || 2000;
+  window._dsDaily = parseInt($('deepseekDaily').value) || 100;
+  window._dsMonthly = parseInt($('deepseekMonthly').value) || 2000;
   // These have no input in the form, but they are real settings: carry the
   // current values through the upload so they are not silently reset.
   window._lookback = d.config.initial_lookback_hours || dflt.initial_lookback_hours || 24;
@@ -1110,7 +1138,7 @@ async function uploadConfig(){
       ai_base_url: $('aiBase').value.trim(),
       telegram_bot_token: secretValue('token'), telegram_chat_id: secretValue('chatid'),
       ai_api_key: secretValue('aikey'), tavily_api_key: secretValue('tavilyKey'),
-      exa_api_key: secretValue('exaKey'),
+      exa_api_key: secretValue('exaKey'), deepseek_api_key: secretValue('dsKey'),
       ticker_meta: tickerMeta,
       push_mode: $('pushMode').value, push_min_score: parseInt($('pushMinScore').value)||7,
       push_min_importance: parseInt($('pushMinImportance').value)||4,
@@ -1121,6 +1149,8 @@ async function uploadConfig(){
       tavily_max_daily_searches: parseInt($('tavilyDaily').value)||30,
       tavily_max_monthly_searches: parseInt($('tavilyMonthly').value)||900,
       tavily_min_free_items: parseInt($('tavilyMinFree').value)||4,
+      deepseek_max_daily_searches: parseInt($('deepseekDaily').value)||100,
+      deepseek_max_monthly_searches: parseInt($('deepseekMonthly').value)||2000,
       initial_lookback_hours: window._lookback || undefined,
       max_items_per_run: window._maxItems || undefined,
       max_digest_items: window._maxDigest || undefined,
@@ -1159,10 +1189,13 @@ async function loadUsage(){
   const d = await api('/api/tavily');
   if(!d.ok){ $('tavilyUsage').textContent = 'Usage: ❌ '+(d.error||'?'); return; }
   const u = d.usage || {};
-  const tv = u.tavily || {}, ex = u.exa || {};
+  const tv = u.tavily || {}, ex = u.exa || {}, ds = u.deepseek || {};
   const td = $('tavilyDaily').value || 15, tm = $('tavilyMonthly').value || 850;
   const ed = window._exaDaily || 32, em = window._exaMonthly || 980; // EXA caps (from your config)
-  $('tavilyUsage').textContent = 'Tavily: '+(tv.count||0)+'/'+td+' today · '+(tv.month_count||0)+'/'+tm+' mo ('+(tm?Math.round(100*(tv.month_count||0)/tm):0)+'% used) | EXA: '+(ex.count||0)+'/'+ed+' today · '+(ex.month_count||0)+'/'+em+' mo ('+(em?Math.round(100*(ex.month_count||0)/em):0)+'% used)';
+  const dd = window._dsDaily || 100, dm = window._dsMonthly || 2000;
+  $('tavilyUsage').textContent = 'Tavily: '+(tv.count||0)+'/'+td+' today · '+(tv.month_count||0)+'/'+tm+' mo ('+(tm?Math.round(100*(tv.month_count||0)/tm):0)+'% used)'
+    + ' | EXA: '+(ex.count||0)+'/'+ed+' today · '+(ex.month_count||0)+'/'+em+' mo ('+(em?Math.round(100*(ex.month_count||0)/em):0)+'% used)'
+    + ' | DeepSeek: '+(ds.count||0)+'/'+dd+' today · '+(ds.month_count||0)+'/'+dm+' mo ('+(dm?Math.round(100*(ds.month_count||0)/dm):0)+'% used)';
 }
 
 async function loadNews(){
@@ -2038,10 +2071,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             data = json.loads(out)
             if "tavily" in data and "exa" in data:
+                data.setdefault("deepseek", {})
                 self._send_json({"ok": True, "usage": data})
             else:
                 # Old layout (single dict) -> wrap it
-                self._send_json({"ok": True, "usage": {"tavily": data, "exa": {}}})
+                self._send_json({"ok": True, "usage": {"tavily": data, "exa": {},
+                                                       "deepseek": {}}})
         except Exception:
             self._send_json({"ok": False, "error": "Could not parse usage from the server."})
 
@@ -2465,7 +2500,11 @@ class Handler(BaseHTTPRequestHandler):
                                   DEFAULT_CONFIG["tavily_max_daily_searches"]),
                                  ("tavily_max_monthly_searches",
                                   DEFAULT_CONFIG["tavily_max_monthly_searches"]),
-                                 ("tavily_min_free_items", 4)):
+                                 ("tavily_min_free_items", 4),
+                                 ("deepseek_max_daily_searches",
+                                  DEFAULT_CONFIG["deepseek_max_daily_searches"]),
+                                 ("deepseek_max_monthly_searches",
+                                  DEFAULT_CONFIG["deepseek_max_monthly_searches"])):
                 if key in data:
                     try:
                         cfg[key] = int(data[key])

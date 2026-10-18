@@ -15,7 +15,8 @@ are pushed to Telegram.
 Pipeline (v2):
   TICKERS (+ Chinese names/aliases/subsidiaries + websites, auto-discovered)
     -> [SEC EDGAR (6-K/8-K content extracted), Google News EN/ZH, Google News
-       site: (official websites), Eastmoney, Baidu, Tavily news search, RSS]
+       site: (official websites), Eastmoney, Baidu, Tavily news search,
+       DeepSeek Search (Chinese in-house index), RSS]
     -> NORMALIZE -> DEDUPLICATE (SQLite exact hash)
     -> store EVERY new item in the `news` table
     -> AI ANALYSIS (one batched call per ticker): translate to English,
@@ -34,7 +35,7 @@ New CLI modes:
   --dump-news[=TICKER]   print the stored news as JSON and exit
                          (used by the panel's "stored news" browse view)
   --dump-lookup    print the company lookup (names/subsidiaries/websites)
-  --dump-usage     print the Tavily usage counters (panel meter)
+  --dump-usage     print the Tavily / EXA / DeepSeek usage counters (panel meter)
   --rediscover[=TICKER]  force a re-discovery of the company lookup now
   --purge-junk-domains   delete stored rows sitting on content-farm/spam
                    domains (the junk-domain gate only stops NEW ones);
@@ -175,6 +176,28 @@ EXA_MAX_MONTHLY_SEARCHES = 980
 # big news).
 EXA_MIN_FREE_ITEMS = 6
 EXA_USAGE_FILE = os.path.join(BASE_DIR, "exa_usage.json")
+
+# DeepSeek Search / Fetch API (launched 2026-10-16). An in-house search engine
+# with the SAME bearer key as the DeepSeek model API:
+#   POST https://api.deepseek.com/v1/tools/search   {query, count, need_content}
+#   POST https://api.deepseek.com/v1/tools/fetch    {url}
+# Billing is per SUCCESSFUL request ($0.75 / 1,000) - a search that returns an
+# empty results array is free - so the budget counts only billable calls. It is
+# the cheapest of the three paid sources by two orders of magnitude, and its
+# Chinese coverage is the reason it is here: it is the only paid source that
+# indexes Chinese outlets on its own.
+DEEPSEEK_SEARCH_API = "https://api.deepseek.com/v1/tools/search"
+DEEPSEEK_FETCH_API = "https://api.deepseek.com/v1/tools/fetch"
+DEEPSEEK_USAGE_FILE = os.path.join(BASE_DIR, "deepseek_usage.json")
+# 100 billable searches/day and 2,000/month is ~$1.50/month at worst, and in
+# practice far less: one query per ticker per run plus macro is ~14/day for the
+# six-stock portfolio. Raise it in the panel if you hold more names.
+DEEPSEEK_MAX_DAILY_SEARCHES = 100
+DEEPSEEK_MAX_MONTHLY_SEARCHES = 2000
+# Account-level QPS is 5 (shared by Search and Fetch), and our calls are
+# sequential, so no throttling is needed. A 402 means the balance is empty:
+# stop calling for the rest of the run instead of retrying every ticker.
+_DEEPSEEK_EXHAUSTED = False
 # Per-ticker EXA neural search. OFF by default: measured over 616 stored Exa
 # rows, 610 never mentioned the company (the neural query's sector tail returned
 # the whole industry), and 5-8 of every 8 results were discarded as undated, so a
@@ -395,6 +418,11 @@ JUNK_CONTENT_PATTERNS = (
     # Quote / valuation / template pages.
     r"stock price,? news,? quote", r"quote & history", r"stock valuation",
     r"peer comparison", r"consensus (?:target|price target|rating)",
+    # Chinese quote/profile template pages, which DeepSeek's Chinese index
+    # surfaces readily: "乐信(LX)_个股概览_股票价格_实时行情_走势图...",
+    # "乐信(NASDAQ:LX)-公司资料-美股-搜狐", "...-财务概况-英为财情".
+    r"个股概览", r"实时行情", r"走势图", r"行情走势", r"公司资料",
+    r"公司概况", r"财务概况",
     r"reaches? new (?:1|one)-year (?:low|high)",
     r"sets new (?:12|twelve)-month (?:low|high)",
     r"stock (?:holds|holding) (?:ground|steady)",
@@ -3435,6 +3463,13 @@ def discover_company(ticker, config, secrets, existing=None, persist=True):
         add_snippets(fetch_exa(q, secrets, config, since_dt=None, limit=6,
                                with_text=True, category="company"),
                      "EXA (company)")
+    # DeepSeek Search: its Chinese index surfaces the company's OWN site pages
+    # ("业务与产品", "集团简介") that the registry-heavy Tavily queries miss -
+    # measured on 乐信, where lexin.com/business was the first result.
+    if deepseek_enabled(secrets, config):
+        add_snippets(fetch_deepseek_search(
+            deepseek_discovery_query(name_hint, name_en, ticker), secrets, config,
+            since_dt=None, limit=8), "DeepSeek Search")
     if secrets.get("tavily_api_key"):
         for q in queries:
             add_snippets(fetch_tavily(q, secrets, config, since_dt=None, limit=6,
@@ -3451,6 +3486,12 @@ def discover_company(ticker, config, secrets, existing=None, persist=True):
                 add_snippets(fetch_exa(q, secrets, config, since_dt=None, limit=5,
                                        with_text=True, category="company"),
                              "EXA (overseas)")
+            if deepseek_enabled(secrets, config) and len(snippets) < 12:
+                add_snippets(fetch_deepseek_search(
+                    deepseek_discovery_query(name_hint, name_en, ticker,
+                                             overseas=True),
+                    secrets, config, since_dt=None, limit=6),
+                    "DeepSeek Search (overseas)")
             if secrets.get("tavily_api_key"):
                 add_snippets(fetch_tavily(q, secrets, config, since_dt=None, limit=6,
                                           topic="general"), f"Tavily '{q[:34]}'")
@@ -3573,6 +3614,17 @@ def discover_company(ticker, config, secrets, existing=None, persist=True):
                   f"site={entry.get('website') or '?'}, "
                   f"subs_zh={entry.get('subsidiaries_zh')}, "
                   f"subs_other={entry.get('subsidiaries_other')})")
+            # Read the company's OWN website before the brand pass. The Search
+            # API surfaces those pages; their text is where brands and
+            # subsidiaries are actually listed. One Fetch call per discovery -
+            # discovery runs monthly per ticker, so this is negligible.
+            website = str(entry.get("website") or "").strip()
+            if website and deepseek_enabled(secrets, config):
+                page = fetch_deepseek_page(website, secrets, config)
+                if page:
+                    snippets.append(f"- OFFICIAL SITE {website}: {page[:1500]}")
+                    print(f"  [discovery] {ticker}: read the official site "
+                          f"({len(page)} chars) for brand extraction.")
             # Second, brand-focused pass: the profile pass above is dominated by
             # registry pages, so brands and overseas brands need their own
             # question. The result goes into `keywords`, which build_zh_terms()
@@ -4815,6 +4867,298 @@ def fetch_exa(query, secrets, config, since_dt=None, limit=6, with_text=False,
 
 
 # ---------------------------------------------------------------------------
+# DeepSeek Search / Fetch - the cheap third paid source
+# ---------------------------------------------------------------------------
+# Why it is here:
+#   * it is the only paid source with its OWN Chinese index, so it adds Chinese
+#     coverage the free sources miss (official-site pages, trade press);
+#   * it costs $0.75 / 1,000 SUCCESSFUL requests and empty results are free,
+#     which makes a per-ticker-per-run query affordable (~$0.30/month here);
+#   * it is a natural BACKUP: when Tavily or EXA hit their caps it keeps going,
+#     and its query operators (lang:/site:/after:) make the intent precise.
+def deepseek_key(secrets, config):
+    """
+    The bearer key for the DeepSeek Search API.
+
+    A dedicated `deepseek_api_key` wins. Otherwise the AI key is reused ONLY
+    when it is really a DeepSeek key: provider deepseek with the DeepSeek base
+    URL (or no explicit base). A Gemini/OpenAI key, or a proxy key aimed at a
+    different host, cannot authenticate against api.deepseek.com.
+    """
+    key = str((secrets or {}).get("deepseek_api_key") or "").strip()
+    if key:
+        return key
+    provider = str((config or {}).get("ai_provider") or "").strip().lower()
+    base = str((config or {}).get("ai_base_url") or "").strip().lower()
+    if "api.deepseek.com" in base or (provider == "deepseek" and not base):
+        return str((secrets or {}).get("ai_api_key") or "").strip()
+    return ""
+
+
+def deepseek_enabled(secrets, config, source_key="deepseek_search"):
+    """Is this DeepSeek source switched on AND usable?"""
+    if not (config.get("sources", {}) or {}).get(source_key, True):
+        return False
+    return bool(deepseek_key(secrets, config))
+
+
+_CHEAP_CAP_WARNED = False
+
+
+def deepseek_usage_today():
+    """
+    DeepSeek usage tracker.
+
+    `count` / `month_count` are BILLABLE requests: a search that returns an
+    empty results array is free, so it must not consume budget. `attempts` (all
+    calls) and `fetch_count` (Fetch API pages) are informational.
+    """
+    data = _read_json(DEEPSEEK_USAGE_FILE, {})
+    today = datetime.now(EASTERN).strftime("%Y-%m-%d")
+    month = today[:7]
+    if data.get("date") != today:
+        data["date"] = today
+        data["count"] = 0
+        data["attempts"] = 0
+        data["fetch_count"] = 0
+    if data.get("month") != month:
+        data["month"] = month
+        data["month_count"] = 0
+    return data
+
+
+def _deepseek_after(since_dt):
+    """
+    The `after:` date for a query.
+
+    One day earlier than the exact delta on purpose: the engine's date has only
+    day precision, and the exact publish timestamp is re-checked on every
+    result, so a wider query loses nothing and misses nothing.
+    """
+    anchor = since_dt or (datetime.now(EASTERN) - timedelta(days=1))
+    return (anchor - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def deepseek_name(meta, zh_terms, en_terms, ticker):
+    """The name a headline/search would use: Chinese name, else the short
+    derived English form ("Toyota", "Alibaba"), else the ticker."""
+    if zh_terms:
+        return str(zh_terms[0]).strip()
+    variants = _latin_name_variants(str((meta or {}).get("name_en") or ""))
+    if variants:
+        return variants[-1]
+    if en_terms:
+        return str(en_terms[0]).strip()
+    return ticker
+
+
+def deepseek_ticker_query(meta, zh_terms, en_terms, ticker, since_dt):
+    after = _deepseek_after(since_dt)
+    name = deepseek_name(meta, zh_terms, en_terms, ticker)
+    if zh_terms:
+        q = f"{name} 新闻 after:{after} lang:zh"
+    else:
+        # "AAPL stock" returned quote pages for days; "<name> news" returned
+        # real Apple Intelligence/China coverage.
+        q = f"{name} news after:{after}"
+    return q[:128]
+
+
+def deepseek_macro_query(since_dt):
+    return (f"中国 助贷 消费金融 监管 降准 降息 after:{_deepseek_after(since_dt)} "
+            f"lang:zh")[:128]
+
+
+def deepseek_discovery_query(name_hint, name_en, ticker, overseas=False):
+    if overseas:
+        name = name_en or name_hint or ticker
+        return f"{name} overseas subsidiaries brands acquisitions"[:128]
+    if name_hint:
+        return f"{name_hint} 子公司 旗下品牌 业务 平台 lang:zh"[:128]
+    return f"{name_en or ticker} subsidiaries brands business"[:128]
+
+
+def fetch_deepseek_search(query, secrets, config, since_dt=None, limit=10,
+                          terms=None, lang=None, ori_question=None,
+                          require_date=None):
+    """
+    One DeepSeek Search request.
+
+    Returns a list of items, or None on a hard failure / when a cap is reached
+    (None - NOT [] - so the caller does not advance that source's delta past a
+    window that was never searched). Empty results return [] (and are free).
+
+    `require_date` defaults to "yes when there is a delta window": an undated
+    news hit cannot be proven fresh, so it is dropped rather than risk pushing a
+    recycled story. Discovery passes since_dt=None (profile pages are undated).
+    """
+    global _DEEPSEEK_EXHAUSTED, _CHEAP_CAP_WARNED
+    key = deepseek_key(secrets, config)
+    if not key:
+        return []
+    if _DEEPSEEK_EXHAUSTED:
+        return None
+    if NO_WRITE:
+        print("  [deepseek] --no-write/--dry-run: skipping the paid search "
+              "(no requests used).")
+        return None
+    daily_cap = _cfg_int(config, "deepseek_max_daily_searches",
+                         DEEPSEEK_MAX_DAILY_SEARCHES)
+    monthly_cap = _cfg_int(config, "deepseek_max_monthly_searches",
+                           DEEPSEEK_MAX_MONTHLY_SEARCHES)
+    usage = deepseek_usage_today()
+    if usage.get("count", 0) >= daily_cap:
+        if not _CHEAP_CAP_WARNED:
+            print(f"  [warn] DeepSeek Search daily cap ({daily_cap}) reached - "
+                  f"skipping (delta not advanced).")
+            _CHEAP_CAP_WARNED = True
+        return None
+    if usage.get("month_count", 0) >= monthly_cap:
+        if not _CHEAP_CAP_WARNED:
+            print(f"  [warn] DeepSeek Search monthly cap ({monthly_cap}) reached - "
+                  f"skipping (delta not advanced).")
+            _CHEAP_CAP_WARNED = True
+        return None
+    query = str(query or "").strip()[:128]
+    if not query:
+        return []
+    body = {"query": query, "count": max(1, min(50, int(limit))),
+            "need_content": False}
+    if ori_question:
+        body["ori_question"] = str(ori_question).strip()[:128]
+    if require_date is None:
+        require_date = since_dt is not None
+    try:
+        resp = requests.post(
+            DEEPSEEK_SEARCH_API,
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json"},
+            json=body, timeout=30)
+        if resp.status_code == 402:
+            _DEEPSEEK_EXHAUSTED = True
+            print("  [warn] DeepSeek balance exhausted (HTTP 402) - Search is "
+                  "disabled for the rest of this run.", file=sys.stderr)
+            return None
+        if resp.status_code == 429:
+            print("  [warn] DeepSeek Search rate limit (429) - skipping this one.",
+                  file=sys.stderr)
+            return None
+        if resp.status_code >= 400:
+            print(f"  [error] DeepSeek Search HTTP {resp.status_code}: "
+                  f"{resp.text[:200]}", file=sys.stderr)
+            return None
+        data = resp.json()
+    except Exception as exc:
+        print(f"  [error] DeepSeek Search '{query[:44]}': {exc}", file=sys.stderr)
+        return None
+
+    results = data.get("results") or []
+    # Bill only when the API returned a non-empty result list.
+    usage["attempts"] = usage.get("attempts", 0) + 1
+    if results:
+        usage["count"] = usage.get("count", 0) + 1
+        usage["month_count"] = usage.get("month_count", 0) + 1
+    try:
+        _write_json(DEEPSEEK_USAGE_FILE, usage)
+    except Exception:
+        pass
+
+    items = []
+    stems = company_stems(terms)
+    dropped = junk = 0
+    for r in results:
+        title = str(r.get("title") or "").strip()
+        url = str(r.get("url") or "").strip()
+        if not title or not url:
+            continue
+        if is_junk_host(url):
+            junk += 1
+            continue
+        if terms and not tavily_term_match(title, terms, stems):
+            continue
+        date = str(r.get("date") or "")
+        pub_dt = _parse_pub(date)
+        if since_dt is not None:
+            if require_date and pub_dt is None:
+                dropped += 1
+                continue
+            if pub_dt is not None and pub_dt < since_dt:
+                dropped += 1
+                continue
+        summary = str(r.get("summary") or "").strip()
+        snippet = summary or str(r.get("snippet") or "").strip()
+        item_lang = lang or ("zh" if (is_chinese(title) or is_chinese(snippet))
+                             else "en")
+        items.append({
+            "source": "DeepSeekSearch",
+            "ticker": "",
+            "id": url or title,
+            "title": title,
+            "url": url,
+            "date": date,
+            "lang": item_lang,
+            "snippet": snippet[:400],
+            # Kept for the run log / future ranking; the pipeline ignores them.
+            "authority": r.get("authority"),
+            "rerank_score": r.get("rerank_score"),
+        })
+    if dropped:
+        print(f"  [deepseek] dropped {dropped} stale/undated result(s) "
+              f"(delta window starts {since_dt.strftime('%Y-%m-%d %H:%M')}).")
+    if junk:
+        print(f"  [deepseek] dropped {junk} junk-domain result(s).")
+    return items
+
+
+def fetch_deepseek_page(url, secrets, config):
+    """
+    Fetch one page as Markdown through the DeepSeek Fetch API.
+
+    Used by discovery to read the company's OWN website: the Search API already
+    surfaces those pages, but their content is what names the brands and
+    subsidiaries that a registry search never lists. One call per discovery
+    (monthly per ticker), $0.75/1,000 successful fetches.
+    """
+    global _DEEPSEEK_EXHAUSTED
+    key = deepseek_key(secrets, config)
+    if not key or _DEEPSEEK_EXHAUSTED or NO_WRITE:
+        return ""
+    text = str(url or "").strip()
+    if not text.lower().startswith(("http://", "https://")):
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(text)
+        if not parsed.hostname or parsed.username or parsed.password:
+            return ""
+        resp = requests.post(
+            DEEPSEEK_FETCH_API,
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json"},
+            json={"url": text[:8192]}, timeout=40)
+        if resp.status_code == 402:
+            _DEEPSEEK_EXHAUSTED = True
+            print("  [warn] DeepSeek balance exhausted (HTTP 402) - Fetch is "
+                  "disabled for the rest of this run.", file=sys.stderr)
+            return ""
+        if resp.status_code != 200:
+            print(f"  [deepseek] fetch HTTP {resp.status_code} for {text[:70]}",
+                  file=sys.stderr)
+            return ""
+        content = str((resp.json() or {}).get("content") or "")
+    except Exception as exc:
+        print(f"  [deepseek] fetch failed for {text[:70]}: {exc}", file=sys.stderr)
+        return ""
+    if content:
+        usage = deepseek_usage_today()
+        usage["fetch_count"] = usage.get("fetch_count", 0) + 1
+        try:
+            _write_json(DEEPSEEK_USAGE_FILE, usage)
+        except Exception:
+            pass
+    return content
+
+
+# ---------------------------------------------------------------------------
 # Chinese fast-news wires (the real-time "tape" - where alpha breaks first)
 # ---------------------------------------------------------------------------
 # 东财 7x24 快讯 (Eastmoney) and 新浪 7x24 (Sina): global breaking-news feeds
@@ -5768,6 +6112,32 @@ def collect_macro_items(conn, config, secrets, wire_cache, src_on,
                 item["source"] = "ExaMacro"
                 raw_items.append(item)
             set_last_fetched(conn, "MACRO", "ExaMacro", now_utc_str)
+
+    # DeepSeek Search macro query: the Chinese in-house index with an explicit
+    # date filter. It is keyword-driven (so it complements EXA's semantic
+    # recall) and costs ~$0.00075 when it returns anything, which also makes it
+    # the fallback that keeps the macro tier alive once EXA's credit is gone.
+    if deepseek_enabled(secrets, config, "deepseek_macro"):
+        last = get_last_fetched(conn, "MACRO", "DeepSeekMacro")
+        since_dt = (datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=EASTERN)
+                    if last else datetime.now(EASTERN) - timedelta(hours=initial_hours))
+        res = fetch_deepseek_search(deepseek_macro_query(since_dt), secrets, config,
+                                    since_dt=since_dt, limit=10)
+        if res is None:
+            print("  [warn] macro: DeepSeek Search failed - NOT advancing delta.")
+        else:
+            added = 0
+            for it in res:
+                if not wanted(f"{it.get('title', '')} {it.get('snippet', '')}"):
+                    continue
+                item = dict(it)
+                item["ticker"] = "MACRO"
+                item["source"] = "DeepSeekMacro"
+                raw_items.append(item)
+                added += 1
+            set_last_fetched(conn, "MACRO", "DeepSeekMacro", now_utc_str)
+            if added:
+                print(f"  [macro] DeepSeek Search added {added} candidate(s).")
     # Primary regulator sources (NFRA / CSRC / PBoC penalty announcements), via
     # the news index. These are the highest-signal items for lending and
     # insurance names - a fine is news when the regulator publishes it, not when
@@ -6207,6 +6577,22 @@ def adhoc_collect(ticker, meta, config, secrets, days=ADHOC_DEFAULT_DAYS):
             cost["tavily_searches"] += 1
             collected.extend(r)
             cost["sources"].append(f"Tavily:{len(r)}")
+
+    # --- DeepSeek Search: independent budget, so a scan still works when
+    #     Tavily's daily/monthly cap is reached. The 600-800 char `summary`
+    #     is what the scoring call reads, which is why this source is worth
+    #     having even next to Tavily. ---
+    if deepseek_enabled(secrets, config):
+        ds_name = deepseek_name(meta, zh_terms, en_terms, ticker)
+        ds_after = since.strftime("%Y-%m-%d")
+        ds_query = (f"{ds_name} 新闻 after:{ds_after} lang:zh" if zh_terms
+                    else f"{ds_name} news after:{ds_after}")[:128]
+        r = fetch_deepseek_search(ds_query, secrets, config, since, limit=12,
+                                  terms=zh_terms + en_terms)
+        if r is not None:
+            cost["deepseek_searches"] = cost.get("deepseek_searches", 0) + 1
+            collected.extend(r)
+            cost["sources"].append(f"DeepSeekSearch:{len(r)}")
 
     # --- keep only what is actually about this company ---
     resolved = resolve_relevance(meta)
@@ -7476,7 +7862,8 @@ def main():
         sys.exit(0)
 
     if "--dump-usage" in sys.argv:
-        print(json.dumps({"tavily": tavily_usage_today(), "exa": exa_usage_today()},
+        print(json.dumps({"tavily": tavily_usage_today(), "exa": exa_usage_today(),
+                          "deepseek": deepseek_usage_today()},
                          ensure_ascii=False))
         sys.exit(0)
 
@@ -7655,7 +8042,8 @@ def main():
 
     print(f"[{start_time.strftime('%Y-%m-%d %H:%M %Z')}] Checking {len(tickers)} "
           f"ticker(s) for new news (sources: SEC, GoogleNews, GoogleNewsZH, "
-          f"GoogleNewsSite, Eastmoney, Eastmoney724, Sina724, Baidu, Tavily, RSS)...")
+          f"GoogleNewsSite, Eastmoney, Eastmoney724, Sina724, Baidu, Tavily, "
+          f"DeepSeekSearch, RSS)...")
 
     # Global Chinese fast-news wires - ONE fetch per wire per run, shared by
     # all tickers (filtered per ticker by its Chinese terms inside the loop).
@@ -7824,6 +8212,31 @@ def main():
                     lambda sd: fetch_tavily(tav_query, secrets, config, sd,
                                             terms=tav_terms),
                     src_status("tavily", strict=False))
+
+        # 2.45) DeepSeek Search - the third paid source, and the cheapest by two
+        #       orders of magnitude ($0.75 / 1,000 successful searches; empty
+        #       results are free). Unlike Tavily/EXA it has its OWN Chinese
+        #       index, so for a ticker with Chinese names it runs ALWAYS
+        #       (parallel coverage), and because the budget is independent it
+        #       keeps working when either of the other two is capped.
+        if src_on("deepseek_search"):
+            ds_terms = zh_terms + en_terms
+            if not ds_terms:
+                print(f"  {ticker}: no company terms yet - skipping DeepSeek "
+                      f"Search (a search with no terms would return anything).")
+            elif not deepseek_key(secrets, config):
+                print(f"  {ticker}: no DeepSeek key - skipping DeepSeek Search "
+                      f"(use ai_provider=deepseek or add a DeepSeek key).")
+            else:
+                display = deepseek_name(meta, zh_terms, en_terms, ticker)
+                fetch_source(
+                    "DeepSeekSearch",
+                    lambda sd: fetch_deepseek_search(
+                        deepseek_ticker_query(meta, zh_terms, en_terms, ticker, sd),
+                        secrets, config, sd, limit=10, terms=ds_terms,
+                        ori_question=f"What news about {display} matters to an "
+                                     f"investor this week?"),
+                    src_status("deepseek_search", strict=False))
 
         # 2.5) Google News restricted to the company's OWN websites (site:)
         #      - catches official announcements / press releases that no news
