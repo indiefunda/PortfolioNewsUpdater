@@ -139,6 +139,9 @@ DEFAULT_CONFIG = {
         "exa_macro": True,  # EXA neural macro search (semantic, no regex)
         "deepseek_search": True,  # DeepSeek Search per ticker (cheap; Chinese index)
         "deepseek_macro": True,  # DeepSeek Search for the macro tier
+        "deepseek_corp": True,  # corporate actions, rolling 21-day window
+        "deepseek_hk": True,  # HK listing code / filings, rolling 21-day window
+        "deepseek_press": True,  # one rotating financial-paper site per day
         "regulators": True,  # NFRA/CSRC/PBoC penalty announcements (macro tier)
         "sector_regulation": True,  # industry rules searched by THEME, no company name
         "baidu": False,  # captcha-blocked from server IPs - off by default
@@ -1384,7 +1387,8 @@ function fillMetaEditor(ticker){
     'aliases_zh (comma separated): ' + show(m.aliases_zh),
     'aliases_en (comma separated): ' + show(m.aliases_en),
     'subsidiaries (comma separated): ' + show(subs),
-    'website: ' + (m.website || '')
+    'website: ' + (m.website || ''),
+    'hk_code (HK listing, e.g. 06623): ' + (m.hk_code || '')
   ].join(NL);
   const zh = (m.search_terms_zh || []).join(' / ');
   $('metaEditStatus').innerHTML =
@@ -1423,6 +1427,7 @@ function applyMetaEdit(){
     entry.subsidiaries_other = subs.filter(s => !/[\u4e00-\u9fff]/.test(s));
   }
   if (lines['website'] !== undefined) entry.website = lines['website'];
+  if (lines['hk_code'] !== undefined) entry.hk_code = lines['hk_code'].replace(/[^0-9]/g, '');
   meta[t] = entry;
   $('tickerMeta').value = JSON.stringify(meta, null, 2);
   showMsg('✅ '+t+' updated in the JSON below. Press "Upload config to server" to apply.', 'ok');

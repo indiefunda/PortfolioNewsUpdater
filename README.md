@@ -60,7 +60,7 @@ still used for the macro tier and for company discovery.)
 | Telegram bot token + chat id | **$0** | @BotFather creates the bot; @userinfobot gives your chat id |
 | Tavily API key | **$0** | tavily.com free plan = 1,000 searches/month (the app budgets itself: max 30/day, 900/month) |
 | EXA AI key | **$0** | exa.ai free plan ≈ 1,000 semantic searches/month (the app budgets itself: max 32/day, 980/month) |
-| DeepSeek Search | **≈$0.30/month** | No extra key: it uses your DeepSeek AI key. $0.75 per 1,000 **successful** searches; empty results are free. Budgeted at 100/day, 2,000/month in the panel |
+| DeepSeek Search | **≈$0.30–0.80/month** | No extra key: it uses your DeepSeek AI key. $0.75 per 1,000 **successful** searches; empty results are free. Budgeted at 100/day, 2,000/month in the panel. Fan-out: news + corporate actions + HK code + one rotating paper |
 | AI key — **DeepSeek (only paid item) OR Gemini free tier** | **$0–$2** | DeepSeek: platform.deepseek.com (tiny top-up, lasts months). **Gemini: aistudio.google.com/apikey → free tier is enough.** Pick it in the panel — AI provider → Gemini. *(Gemini users: the Search source needs a DeepSeek key too; paste one in the panel's "DeepSeek Search key" field or leave it off.)* |
 
 ---
@@ -116,9 +116,10 @@ Full details, troubleshooting and all knobs: **GUIDE-NEWS.md**.
 
 - **VM / network / storage: $0** (Google Cloud Always-Free e2-micro).
 - **Tavily: $0** — free plan, hard-budgeted by the app (meter in the panel).
-- **DeepSeek Search: ≈$0.30/month** — 100/day and 2,000/month caps, and a
-  search that returns no results is **free**. It runs in parallel (one query per
-  ticker + one macro query) and keeps working when Tavily/EXA are capped.
+- **DeepSeek Search: ≈$0.30–0.80/month** — 100/day and 2,000/month caps, and a
+  search that returns no results is **free**. It runs a small fan-out per
+  ticker (news, corporate actions, HK code, one rotating paper), plus one macro
+  query, so it keeps working when Tavily/EXA are capped.
 - **AI: $0 with Gemini free tier**, or ~$1–2/year with DeepSeek (the app
   makes ~1 AI call per ticker per run and caches everything in the DB).
 - **Telegram: $0.**

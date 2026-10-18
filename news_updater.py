@@ -194,6 +194,19 @@ DEEPSEEK_USAGE_FILE = os.path.join(BASE_DIR, "deepseek_usage.json")
 # six-stock portfolio. Raise it in the panel if you hold more names.
 DEEPSEEK_MAX_DAILY_SEARCHES = 100
 DEEPSEEK_MAX_MONTHLY_SEARCHES = 2000
+# Corporate actions and HK filings are ANNOUNCED ONCE and then only covered for
+# a day or two. A 24h delta misses them (the LU 1-for-10 reverse split was
+# announced on 30 Sep and was still invisible on 18 Oct). These sources
+# therefore always look back three weeks; the seen/story ledger stops repeats.
+DEEPSEEK_CORP_DAYS = 21
+# Press follow-ups arrive a day or two after the event, so the rotating site
+# query looks back a week rather than at the last-fetch delta.
+DEEPSEEK_PRESS_DAYS = 7
+# One press outlet per run, rotating daily. A multi-site OR query returned
+# almost nothing when combined with before:/lang:, while a single site with
+# after: returns the paper's own articles (measured on 证券时报).
+DEEPSEEK_PRESS_SITES = ("stcn.com", "cls.cn", "yicai.com", "21jingji.com",
+                        "cnstock.com")
 # Account-level QPS is 5 (shared by Search and Fetch), and our calls are
 # sequential, so no throttling is needed. A 402 means the balance is empty:
 # stop calling for the rest of the run instead of retrying every ticker.
@@ -4986,6 +4999,61 @@ def deepseek_discovery_query(name_hint, name_en, ticker, overseas=False):
     return f"{name_en or ticker} subsidiaries brands business"[:128]
 
 
+def _date_from_url(url):
+    """
+    Pull a filing date out of a URL.
+
+    HKEXnews document URLs carry it (`/2026/0727/2026072700039.pdf`) and so do
+    Stockstar announcement ids (`AN2026101600036209`). The API often returns
+    `date: null` for PDFs, and without a date the freshness gate would drop
+    them.
+    """
+    text = str(url or "")
+    m = re.search(r"/(20\d{2})/(\d{2})(\d{2})/", text)
+    if not m:
+        # Stockstar: AN2026101600036209 (date + sequence, no separator).
+        m = re.search(r"AN(20\d{2})(\d{2})(\d{2})", text)
+    if not m:
+        m = re.search(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)", text)
+    if m and 1 <= int(m.group(2)) <= 12 and 1 <= int(m.group(3)) <= 31:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return ""
+
+
+def deepseek_hk_code(meta):
+    """The HK listing code (e.g. 06623 for Lufax), when the profile has one."""
+    code = re.sub(r"\D", "", str((meta or {}).get("hk_code") or ""))
+    return code[:5]
+
+
+def deepseek_corp_query(name, since_dt):
+    """
+    Corporate-action vocabulary.
+
+    `合股`/`并股`/`拆股`/`ADS 比例变更` are the words that find a reverse
+    split, a merger or an ADS-ratio change; none of them appear in a generic
+    "<company> 新闻" query. Measured: this exact query found the 陆金所
+    1-for-10 reverse-split coverage the daily run had missed.
+    """
+    return (f"{name} 合股 并股 拆股 ADS比例变更 "
+            f"after:{_deepseek_after(since_dt)}")[:128]
+
+
+def deepseek_hk_query(code, name, since_dt):
+    return f"{code} {name} after:{_deepseek_after(since_dt)}"[:128]
+
+
+def deepseek_press_query(name, site, since_dt):
+    # No lang:/before: here: a single site: plus after: is what worked.
+    return f"{name} site:{site} after:{_deepseek_after(since_dt)}"[:128]
+
+
+def deepseek_press_site(now=None):
+    """Rotate the press outlet by day so every paper gets a turn."""
+    now = now or datetime.now(EASTERN)
+    return DEEPSEEK_PRESS_SITES[now.timetuple().tm_yday % len(DEEPSEEK_PRESS_SITES)]
+
+
 def fetch_deepseek_search(query, secrets, config, since_dt=None, limit=10,
                           terms=None, lang=None, ori_question=None,
                           require_date=None):
@@ -5084,7 +5152,7 @@ def fetch_deepseek_search(query, secrets, config, since_dt=None, limit=10,
             continue
         if terms and not tavily_term_match(title, terms, stems):
             continue
-        date = str(r.get("date") or "")
+        date = str(r.get("date") or "") or _date_from_url(url)
         pub_dt = _parse_pub(date)
         if since_dt is not None:
             if require_date and pub_dt is None:
@@ -7800,6 +7868,7 @@ def main():
                     "subsidiaries_other": list(meta.get("subsidiaries_other") or []),
                     "keywords": list(meta.get("keywords") or []),
                     "website": meta.get("website") or "",
+                    "hk_code": meta.get("hk_code") or "",
                     # The terms actually used for searching, in ranked order.
                     "search_terms_zh": build_zh_terms(meta),
                     "search_terms_en": build_en_terms(meta),
@@ -8110,11 +8179,19 @@ def main():
             """
             return {"status": "strict" if strict else "warn", "note": note}
 
-        def fetch_source(source, fetch_fn, status):
-            """Fetch one source and fold it through the shared ingest gate."""
+        def fetch_source(source, fetch_fn, status, since_override=None):
+            """
+            Fetch one source and fold it through the shared ingest gate.
+
+            `since_override` is for the rolling-window sources (corporate
+            actions, HK filings): they deliberately look back three weeks on
+            every run instead of at the last-fetch delta, because an
+            announcement is made ONCE and is not re-published.
+            """
             last = get_last_fetched(conn, ticker, source)
-            since_dt = (datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=EASTERN)
-                        if last else datetime.now(EASTERN) - timedelta(hours=initial_hours))
+            since_dt = since_override or (
+                datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=EASTERN)
+                if last else datetime.now(EASTERN) - timedelta(hours=initial_hours))
             items = fetch_fn(since_dt)
             if items is None:
                 print(f"  [warn] {ticker} {source} fetch failed - NOT advancing "
@@ -8227,12 +8304,13 @@ def main():
         #       index, so for a ticker with Chinese names it runs ALWAYS
         #       (parallel coverage), and because the budget is independent it
         #       keeps working when either of the other two is capped.
+        ds_terms = zh_terms + en_terms
+        ds_ok = bool(deepseek_key(secrets, config))
         if src_on("deepseek_search"):
-            ds_terms = zh_terms + en_terms
             if not ds_terms:
                 print(f"  {ticker}: no company terms yet - skipping DeepSeek "
                       f"Search (a search with no terms would return anything).")
-            elif not deepseek_key(secrets, config):
+            elif not ds_ok:
                 print(f"  {ticker}: no DeepSeek key - skipping DeepSeek Search "
                       f"(use ai_provider=deepseek or add a DeepSeek key).")
             else:
@@ -8245,6 +8323,55 @@ def main():
                         ori_question=f"What news about {display} matters to an "
                                      f"investor this week?"),
                     src_status("deepseek_search", strict=False))
+
+        # 2.46) Corporate actions - a rolling 3-week window, because an
+        #       announcement is made ONCE. The 1-for-10 reverse split at LU was
+        #       announced on 30 Sep and the daily delta never saw it; the
+        #       `合股 并股 拆股 ADS比例变更` query finds it immediately. Repeat
+        #       coverage is stopped downstream by the seen/story ledger.
+        if src_on("deepseek_corp") and ds_ok and zh_terms:
+            display = deepseek_name(meta, zh_terms, en_terms, ticker)
+            fetch_source(
+                "DeepSeekCorp",
+                lambda sd: fetch_deepseek_search(
+                    deepseek_corp_query(display, sd), secrets, config, sd,
+                    limit=10, terms=ds_terms,
+                    ori_question=f"Any corporate action for {display}: reverse "
+                                 f"split, ADS ratio, buyback, delisting?"),
+                src_status("deepseek_corp", strict=False),
+                since_override=datetime.now(EASTERN)
+                - timedelta(days=DEEPSEEK_CORP_DAYS))
+
+        # 2.47) HK listing code / filings - same rolling window. A Chinese ADR
+        #       that is also HK-listed (LU 06623, QFIN 03660) publishes
+        #       announcements there first, and Chinese portals summarise them
+        #       within hours. `hk_code` lives in ticker_meta.
+        hk_code = deepseek_hk_code(meta)
+        if src_on("deepseek_hk") and ds_ok and hk_code and zh_terms:
+            display = deepseek_name(meta, zh_terms, en_terms, ticker)
+            fetch_source(
+                "DeepSeekHK",
+                lambda sd: fetch_deepseek_search(
+                    deepseek_hk_query(hk_code, display, sd), secrets, config, sd,
+                    limit=10, terms=ds_terms),
+                src_status("deepseek_hk", strict=False),
+                since_override=datetime.now(EASTERN)
+                - timedelta(days=DEEPSEEK_CORP_DAYS))
+
+        # 2.48) One financial-paper site per day (rotation). A single site:
+        #       clause plus after: works; a multi-site OR group with before:
+        #       and lang: returned almost nothing.
+        if src_on("deepseek_press") and ds_ok and zh_terms:
+            display = deepseek_name(meta, zh_terms, en_terms, ticker)
+            site = deepseek_press_site()
+            fetch_source(
+                "DeepSeekPress",
+                lambda sd: fetch_deepseek_search(
+                    deepseek_press_query(display, site, sd), secrets, config, sd,
+                    limit=8, terms=ds_terms),
+                src_status("deepseek_press", strict=False),
+                since_override=datetime.now(EASTERN)
+                - timedelta(days=DEEPSEEK_PRESS_DAYS))
 
         # 2.5) Google News restricted to the company's OWN websites (site:)
         #      - catches official announcements / press releases that no news

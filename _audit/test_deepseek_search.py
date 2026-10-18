@@ -116,6 +116,38 @@ check("queries stay within the 128-char API limit",
       all(len(q) <= 128 for q in (zh, en, macro, disc, disc_en)))
 
 print()
+print("=== corporate actions, HK code, press rotation, URL dates ===")
+corp = nu.deepseek_corp_query("陆金所", since)
+press = nu.deepseek_press_query("陆金所", "stcn.com", since)
+hk = nu.deepseek_hk_query("06623", "陆金所", since)
+check("corporate query carries 合股/并股 and a date",
+      "合股" in corp and "并股" in corp and "after:" in corp, corp)
+check("press query is single-site + dated",
+      "site:stcn.com" in press and "after:" in press, press)
+check("HK query carries the listing code",
+      hk.startswith("06623 陆金所") and "after:" in hk, hk)
+check("HK code is digits only",
+      nu.deepseek_hk_code({"hk_code": "06623.HK"}) == "06623",
+      nu.deepseek_hk_code({"hk_code": "06623.HK"}))
+check("HK codes pad/truncate to five digits",
+      nu.deepseek_hk_code({"hk_code": "3660"}) == "3660" and
+      nu.deepseek_hk_code({"hk_code": "0003660"}) == "00036",
+      nu.deepseek_hk_code({"hk_code": "0003660"}))
+check("HKEX PDF URL yields its filing date",
+      nu._date_from_url("https://www1.hkexnews.hk/listedco/listconews/sehk/"
+                        "2026/0727/2026072700039.pdf") == "2026-07-27",
+      nu._date_from_url("https://www1.hkexnews.hk/listedco/listconews/sehk/"
+                        "2026/0727/2026072700039.pdf"))
+check("Stockstar announcement id yields a date",
+      nu._date_from_url("https://stock.stockstar.com/AN2026101600036209.shtml")
+      == "2026-10-16",
+      nu._date_from_url("https://stock.stockstar.com/AN2026101600036209.shtml"))
+check("press site rotates by day",
+      nu.deepseek_press_site(datetime(2026, 10, 18, tzinfo=nu.EASTERN))
+      in nu.DEEPSEEK_PRESS_SITES)
+check("no date in a URL -> empty string", nu._date_from_url("https://x/y") == "")
+
+print()
 print("=== response mapping, delta, junk and term filter ===")
 _next[:] = [Resp(200, {"results": [
     {"title": "乐信发布Q3财报", "url": "https://finance.example.com/lx-q3",
@@ -221,9 +253,28 @@ check("fetch recorded", nu.deepseek_usage_today().get("fetch_count") == 1)
 check("non-http URL refused", nu.fetch_deepseek_page("ftp://x/y", SEC, CFG) == "")
 
 print()
+print("=== mapping falls back to the URL date (HK PDFs / filings) ===")
+nu._DEEPSEEK_EXHAUSTED = False
+_next[:] = [Resp(200, {"results": [
+    {"title": "陆金所控股LUFAX", "url": "https://www1.hkexnews.hk/listedco/"
+     "listconews/sehk/2026/1016/2026101600001.pdf", "date": None,
+     "summary": "公告"},
+]})]
+hk_items = nu.fetch_deepseek_search("06623 陆金所 after:2026-09-27", SEC, CFG,
+                                    since_dt=datetime.now(nu.EASTERN)
+                                    - timedelta(days=21), terms=["陆金所"])
+check("undated HK PDF kept when the URL carries the date", len(hk_items) == 1,
+      len(hk_items))
+check("the URL date is used", hk_items and hk_items[0]["date"] == "2026-10-16",
+      hk_items and hk_items[0]["date"])
+
+print()
 print("=== wiring ===")
 src = open(os.path.join(ROOT, "news_updater.py"), encoding="utf-8").read()
 check("daily loop calls DeepSeekSearch", '"DeepSeekSearch"' in src)
+check("corporate-action source is wired", '"DeepSeekCorp"' in src)
+check("HK source is wired", '"DeepSeekHK"' in src)
+check("press source is wired", '"DeepSeekPress"' in src)
 check("macro tier calls DeepSeekMacro", '"DeepSeekMacro"' in src)
 check("ad-hoc scan records deepseek_searches",
       'cost["deepseek_searches"]' in src)
@@ -240,6 +291,10 @@ check("example config carries the budget keys",
       "deepseek_max_monthly_searches" in example)
 check("example config enables the macro query",
       example.get("sources", {}).get("deepseek_macro") is True)
+check("example config enables corp/hk/press",
+      example.get("sources", {}).get("deepseek_corp") is True and
+      example.get("sources", {}).get("deepseek_hk") is True and
+      example.get("sources", {}).get("deepseek_press") is True)
 
 shutil.rmtree(TMP, ignore_errors=True)
 print()

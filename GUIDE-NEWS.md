@@ -659,14 +659,26 @@ paid source by two orders of magnitude:
   only billable calls, not attempts.
 - **Caps:** `deepseek_max_daily_searches` (default **100**) and
   `deepseek_max_monthly_searches` (default **2,000**) — at worst ~$1.50/month,
-  in practice ~$0.30. The panel shows the live meter (DeepSeek: n/100 today…).
-- **Where it runs:** one query per ticker per run (parallel with Tavily/EXA,
-  not only as a fallback), one macro query, one per deep search, and up to two
-  in discovery.
-- **Query shapes:** Chinese tickers use `<name> 新闻 after:<date> lang:zh`
-  (the `lang:`/`after:` operators are what keep it on-topic and fresh);
-  English tickers use the derived short name (`Toyota news after:…`, **not**
-  `AAPL stock`, which returned quote pages).
+  in practice ~$0.30–0.80 depending on the fan-out. The panel shows the live
+  meter (DeepSeek: n/100 today…).
+- **Where it runs:** a fan-out per ticker, all on the same cheap budget:
+  1. **baseline** — `<name> 新闻 after:<date> lang:zh` (fresh news);
+  2. **corporate actions** — `合股 并股 拆股 ADS比例变更` over a **rolling
+     21-day window**. Announcements are made once, so a 24 h delta never sees
+     them; this is what found the LU 1-for-10 reverse split;
+  3. **HK listing code** — `<code> <name>` over the same 21-day window when
+     `ticker_meta` has an `hk_code` (LU `06623`, QFIN `03660`). HKEX
+     announcements and the Chinese portals' summaries are indexed there;
+  4. **rotating press site** — one of 证券时报/财联社/第一财经/21世纪经济报道/
+     中国证券报 per day, over the last 7 days (`site:` + `after:` works;
+     a multi-site OR with `before:`/`lang:` returned almost nothing).
+  Plus one macro query and up to two discovery queries.
+- **Aliases matter:** the HK press writes 陆控, not 陆金所 — that alias is in
+  `ticker_meta` and is what lets those summaries through the relevance gate.
+- **Query shapes:** Chinese tickers use the Chinese name; English tickers use
+  the derived short name (`Toyota news after:…`, **not** `AAPL stock`, which
+  returned quote pages). Ticker-only queries are avoided: `LX` matched LXEH
+  (丽翔教育) and `YB` matched CNFinance.
 - **Why parallel:** it has its own Chinese index, so it adds outlets and
   official-site pages the other sources miss. It also has its **own budget**, so
   when Tavily or EXA is capped it keeps working instead of the pipeline going
