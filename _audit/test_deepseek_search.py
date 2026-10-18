@@ -170,10 +170,14 @@ print()
 print("=== Chinese quote/profile pages are junk ===")
 for title in ("乐信(LX)_个股概览_股票价格_实时行情_走势图_新闻资讯",
               "乐信(NASDAQ:LX)-公司资料-美股-搜狐",
-              "乐信(LX)财报_财务概况_股票财务指标分析"):
+              "乐信(LX)财报_财务概况_股票财务指标分析",
+              "元保 (YB)",
+              "元保_F10"):
     check(f"junk: {title[:34]}", nu.is_junk_content(title), title)
 check("a real Chinese headline survives",
       not nu.is_junk_content("乐信发布Q3财报：营收同比增长12%"))
+check("a real headline with a ticker in parentheses survives",
+      not nu.is_junk_content("乐信(LX)宣布3亿美元回购计划"))
 
 print()
 print("=== caps and fail-closed paths ===")

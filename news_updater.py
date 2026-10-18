@@ -423,6 +423,10 @@ JUNK_CONTENT_PATTERNS = (
     # "乐信(NASDAQ:LX)-公司资料-美股-搜狐", "...-财务概况-英为财情".
     r"个股概览", r"实时行情", r"走势图", r"行情走势", r"公司资料",
     r"公司概况", r"财务概况",
+    # A bare "Company (TICKER)" title and an F10 fact sheet are quote pages,
+    # not news. DeepSeek's index returns both for a quiet name (measured:
+    # "元保 (YB)" and "元保_F10"), and they were being stored at importance 2.
+    r"^\S+\s*\([a-z0-9.\-]{1,6}\)\s*$", r"(?<![a-z0-9])f10(?![a-z0-9])",
     r"reaches? new (?:1|one)-year (?:low|high)",
     r"sets new (?:12|twelve)-month (?:low|high)",
     r"stock (?:holds|holding) (?:ground|steady)",
