@@ -48,6 +48,7 @@ OFFLINE = [
     ("py", "test_deepseek_search.py", []),
     ("py", "test_guba.py", []),
     ("py", "test_stale_period.py", []),
+    ("py", "test_primary_event.py", []),
     ("py", "test_crash_record.py", []),
     ("py", "test_purge_duplicates.py", []),
     ("py", "test_hosted_build.py", []),

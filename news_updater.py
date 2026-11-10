@@ -8048,7 +8048,25 @@ def select_push_items(enriched, config, conn=None, now=None):
               f"({min_score}) only applies in 'score' mode.")
     candidates = []
     for it in unique:
-        if not it.get("push", True):
+        # Primary-source events are never vetoed by the model. Measured
+        # 2026-11-09, the AI had stored and then suppressed ALL of these:
+        #   QFIN  "奇富科技：高盛持股1260.38万股，占比5.2%"   (a SC 13G)
+        #   QFIN  "Qfin Holdings - SCHEDULE 13G filed 2026-11-09"
+        #   YB    three Form 4s (VP, Director, COO)
+        #   LU    a 6-K filed 2026-11-09
+        # Its reason was "does not change company fundamentals" - which is the
+        # wrong test for a $300M company, where a 5% holder, an insider filing
+        # or a 6-K IS the news. Ownership and filing events are facts, not
+        # opinions, so the model does not get to veto them.
+        # The model may not both score an item 6+ AND veto it. A high
+        # importance with push=false is self-contradictory, and in practice the
+        # veto was killing exactly the substantive Chinese analysis a holder
+        # wants: "陆控：消金业务提速但亏损未止，修复尚需等待盈利拐点" (6),
+        # "陆金所控股续约关联担保 复牌后不确定性折价逐步回补" (6). Below 6 the
+        # veto still stands, which is where the PR and listicle items sit.
+        importance = it.get("importance") or 0
+        if (not it.get("push", True) and not is_primary_event(it)
+                and importance < VETO_MAX_IMPORTANCE):
             it["_vetoed"] = True
             continue
         if (it.get("importance") or 0) < thresh:
@@ -8093,6 +8111,37 @@ def select_push_items(enriched, config, conn=None, now=None):
         if id(it) not in seated:
             it["_no_seat"] = True
     return pushed
+
+
+def is_primary_event(item):
+    """
+    Is this a primary-source corporate fact rather than a write-up about one?
+
+    Ownership filings (SC 13G/13D, Form 4), periodic reports (6-K, 8-K, 20-F),
+    buybacks/dividends and regulatory actions are FACTS about the company. For a
+    microcap they are frequently the only hard news in a month, so the model's
+    "won't move the stock" veto must not apply to them (see the push selection:
+    measured 2026-11-09, a Goldman 5.2% stake, three Form 4s and a 6-K were all
+    stored and suppressed).
+
+    Monthly share-movement returns (月报表) are deliberately NOT included: they
+    are routine paperwork with no information content for a holder.
+    """
+    title = str((item or {}).get("title") or "")
+    if str((item or {}).get("source") or "") == "SEC":
+        return True
+    return bool(PRIMARY_EVENT_RE.search(title))
+
+
+PRIMARY_EVENT_RE = re.compile(
+    r"(?:\bSC\s+13[GD]\b|\b13[GD]\b|\bSCHEDULE\s+13|\bForm\s+[34]\b|\b[68]-K\b|"
+    r"\b20-F\b|\b10-Q\b|insider\b|持股|权益变动|增持|减持|回购|"
+    r"处罚|罚单|罚款|被罚|行政处罚|立案|退市|私有化|停牌|复牌)", re.I)
+
+# Above this importance the model's own push=false is ignored: it may not say
+# "this matters 6/10" and "do not send it" in the same breath. Below it, the
+# veto stands (PR, listicles, generic commentary).
+VETO_MAX_IMPORTANCE = 6
 
 
 def push_decision_counts(enriched):
