@@ -4,13 +4,17 @@
 anonymous reads. The second check is the important one - an auth-gated page over
 an open database is the exact failure mode this whole design avoids."""
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 PROJECT = "keen-wavelet-275120"
-SITE = f"https://{PROJECT}.web.app"
+# The page is served from its own hosting site (a meaningful name), while the
+# project id stays the anonymous technical one. Override for a custom domain:
+#   SITE_URL=https://your.domain python _audit/verify_deployed_site.py
+SITE = os.environ.get("SITE_URL", "https://stock-newsupdater.web.app")
 DOCS = f"https://firestore.googleapis.com/v1/projects/{PROJECT}/databases/(default)/documents"
 
 fail = 0

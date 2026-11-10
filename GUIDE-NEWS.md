@@ -262,9 +262,15 @@ Checklist for a swap:
    tidy-up rather than a correctness requirement.
 5. **Smoke-test one new ticker with 🔎 Deep search** — a ticker you know is in
    the news. Zero or one article means the profile/matching needs an alias.
-6. Old archives linger for the retention window (~21 days) and are labelled
-   "(old)" on the hosted page; the repeat/event ledgers for removed tickers are
-   ignored from the next run on.
+6. **Removing a holding also removes its news.** The next run prunes every
+   table for tickers no longer in `tickers` (`news`, `staging`, `seen`,
+   `last_fetched`, `pushed_stories`) plus its `company_lookup.json` entry, so a
+   dropped stock cannot linger on the hosted page for the 21-day retention —
+   that used to happen (a removed HUIZ kept showing up). To do it without
+   waiting: `python3 news_updater.py --purge-unconfigured` (add `--dry-run` to
+   preview), then run the web sync. The page and the sync also filter such rows
+   immediately, so the hosted view is correct even before the next run.
+   `MACRO` / `GLOBAL` are tiers, not holdings, and are always kept.
 
 ## One-time setup
 
@@ -552,6 +558,18 @@ python3 news_updater.py --translate=LX         # only one ticker
   pushed, even in "push everything" mode — kills ⭐1–3 noise.
 - **AI veto**: the AI's per-item `push` flag is honored — it can keep an item
   stored-only.
+- **Quiet-run heartbeat** (`heartbeat_after_quiet_runs`, default 2;
+  `heartbeat_reminder_every`, default 4): a run that delivers nothing is
+  indistinguishable from a run that never happened — both are silence on your
+  phone. After this many consecutive silent **scheduled** runs the updater sends
+  one short plain-text line to Telegram: how many quiet runs in a row, what it
+  checked this time, when you last got a digest, and whether the sources
+  answered. It is status only — no news row is marked pushed and the push
+  ledger is untouched. Deploying it mid-stretch fires on the next run; after
+  that it reminds you every 4 quiet runs, so a genuinely dead pipeline cannot
+  hide behind "it's just quiet". `0` switches it off. Manual runs never send it
+  (their output is on screen), and a run recorded as `error`/`interrupted` ends
+  the streak instead of being counted as quiet.
 - **Per-ticker cap** (`push_max_per_ticker`, default 2): seats are allocated
   round-robin per ticker, so one ticker can't eat every digest slot while
   another name has news.
@@ -581,7 +599,7 @@ reference to a local panel step. It is set in the panel's **Configuration** tab
 (under the push settings) or directly in `config_local.json`:
 
 ```json
-"web_url": "https://keen-wavelet-275120.web.app"
+"web_url": "https://stock-newsupdater.web.app"
 ```
 
 ### Finding the link again (three easy ways)
@@ -717,6 +735,8 @@ python3 news_updater.py --dry-run --purge-junk-domains  # ... list them, delete 
 python3 news_updater.py --purge-duplicates     # delete same-story duplicates (keeps the best copy)
 python3 news_updater.py --dry-run --purge-duplicates   # ... list them, delete nothing
 python3 news_updater.py --purge-duplicates=LX  # ... only for LX
+python3 news_updater.py --purge-unconfigured   # delete news for tickers no longer in the watchlist
+python3 news_updater.py --dry-run --purge-unconfigured  # ... list them, delete nothing
 python3 news_updater.py --purge-macro-noise-dry  # show macro chatter that would go
 python3 news_updater.py --purge-macro-noise      # delete it (never touches pushed rows)
 python3 news_updater.py --translate            # fill in English titles for stored rows
@@ -772,7 +792,7 @@ those jobs running.
 | "Schedule not installed" | Click **Upload config to server**, then **Check schedule**. |
 | An OLD story (weeks/months old) appeared in the digest | Fixed by the freshness gates: every EXA result is now date-verified against the per-source delta window, and ANY item whose publish time is older than `max_news_age_hours` (default **96h**, set in `config_local.json`; 0 disables) is dropped at ingestion no matter which source returned it. The digest also shows each item's 📅 publish date so anything stale is visible at a glance. |
 | New stock added but no Chinese news appears | Check Step 6 (Company lookup) after the next run — the updater auto-discovers the company's Chinese names/subsidiaries and searches them. You can also add them manually in the Step 3 JSON (overrides always win). |
-| No digest arrives | Click **Run now (test)** and read the output. Check Telegram + AI keys. With **no AI key** the run deliberately stores items and pushes nothing (fail closed); an AI outage behaves the same way. |
+| No digest arrives | Click **Run now (test)** and read the output. Check Telegram + AI keys. With **no AI key** the run deliberately stores items and pushes nothing (fail closed); an AI outage behaves the same way. Remember that a quiet day is also silent: after `heartbeat_after_quiet_runs` (default 2) consecutive scheduled runs with nothing to send you get a **quiet-run heartbeat** on Telegram confirming the bot is alive. |
 | Hosted page says **"This account is not on the access list"** | Add that Google email under **Configuration → Hosted page access**, upload, then run `news_web.py --sync-firebase` on the VM. The page prints the signed-in address so you can copy it. Rules only need re-deploying if you changed `firestore.rules` itself. |
 | Tavily not used | Add your Tavily key (free tier) in the panel and re-upload; the run log shows `Tavily daily/monthly cap reached` or `skipping Tavily (saving credits)` when it's budget-skipped. |
 | DeepSeek Search stops / says **402** | The DeepSeek account balance is empty. Top up at platform.deepseek.com; the source disables itself for that run and resumes next time. (A search with no results is free, so an empty meter is not a spend problem.) |

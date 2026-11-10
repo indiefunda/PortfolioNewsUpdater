@@ -111,8 +111,7 @@ check("anchor becomes a bare URL", ZH_URL in plain)
 check("label is kept", "📄 finance.sina.com.cn" in plain)
 check("no HTML tags remain", "<a href" not in plain and "</a>" not in plain)
 check("entities are decoded back", "&amp;" not in plain)
-check("the web link survives too", "https://keen-wavelet-275120.web.app" not in plain
-      or True)  # web_url is empty in this message
+check("no web link when web_url is empty", "Read them all" not in plain)
 
 with_web = nu.format_digest([en], 1, stored_count=7, web_url="https://x.web.app/")
 check("web link present in HTML", '<a href="https://x.web.app">' in with_web)

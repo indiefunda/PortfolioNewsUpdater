@@ -71,6 +71,13 @@ DEFAULT_CONFIG = {
     "push_min_score": 7,
     "push_min_importance": 4,
     "push_max_per_ticker": 2,
+    # Quiet-run heartbeat: a run that delivers nothing is indistinguishable from
+    # a run that never happened, so after this many consecutive silent scheduled
+    # runs a short "still alive, just quiet" line goes to Telegram. 0 disables.
+    # `heartbeat_reminder_every` spaces the reminders during a long quiet stretch.
+    # No panel input (hand-edit config_local.json); see GUIDE-NEWS.md.
+    "heartbeat_after_quiet_runs": 2,
+    "heartbeat_reminder_every": 4,
     # The read-only web view of the archive (see SETUP-WEB.md). When set, the
     # digest's "N more stored, not pushed" line links here instead of dead-ending,
     # and it is the URL you open on your phone. Empty = no link, plain count.

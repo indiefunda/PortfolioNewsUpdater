@@ -1,5 +1,6 @@
 {
   "hosting": {
+    "site": "stock-newsupdater",
     "public": "web_public",
     "ignore": [
       "firebase.json",

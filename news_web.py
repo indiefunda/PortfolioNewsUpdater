@@ -118,6 +118,41 @@ def configured_tickers(db_path=None):
     return out
 
 
+# Stored rows under these pseudo-tickers are tiers, not holdings, so they stay
+# whatever the watchlist is. Kept in sync with news_updater.PSEUDO_TICKERS.
+PSEUDO_TICKERS = ("MACRO", "GLOBAL")
+
+
+def ticker_is_current(ticker, configured):
+    """
+    True when a stored row belongs to a ticker still in the watchlist.
+
+    The hosted page mirrors the database, so a holding removed from the config
+    used to keep appearing there until its rows aged out of the 21-day retention
+    (HUIZ was the live case). The updater prunes those rows on its next run; this
+    filter means the page and the sync are correct immediately, even before that.
+    '<TICKER>~SECTOR' rows follow their base ticker.
+    """
+    t = str(ticker or "").strip().upper()
+    if not t:
+        return False
+    if t in PSEUDO_TICKERS:
+        return True
+    base = t.split("~", 1)[0]
+    for x in (configured or []):
+        if str(x).strip().upper() == base:
+            return True
+    return False
+
+
+def current_items(items, configured):
+    """Drop rows for tickers that left the watchlist (see ticker_is_current)."""
+    wanted = [t for t in (configured or []) if str(t).strip()]
+    if not wanted:
+        return list(items)
+    return [i for i in items if ticker_is_current(i.get("ticker"), wanted)]
+
+
 def allowed_emails(db_path=None):
     """Google accounts allowed to read the hosted page (lowercased).
 
@@ -455,11 +490,23 @@ window.__glSetData = function(data){
       .filter(function(t, idx, arr){ return t && arr.indexOf(t) === idx; })
       .sort();
   }
+  // "Old" means ONE thing: a holding that left the watchlist. MACRO and GLOBAL
+  // are TIERS - they exist whatever the portfolio is - and '<TICKER>~SECTOR'
+  // rows belong to their base ticker. Labelling the China-macro section "(old)"
+  // because it is not a stock made no sense.
+  function isTierTicker(t){
+    var base = String(t || '').split('~')[0];
+    return base === 'MACRO' || base === 'GLOBAL';
+  }
+  function isOldHolding(t){
+    if (!configured.length || isTierTicker(t)) return false;
+    return configured.indexOf(String(t || '').split('~')[0]) === -1;
+  }
   tickers.forEach(function(t){
     if (have[t]) return;
     var o = document.createElement('option');
     o.value = t;
-    o.textContent = (configured.length && configured.indexOf(t) === -1) ? (t + ' (old)') : t;
+    o.textContent = isOldHolding(t) ? (t + ' (old)') : t;
     sel.appendChild(o);
   });
 
@@ -580,7 +627,9 @@ def export(db_path, out_dir, embed=False, hosted=False, firebase_config=None):
     if not os.path.exists(db_path):
         raise SystemExit(f"database not found: {db_path}")
     items = read_items(db_path)
-    payload = build_payload(items, configured_tickers(db_path))
+    configured = configured_tickers(db_path)
+    items = current_items(items, configured)
+    payload = build_payload(items, configured)
     os.makedirs(out_dir, exist_ok=True)
 
     head = ""
@@ -708,7 +757,10 @@ def _fs_list_news_ids(project, token):
 
 def sync_firestore(db_path, project, dry_run=False, reconcile=False):
     """Mirror news.db into Firestore. Returns (written, deleted, unchanged)."""
-    items = read_items(db_path)
+    # Rows for holdings that left the watchlist are dropped here as well as in
+    # the URL-level filter: the sync must DELETE their documents from Firestore,
+    # which it derives from "ids that vanished from the payload".
+    items = current_items(read_items(db_path), configured_tickers(db_path))
     manifest_file = _manifest_path(db_path)
     try:
         with open(manifest_file, encoding="utf-8-sig") as fh:

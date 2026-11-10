@@ -4,7 +4,7 @@
 const http = require('http');
 
 const PORT = 9333;
-const URL_TO_TEST = process.argv[2] || 'https://keen-wavelet-275120.web.app';
+const URL_TO_TEST = process.argv[2] || 'https://stock-newsupdater.web.app';
 const WAIT_MS = parseInt(process.argv[3] || '15000', 10);
 
 function targets() {

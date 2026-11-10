@@ -283,8 +283,13 @@ _next[:] = [Resp(200, {"results": [
      "summary": "公告"},
 ]})]
 hk_items = nu.fetch_deepseek_search("06623 陆金所 after:2026-09-27", SEC, CFG,
-                                    since_dt=datetime.now(nu.EASTERN)
-                                    - timedelta(days=21), terms=["陆金所"])
+                                    # A FIXED window. This used to be
+                                    # `now - 21 days`, which made the test pass
+                                    # only until the wall clock drifted past the
+                                    # fixture's 16 Oct date - it started failing
+                                    # on 2026-11-10 for no code reason at all.
+                                    since_dt=datetime(2026, 10, 1, tzinfo=nu.EASTERN),
+                                    terms=["陆金所"])
 check("undated HK PDF kept when the URL carries the date", len(hk_items) == 1,
       len(hk_items))
 check("the URL date is used", hk_items and hk_items[0]["date"] == "2026-10-16",

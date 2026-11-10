@@ -229,6 +229,34 @@ firebase deploy --only firestore:rules,hosting
 use â€” no `firebase init` and no `firebase use` needed. The command prints your
 Hosting URL when it finishes.
 
+### Step 7b - Give it a meaningful name (optional)
+
+The default URL is `https://<project-id>.web.app`, and a project id like
+`keen-wavelet-275120` says nothing about what the page is. You do NOT need a new
+project or a paid domain to fix that: a Firebase project can host extra
+**sites**, each with its own `<name>.web.app` address, all reading the same
+Firestore.
+
+```bash
+firebase hosting:sites:create stock-newsupdater    # the name becomes the URL
+```
+
+Then pin it in `firebase.json` (inside `hosting`, next to `public`):
+
+```json
+"site": "stock-newsupdater",
+```
+
+and deploy again. Two follow-ups, or the page only half-works:
+
+1. **Authentication -> Settings -> Authorized domains** - add
+   `stock-newsupdater.web.app`, otherwise Google sign-in fails with
+   `auth/unauthorized-domain` on the new address.
+2. Set that address as `web_url` (panel -> **Configuration**, or the first key
+   of `config_local.json`) so the digest's "Read them all" link points at it.
+
+The old `<project-id>.web.app` address keeps working: it reads the same database.
+
 ### Step 8 â€” Open it
 
 Go to `https://YOUR-PROJECT-ID.web.app`, click **Sign in with Google**, and

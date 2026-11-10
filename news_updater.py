@@ -88,6 +88,14 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config_local.json")
 SECRETS_FILE = os.path.join(BASE_DIR, "secrets_local.json")
 DB_FILE = os.path.join(BASE_DIR, "news.db")
+# --db=PATH: run against a different database file. Combined with
+# --lookback-hours this simulates a window ("what would the reader have been
+# sent over the last N hours") on a COPY, so the live database, its `seen`
+# ledger and its repeat state are never disturbed.
+for _dbarg in sys.argv:
+    if _dbarg.startswith("--db="):
+        DB_FILE = os.path.abspath(_dbarg.split("=", 1)[1].strip())
+        break
 RUN_HISTORY_FILE = os.path.join(BASE_DIR, "news_run_history.json")
 TAVILY_USAGE_FILE = os.path.join(BASE_DIR, "tavily_usage.json")
 # Exclusive-run marker (flock); see acquire_run_lock().
@@ -247,6 +255,15 @@ CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 # writes, no lookup writes, no run history, no Tavily credit usage). The DB
 # is opened in-memory. Safe for repeated testing - combine with --dry-run.
 NO_WRITE = False
+
+# --lookback-hours=N: ignore each source's last-fetch delta and read the last N
+# hours instead. The normal pipeline is purely incremental (it asks each source
+# only for what appeared since the previous run), which is right for production
+# but makes it impossible to answer "what would the reader have been sent over
+# the last four days?". This mode answers exactly that. The repeat gates
+# (pushed_stories / event keys) still apply, so nothing already delivered is
+# sent twice.
+BACKFILL_HOURS = 0.0
 
 # How many Chinese search terms we build per ticker (name + aliases +
 # subsidiaries), capped so we stay polite to free APIs and keep Tavily
@@ -662,6 +679,150 @@ def append_run_record(record):
 # quiet. A source returning nothing looks identical to a quiet news day, and a
 # source that has been silently empty for weeks shows green badges everywhere.
 SOURCE_SILENT_RUNS = 5
+
+# Quiet-run heartbeat. A run that finds nothing and a run that never happened
+# look IDENTICAL from the phone: both are silence. When two scheduled runs in a
+# row deliver nothing, that silence stops being evidence of health, so one short
+# line is sent to say the pipeline is alive and the news is just thin.
+# `heartbeat_after_quiet_runs` = how many consecutive zero-delivery runs trigger
+# it (0 disables); `heartbeat_reminder_every` = if the quiet stretch continues,
+# remind every N runs (so an outage can't hide behind "it's just quiet" forever)
+# without a message after every single run.
+HEARTBEAT_AFTER_QUIET_RUNS = 2
+HEARTBEAT_REMINDER_EVERY = 4
+
+
+def quiet_run_streak(history, status="ran", sent=0):
+    """
+    Consecutive completed runs that delivered nothing, counting THIS one.
+
+    Only successful runs count. A run recorded as error/interrupted means we do
+    not know whether anything arrived, so it ENDS the streak rather than being
+    reported as "quiet" - a failed delivery must never look like a quiet day.
+    History is newest-first (append_run_record inserts at 0).
+    """
+    if status != "ran" or (sent or 0) > 0:
+        return 0
+    streak = 1
+    for rec in history or []:
+        if rec.get("status") != "ran" or (rec.get("sent_items") or 0) > 0:
+            break
+        streak += 1
+    return streak
+
+
+def heartbeat_due(history, status="ran", sent=0,
+                  after=HEARTBEAT_AFTER_QUIET_RUNS,
+                  every=HEARTBEAT_REMINDER_EVERY):
+    """
+    True when this quiet streak has earned a heartbeat message.
+
+    State-based rather than "every Nth run": if no heartbeat has been sent yet in
+    the current quiet streak it fires as soon as the threshold is met - including
+    when the feature is deployed mid-stretch, so a user who is already wondering
+    why the phone is silent gets an answer on the next run. Once it has fired, the
+    next one waits `every` runs, so a long quiet stretch is a reminder twice a
+    week, not a message after every run.
+    """
+    if after <= 0 or status != "ran" or (sent or 0) > 0:
+        return False
+    quiet = 0
+    for rec in history or []:
+        if rec.get("status") != "ran" or (rec.get("sent_items") or 0) > 0:
+            break
+        if rec.get("heartbeat_sent"):
+            return quiet >= max(1, every)
+        quiet += 1
+    return quiet + 1 >= after
+
+
+_MONTH_ABBR = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _friendly_run_time(stamp):
+    """'2026-10-21 09:15:10 EDT' -> '21 Oct 09:15 ET' (history is already ET)."""
+    try:
+        d = datetime.strptime(str(stamp or "")[:19], "%Y-%m-%d %H:%M:%S")
+        return f"{d.day} {_MONTH_ABBR[d.month - 1]} {d.strftime('%H:%M')} ET"
+    except Exception:
+        return str(stamp or "?")
+
+
+def build_quiet_heartbeat(record, streak, history, label=""):
+    """The heartbeat text: what ran, what it found, and when you last heard from it."""
+    when = _friendly_run_time(record.get("timestamp"))
+    if label and label != "manual":
+        when += f" ({label})"
+    lines = [
+        f"\u2705 PortfolioNewsUpdater is alive \u2014 {streak} quiet runs in a row.",
+        "",
+        f"{when}: {record.get('new_items') or 0} new candidate(s) across "
+        f"{record.get('tickers_checked') or 0} ticker(s), 0 pushed "
+        f"(repeats, duplicates or below the push bar).",
+    ]
+    last = next((r for r in (history or [])
+                 if (r.get("sent_items") or 0) > 0), None)
+    if last:
+        lines.append(f"Last delivery: {_friendly_run_time(last.get('timestamp'))} "
+                     f"\u2014 {last.get('sent_items')} item(s).")
+    else:
+        lines.append("No delivery recorded yet.")
+    stats = record.get("source_stats") or {}
+    if stats:
+        answered = sum(1 for s in stats.values() if (s or {}).get("fetched"))
+        failed = sorted(n for n, s in stats.items() if (s or {}).get("failed"))
+        src = f"Sources: {answered}/{len(stats)} returned items"
+        src += f", {len(failed)} failed ({', '.join(failed[:4])})." \
+            if failed else ", none failed."
+        lines.append(src)
+    lines += ["",
+              "Nothing to fix \u2014 the scheduled runs completed; it is just a "
+              "quiet news stretch. Runs continue at 09:15 / 17:00 ET, Mon\u2013Fri."]
+    return "\n".join(lines)
+
+
+def maybe_send_quiet_heartbeat(record, config, token, chat_id, label="",
+                               dry_run=False):
+    """
+    Send the heartbeat when the quiet streak has earned one.
+
+    Sent as PLAIN TEXT on purpose: there is no article title or URL in it to
+    escape, so nothing in a headline can make Telegram reject the one message
+    that proves the bot is alive. It marks no news row as pushed and writes
+    nothing to the push ledger - it is a status line, not a digest.
+    """
+    after = _cfg_int(config, "heartbeat_after_quiet_runs",
+                     HEARTBEAT_AFTER_QUIET_RUNS)
+    every = _cfg_int(config, "heartbeat_reminder_every",
+                     HEARTBEAT_REMINDER_EVERY)
+    if after <= 0 or label == "manual":
+        return False
+    history = load_run_history()
+    streak = quiet_run_streak(history, record.get("status"),
+                              record.get("sent_items") or 0)
+    if not heartbeat_due(history, record.get("status"),
+                         record.get("sent_items") or 0, after, every):
+        return False
+    message = build_quiet_heartbeat(record, streak, history, label)
+    if dry_run:
+        print("\n" + "=" * 60)
+        print("DRY RUN - quiet-run heartbeat (would be sent to Telegram):")
+        print("=" * 60)
+        print(message)
+        print("=" * 60)
+        return False
+    if not (token and chat_id):
+        print("  Quiet-run heartbeat is due, but Telegram is not configured.")
+        return False
+    ok, _ = send_telegram(token, chat_id, message, parse_mode="")
+    if ok:
+        record["heartbeat_sent"] = True
+        print(f"  Quiet-run heartbeat sent ({streak} run(s) in a row with no "
+              f"delivery).")
+    else:
+        print("  [warn] Could not send the quiet-run heartbeat.", file=sys.stderr)
+    return ok
 
 
 def source_health_warnings(source_stats, history=None, runs=SOURCE_SILENT_RUNS):
@@ -1583,6 +1744,74 @@ def acquire_run_lock():
 # ---------------------------------------------------------------------------
 # Rolling cleanup: always ~3 weeks of news, dedup hashes a bit longer
 # ---------------------------------------------------------------------------
+# Rows stored under these pseudo-tickers belong to the macro/global tiers, not to
+# a holding, so they survive any watchlist change.
+PSEUDO_TICKERS = ("MACRO", "GLOBAL")
+
+
+def ticker_is_current(ticker, configured):
+    """
+    True when a stored row belongs to the current watchlist.
+
+    Sector rows are stored as '<TICKER>~SECTOR', so they follow their base
+    ticker: remove LX and its sector rows go with it. The macro/global tiers use
+    pseudo-tickers and are never a holding, so they always stay.
+    """
+    t = str(ticker or "").strip().upper()
+    if not t:
+        return False
+    if t in PSEUDO_TICKERS:
+        return True
+    base = t.split("~", 1)[0]
+    for x in (configured or []):
+        if str(x).strip().upper() == base:
+            return True
+    return False
+
+
+def prune_unconfigured_tickers(conn, configured, dry_run=False):
+    """
+    Delete stored rows that belong to a ticker no longer in the watchlist.
+
+    Swapping a holding out of `tickers` used to leave its news in news.db for the
+    whole 21-day retention, and the hosted page mirrors the database - so a
+    removed stock (HUIZ was the live case) kept appearing on the web page long
+    after it left the portfolio.
+
+    Removes it from every table a removal owns: the archive (`news`), the staging
+    rows, the `seen` hashes (otherwise they would keep suppressing the same story
+    if the ticker is ever added back) and the `last_fetched` / `pushed_stories`
+    bookkeeping. An empty watchlist means "no information", NOT "delete
+    everything" - a broken config must never wipe the archive.
+
+    Returns {ticker: rows_removed}. dry_run only counts, so it works on a
+    read-only connection too.
+    """
+    wanted = [t for t in (configured or []) if str(t).strip()]
+    if not wanted:
+        return {}
+    removed = {}
+    for table in ("news", "staging", "seen", "last_fetched", "pushed_stories"):
+        try:
+            tickers = [r[0] for r in conn.execute(
+                f"SELECT DISTINCT ticker FROM {table}")]
+        except sqlite3.Error:
+            continue
+        stale = [t for t in tickers if not ticker_is_current(t, wanted)]
+        if not stale:
+            continue
+        for t in stale:
+            n = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE ticker=?",
+                             (t,)).fetchone()[0]
+            removed[t] = removed.get(t, 0) + n
+        if not dry_run:
+            marks = ",".join("?" * len(stale))
+            conn.execute(f"DELETE FROM {table} WHERE ticker IN ({marks})", stale)
+    if not dry_run:
+        conn.commit()
+    return removed
+
+
 def prune_db(conn):
     """
     Rolling cleanup, run on every run:
@@ -1754,6 +1983,16 @@ def is_chinese(text):
 # insurance), so that never counts.
 NAME_PREFIXES = set("与和及由为被向从在据是对给跟同了将已拟欲再又称说报"
                     "，。、；：）」】)(")
+# A company name that is also the prefix of an UNRELATED organisation. Only
+# clearly-measured collisions belong here: the general rule below accepts a match
+# on EITHER side, and tightening it to "both sides must be clear" was measured
+# to reject 18 of 112 real headlines (陆控第三季营收, 元保披露高管减持,
+# 元保联合清华), so this list stays narrow and evidence-based.
+#   乐信圣文  - a mobile-game studio that is not LexinFintech (stored as LX news
+#               on every run until 2026-11-01).
+NAME_PREFIX_COLLISIONS = {
+    "乐信": ("圣文",),
+}
 # Only the FIRST character of each legitimate continuation word belongs here:
 # 保(保险) 科(科技) 集(集团) 控(控股) 信(信息) 服(服务) 网(网络) 数(数据)
 # 金(金服/金融) 有(有限) 公(公司) 银(银行) 经(经纪) 平(平台) 商(商城) 贷
@@ -1787,6 +2026,15 @@ def _term_in_text(term, text):
         after = text[idx + n:idx + n + 1]
         # Part of a number/money phrase, not a company name.
         if before.isdigit() or (term[:1] in "元角分" and before in UNIT_PREFIXES):
+            idx = text.find(term, idx + 1)
+            continue
+        # A name that is also the prefix of an UNRELATED organisation. Only the
+        # clearly-measured cases go here: the general boundary rule below must
+        # stay permissive (accepting on either side), because tightening it to
+        # "both sides must be clear" rejected real coverage - 陆控第三季营收,
+        # 元保披露高管减持, 元保联合清华 - 18 of 112 real headlines in the
+        # 2026-11-01 benchmark, including 9/10-rated ones.
+        if text.startswith(NAME_PREFIX_COLLISIONS.get(term, ()), idx + n):
             idx = text.find(term, idx + 1)
             continue
         if (not before) or (not is_chinese(before)) or (before in NAME_PREFIXES) \
@@ -1861,6 +2109,76 @@ def _item_age_hours(item):
 
 
 # ---------------------------------------------------------------------------
+# Stale fiscal period: the evergreen-page trap
+# ---------------------------------------------------------------------------
+# Some pages carry a FRESH date but describe a period that ended months ago.
+# Measured 2026-11-10: "LexinFintech Holdings Ltd. R (1LFA.HA) Q4 FY2025 earnings
+# call transcript" was pushed to Telegram on 10 November 2026. The Yahoo page's
+# date was 2026-11-09, so every freshness gate passed - but Q4 FY2025 ended on
+# 31 December 2025, eleven months earlier. That is exactly the "LX news which are
+# very old" item.
+#
+# The fix reads the period out of the HEADLINE and refuses one that ended too
+# long ago. It is deliberately based on the title: the page's date is the thing
+# that lied, so it cannot be the thing we trust.
+PERIOD_STALE_DAYS = 150
+_PERIOD_RES = (
+    re.compile(r"\bQ([1-4])\s*(?:FY\s*)?(20\d{2})\b", re.I),          # Q4 FY2025
+    re.compile(r"\b(20\d{2})\s*Q([1-4])\b", re.I),                     # 2026 Q3
+    re.compile(r"\bFY\s*(20\d{2})\b", re.I),                           # FY2025
+    re.compile(r"\b(first|second|third|fourth)\s+quarter\s+(?:of\s+)?(20\d{2})\b", re.I),
+    re.compile(r"\b(first|second|third|fourth)\s+quarter\s+(?:of\s+)?(?:fiscal\s+)?(20\d{2})\b", re.I),
+    re.compile(r"(20\d{2})\s*年\s*第?\s*([一二三四1-4])\s*季度"),        # 2026年第三季度
+    re.compile(r"第\s*([一二三四1-4])\s*季度\s*[（(]?\s*(20\d{2})"),      # 第三季度（2026）
+)
+_ZH_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "1": 1, "2": 2, "3": 3, "4": 4}
+_EN_ORD = {"first": 1, "second": 2, "third": 3, "fourth": 4}
+
+
+def stale_fiscal_period(text, now=None, max_age_days=None):
+    """
+    True when a headline names a fiscal period that ended too long ago.
+
+    False when no period is named - most headlines name none, and this must
+    never drop an item that does not actually claim a period.
+    """
+    t = str(text or "")
+    if not t:
+        return False
+    now = now or datetime.now(EASTERN)
+    limit = PERIOD_STALE_DAYS if max_age_days is None else float(max_age_days)
+    for pat in _PERIOD_RES:
+        m = pat.search(t)
+        if not m:
+            continue
+        quarter = year = None
+        for g in m.groups():
+            if not g:
+                continue
+            word = str(g).lower()
+            if word in _EN_ORD:
+                quarter = _EN_ORD[word]
+            elif re.fullmatch(r"[1-4一二三四]", str(g)):
+                quarter = _ZH_NUM.get(str(g))
+            elif re.fullmatch(r"20\d{2}", str(g)):
+                year = int(g)
+        if year is None:
+            continue
+        if quarter:
+            month = quarter * 3
+            if month == 12:
+                end = datetime(year, 12, 31, tzinfo=EASTERN)
+            else:
+                # Last day of the quarter's final month (Q2 -> 30 June).
+                end = datetime(year, month + 1, 1, tzinfo=EASTERN) - timedelta(days=1)
+        else:
+            end = datetime(year, 12, 31, tzinfo=EASTERN)
+        if (now - end).days > limit:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Relevance + duplicate detection (the "why is this in my digest?" layer)
 # ---------------------------------------------------------------------------
 # Titles carry a lot of machine noise that must not count as "content" when
@@ -1911,6 +2229,25 @@ def story_tokens(title):
     return tokens
 
 
+def strip_outlet_tail(title):
+    """
+    Drop a trailing ' - Publisher' suffix ("... - Moomoo", "... - 文学城").
+
+    This matters for RELEVANCE, not just for dedup: Google News appends the
+    publisher to every title, and the publisher can itself be a portfolio brand.
+    Measured 2026-11-01: a 住友电工 earnings item was stored as TIGR news purely
+    because it was published by Moomoo (TIGR's own app), and a Tiger Safari
+    travel piece matched "Tiger Brokers". The suffix is not part of the story.
+    """
+    t = str(title or "").strip()
+    parts = re.split(r"\s+[-–—|]\s+", t)
+    if len(parts) > 1:
+        tail = parts[-1]
+        if len(tail) <= 20 and not re.search(r"\d", tail):
+            return " - ".join(parts[:-1])
+    return t
+
+
 def normalize_title(title):
     """
     Comparable form of a headline: drop a trailing ' - publisher' suffix, then
@@ -1926,12 +2263,7 @@ def normalize_title(title):
     a buyback looked like a duplicate of the earnings release and was dropped
     before it was even stored.
     """
-    t = str(title or "").strip()
-    parts = re.split(r"\s+[-–—|]\s+", t)
-    if len(parts) > 1:
-        tail = parts[-1]
-        if len(tail) <= 20 and not re.search(r"\d", tail):
-            t = " - ".join(parts[:-1])
+    t = strip_outlet_tail(title)
     return re.sub(r"[\s\W_]+", "", t, flags=re.UNICODE).lower()[:80]
 
 
@@ -2399,6 +2731,10 @@ data mobile online platform platforms utilities wholesale chase gamble first
 # (King Charles is not a brokerage story).
 charles john james william george henry david michael robert thomas richard
 daniel joseph andrew edward peter paul mary anne elizabeth
+# Animal/ordinary-word brand tokens: the short form of "Tiger Brokers" is
+# "Tiger", and "One Day Tiger Safari" is not a brokerage story. The full phrase
+# still matches; only the standalone token is refused.
+tiger moomoo
 """.split())
 
 
@@ -2635,7 +2971,7 @@ def passes_relevance(item, meta, resolved):
                     never sent to the AI.
     """
     hay = " ".join(str(item.get(k) or "") for k in ("title", "snippet")).lower()
-    title_l = str(item.get("title") or "").lower()
+    title_l = strip_outlet_tail(item.get("title")).lower()
     # The NAME must be in the TITLE. Matching title+snippet let an aggregator
     # page qualify through its sidebar: a Yahoo Finance page headed "Yiren Digital
     # Ltd. (YRD) Stock Price..." was stored as LX news because its excerpt listed
@@ -2778,6 +3114,12 @@ def ingest_items(conn, all_new, source, items, ticker, since_dt, max_age_hours,
         # dropped here rather than stored and scored.
         if is_junk_content(f"{item.get('title', '')} {item.get('title_en', '')}"):
             bump("junk_content")
+            continue
+        # A headline that names a period which ended months ago is stale even if
+        # the page claims today's date (the Q4 FY2025 transcript pushed on
+        # 2026-11-10). Checked on the title because the date is what lied.
+        if stale_fiscal_period(item.get("title", "")):
+            bump("stale_period")
             continue
         if not is_new(conn, ticker, item["source"], item["id"], item["title"]):
             bump("already_seen")
@@ -3055,6 +3397,35 @@ def save_lookup(data):
     if NO_WRITE:
         return
     _write_json(COMPANY_LOOKUP_FILE, data)
+
+
+def prune_unconfigured_lookup(configured, dry_run=False):
+    """
+    Drop company_lookup.json entries for tickers that left the watchlist.
+
+    The lookup is what every search is built from ("慧择 / 慧择保险 / ..."), so a
+    removed holding otherwise lingers in the panel's company lookup and its
+    profile keeps being consulted for nothing. Re-adding the ticker simply
+    re-discovers it.
+
+    Returns the removed ticker names (sorted). An empty watchlist is a config
+    problem, not an instruction to delete the lookup.
+    """
+    wanted = [t for t in (configured or []) if str(t).strip()]
+    if not wanted:
+        return []
+    try:
+        data = load_lookup()
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    stale = sorted(k for k in data if not ticker_is_current(k, wanted))
+    if stale and not dry_run:
+        for k in stale:
+            data.pop(k, None)
+        save_lookup(data)
+    return stale
 
 
 def _grounded_names(names, snippets, existing=None):
@@ -4353,6 +4724,118 @@ def fetch_eastmoney_search(query, since_dt=None, limit=10, terms=None):
 
 
 # ---------------------------------------------------------------------------
+# Eastmoney 股吧 (guba) - the per-stock Chinese message board
+# ---------------------------------------------------------------------------
+# This is where Chinese retail investors actually talk about a name, and it is
+# also where the Chinese write-ups of a filing land hours before any English
+# article exists. Measured 2026-11-01 on the US boards: usLU carried
+# "陆控三季度总营收61.8亿，消金业务新贷同比增长25.2%" and "陆控三季报发布：
+# 结构更优，底盘更稳" - the Q3 numbers the English feed only had as a bare 6-K.
+#
+# The US board (usLU, usQFIN, ...) is server-rendered and embeds a
+# `var article_list={"re":[...]}` blob, so no API key and no JS engine is
+# needed. The HK boards (06623, 03660) are JavaScript shells, so they are not
+# used: for the ADRs the US board is the same discussion anyway (the usLU page
+# reports stockbar_code "hk06623" - Eastmoney merges them).
+GUBA_BASE = "https://guba.eastmoney.com"
+# Board posts are mostly chatter ("最高点的1%？真么可怕吗"). Only two classes may
+# enter the pipeline: posts from a news/announcement account (user_nickname like
+# "陆控资讯", post_type 1), and posts whose title carries a corporate event word.
+# Everything else is opinion noise with no verifiable content.
+GUBA_NEWS_ACCOUNT_MARKS = ("资讯", "公告", "研报", "新闻")
+
+
+def _guba_article_list(html):
+    """Extract the `var article_list={...}` records from a guba board page."""
+    at = html.find("var article_list=")
+    if at < 0:
+        return []
+    brace = html.find("{", at)
+    if brace < 0:
+        return []
+    try:
+        obj, _end = json.JSONDecoder().raw_decode(html[brace:])
+    except Exception:
+        return []
+    posts = obj.get("re") if isinstance(obj, dict) else None
+    return posts or []
+
+
+def fetch_guba(ticker, since_dt=None, terms=None, limit=80):
+    """
+    One Eastmoney 股吧 board for one ticker. Returns items, or None on a hard
+    fetch failure (so the delta is not advanced past a window we never read).
+
+    Precision: the board is ticker-scoped, but a post is only kept when it comes
+    from a news/announcement account or its title carries a corporate event word,
+    and (for the event-word class) it must name one of the ticker's Chinese
+    terms. That is what separates "陆控三季度总营收61.8亿" from "明天会涨吗".
+    """
+    board = f"us{str(ticker or '').strip().upper()}"
+    if not re.match(r"^us[A-Z.]{1,8}$", board):
+        return []
+    url = f"{GUBA_BASE}/list,{board}.html"
+    try:
+        resp = requests.get(url, headers={**HEADERS, "Referer": GUBA_BASE + "/"},
+                            timeout=25)
+        resp.raise_for_status()
+    except Exception as exc:
+        print(f"  [error] Guba '{board}': {exc}", file=sys.stderr)
+        return None
+    posts = _guba_article_list(resp.text)
+    if not posts:
+        # A 200 with no parseable blob is a page change, not "no news": return
+        # None so the window is retried instead of being silently skipped.
+        print(f"  [warn] Guba '{board}': no article_list in the page "
+              f"({len(resp.text)} bytes) - layout changed?", file=sys.stderr)
+        return None
+
+    floor = datetime.min.replace(tzinfo=EASTERN)
+    out = []
+    for p in posts[:limit]:
+        title = strip_tags(str(p.get("post_title") or "")).strip()
+        if not title:
+            continue
+        nick = str(p.get("user_nickname") or "")
+        is_news = (int(p.get("post_type") or 0) == 1
+                   or any(m in nick for m in GUBA_NEWS_ACCOUNT_MARKS))
+        # A news/announcement account still posts index roundups ("纳斯达克中国
+        # 金龙指数收涨0.59%") and mirrors of every SEC form ("[Amend] Statement
+        # of changes in beneficial ownership"), so the COMPANY NAME is required
+        # for every post - news account or not. Measured 2026-11-01 that removes
+        # ~60% of the board volume and every one of those was symbol noise.
+        if terms and not any(_term_in_text(t, title) for t in terms):
+            continue
+        if not is_news and not _event_terms_hit(title, DEEPSEEK_CORP_TERMS):
+            continue
+        date = _zh_date_to_et(str(p.get("post_publish_time") or ""))
+        pub_dt = _parse_pub(date)
+        if since_dt is not None and pub_dt is not None and pub_dt < since_dt:
+            continue
+        pid = str(p.get("post_id") or "")
+        if not pid:
+            continue
+        clicks = p.get("post_click_count") or 0
+        comments = p.get("post_comment_count") or 0
+        snippet = f"{nick} · 阅读 {clicks} · 评论 {comments}".strip()
+        abstract = strip_tags(str(p.get("post_abstract") or "")).strip()
+        if abstract:
+            snippet = f"{snippet} · {abstract[:200]}"
+        out.append({
+            "source": "Guba",
+            "ticker": "",
+            "id": f"guba:{board}:{pid}",
+            "title": title,
+            "url": f"{GUBA_BASE}/news,{board},{pid}.html",
+            "date": date,
+            "lang": "zh" if is_chinese(title) else "en",
+            "snippet": snippet[:300],
+        })
+    out.sort(key=lambda it: _parse_pub(it.get("date", "")) or floor, reverse=True)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Baidu news (best-effort; degrades gracefully)
 # ---------------------------------------------------------------------------
 def fetch_baidu_news(query, since_dt=None, limit=10, terms=None):
@@ -5047,6 +5530,63 @@ def _date_from_url(url):
     return ""
 
 
+# How many article pages a single run may open just to recover a publish date.
+# A plain GET per undated-but-relevant find, so it is free, but it must stay
+# bounded: a pathological run must not crawl 100 pages.
+_PAGE_DATE_BUDGET = 12
+_PAGE_DATE_USED = 0
+_PAGE_DATE_PATTERNS = (
+    r'"datePublished"\s*:\s*"(20\d{2}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})',
+    r'"publish[_-]?time"\s*:\s*"(20\d{2}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})',
+    r'property=["\']article:published_time["\']\s+content=["\'](20\d{2}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})',
+    r'(20\d{2}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})',
+    r'(20\d{2})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}:\d{2})',
+)
+
+
+def _date_from_page(url, timeout=8):
+    """
+    Recover the publish date from an article page.
+
+    Why this exists: measured 2026-11-01 across the watchlist, 9 of the 10
+    high-value finds that ONLY DeepSeek surfaced were undated ("乐信季报图解",
+    "肖文杰狂赚1.1亿分红的另一面", "元保被9000条投诉缠上", "老虎国际首财季经调整
+    转蚀2380万美元"), and the freshness gate drops undated items - so the deepest
+    Chinese analysis was being thrown away as unverifiable. Opening the page and
+    reading its own date is the honest way to keep it.
+
+    Returns an ET-normalized 'YYYY-MM-DD HH:MM:SS' string, or "" when the page
+    has no recognisable date or the budget/network stops us.
+    """
+    global _PAGE_DATE_USED
+    if _PAGE_DATE_USED >= _PAGE_DATE_BUDGET:
+        return ""
+    text = str(url or "")
+    if not text.startswith(("http://", "https://")):
+        return ""
+    _PAGE_DATE_USED += 1
+    try:
+        resp = requests.get(text, headers=HEADERS, timeout=timeout)
+        resp.raise_for_status()
+        html = resp.text[:250000]
+    except Exception:
+        return ""
+    for pat in _PAGE_DATE_PATTERNS:
+        m = re.search(pat, html)
+        if not m:
+            continue
+        g = m.groups()
+        if pat.startswith("(20") and len(g) >= 4:      # 2026年10月30日 09:46
+            year, mon, day, hm = g[0], g[1], g[2], g[3]
+            stamp = f"{year}-{int(mon):02d}-{int(day):02d} {hm}"
+        elif len(g) >= 2:
+            stamp = f"{g[0]} {g[1]}"
+        else:
+            stamp = g[0]
+        return _zh_date_to_et(stamp)
+    return ""
+
+
 def deepseek_hk_code(meta):
     """The HK listing code (e.g. 06623 for Lufax), when the profile has one."""
     code = re.sub(r"\D", "", str((meta or {}).get("hk_code") or ""))
@@ -5055,15 +5595,24 @@ def deepseek_hk_code(meta):
 
 def deepseek_corp_query(name, since_dt):
     """
-    Corporate-action vocabulary.
+    The corporate-event query: what actually happened to this company.
 
-    `合股`/`并股`/`拆股`/`ADS 比例变更` are the words that find a reverse
-    split, a merger or an ADS-ratio change; none of them appear in a generic
-    "<company> 新闻" query. Measured: this exact query found the 陆金所
-    1-for-10 reverse-split coverage the daily run had missed.
+    The reverse-split vocabulary (合股/并股/拆股/ADS比例变更) stays - it is what
+    found the 陆金所 ADS-ratio change - but on its own it is far too narrow: it
+    only ever looks for share-count mechanics. The broad event vocabulary below
+    covers what actually moves these names (earnings, buybacks, insider sales,
+    privatisation, penalties, management changes) at the SAME cost: still one
+    paid search per ticker per run.
+
+    Caveat measured 2026-11-01, and the reason the freshness gate stays strict:
+    DeepSeek Search returns many undated evergreen pages ("乐信季报图解" from
+    June, the 元保 exposé from March, a 2024 CAAS buyback). Rated on title alone
+    they look like 9-10/10 alpha, but they are months old. Only dated results
+    inside the window may be pushed - an undated "great" find is usually a stale
+    one.
     """
-    return (f"{name} 合股 并股 拆股 ADS比例变更 "
-            f"after:{_deepseek_after(since_dt)}")[:128]
+    return (f"{name} 财报 业绩 公告 回购 减持 私有化 监管 处罚 高管 "
+            f"合股 并股 拆股 ADS比例变更 after:{_deepseek_after(since_dt)}")[:128]
 
 
 def deepseek_hk_query(code, name, since_dt):
@@ -5208,6 +5757,14 @@ def fetch_deepseek_search(query, secrets, config, since_dt=None, limit=10,
                 continue
         date = str(r.get("date") or "") or _date_from_url(url)
         pub_dt = _parse_pub(date)
+        if pub_dt is None and since_dt is not None:
+            # Undated but event-relevant: read the page's own date before the
+            # freshness gate throws away the deepest Chinese analysis there is.
+            # (This is a free GET, budgeted per run - see _date_from_page.)
+            resolved = _date_from_page(url)
+            if resolved:
+                date = resolved
+                pub_dt = _parse_pub(date)
         if since_dt is not None:
             if require_date and pub_dt is None:
                 dropped += 1
@@ -7643,6 +8200,22 @@ def main():
     global NO_WRITE
     NO_WRITE = ("--no-write" in sys.argv) or ("--dry-run" in sys.argv)
 
+    # --lookback-hours=N (see BACKFILL_HOURS): read the last N hours from every
+    # source instead of the per-source delta. Used to test what the reader
+    # "would have received" over a window.
+    global BACKFILL_HOURS
+    for _a in sys.argv:
+        if _a.startswith("--lookback-hours="):
+            try:
+                BACKFILL_HOURS = max(0.0, float(_a.split("=", 1)[1]))
+            except (TypeError, ValueError):
+                print(f"  [warn] bad --lookback-hours value: {_a!r} (ignored)",
+                      file=sys.stderr)
+                BACKFILL_HOURS = 0.0
+    if BACKFILL_HOURS:
+        print(f"[lookback] reading the last {BACKFILL_HOURS:g} h from every "
+              f"source (per-source deltas ignored for this run)")
+
     # ---- CLI modes first (never blocked by the schedule guard) ----
     # Match the PREFIX for modes that can carry a value (--purge-junk=3,
     # --rediscover=LU): an exact `"--mode" in sys.argv` test is False for
@@ -7718,6 +8291,38 @@ def main():
         removed, groups = purge_duplicates(conn, ticker=ticker_arg, dry_run=False)
         conn.close()
         _print_duplicate_groups(groups, removed, dry_run=False)
+        sys.exit(0)
+
+    if "--purge-unconfigured" in sys.argv:
+        # "I removed a stock from the watchlist - get it off my page." The
+        # updater now does this automatically at the start of every run; the flag
+        # exists so it can be previewed and done NOW, without waiting for the next
+        # scheduled run (the web sync alone cannot clean news.db).
+        config = load_config()
+        tickers = [t.strip().upper() for t in config.get("tickers", []) if t.strip()]
+        dry = "--dry-run" in sys.argv or NO_WRITE
+        conn = _readonly_db() if dry else _db()
+        removed = prune_unconfigured_tickers(conn, tickers, dry_run=dry)
+        conn.close()
+        stale_lookup = prune_unconfigured_lookup(tickers, dry_run=dry)
+        if not removed and not stale_lookup:
+            print("  [purge] every stored row belongs to a configured ticker - "
+                  "nothing to remove.")
+            sys.exit(0)
+        verb = "would remove" if dry else "removed"
+        if removed:
+            print(f"  [purge] {verb} {sum(removed.values())} row(s) for "
+                  f"{len(removed)} ticker(s) no longer in the watchlist:")
+            for t, n in sorted(removed.items()):
+                print(f"    {t}: {n} row(s)")
+        if stale_lookup:
+            print(f"  [purge] {verb} {len(stale_lookup)} company-lookup "
+                  f"entr(y/ies): " + ", ".join(stale_lookup))
+        if dry:
+            print("  [purge] PREVIEW - nothing deleted (drop --dry-run to do it).")
+        else:
+            print("  [purge] run the web sync so the hosted page drops them too:\n"
+                  "    python3 news_web.py --sync-firebase --project=YOUR-PROJECT-ID")
         sys.exit(0)
 
     if any(a == "--purge-junk" or a.startswith("--purge-junk=") for a in sys.argv):
@@ -8129,6 +8734,15 @@ def main():
     SEEN_RETENTION_DAYS = max(NEWS_RETENTION_DAYS, _cfg_int(config, "seen_retention_days", SEEN_RETENTION_DAYS))
 
     conn = _db()
+    stale_tickers = prune_unconfigured_tickers(conn, tickers)
+    if stale_tickers:
+        print(f"  [db] removed {sum(stale_tickers.values())} row(s) for "
+              f"ticker(s) no longer configured: "
+              + ", ".join(sorted(stale_tickers)) + ".")
+    stale_lookup = prune_unconfigured_lookup(tickers)
+    if stale_lookup:
+        print(f"  [lookup] dropped {len(stale_lookup)} ticker(s) no longer "
+              f"configured: " + ", ".join(stale_lookup) + ".")
     pruned, vacuumed = prune_db(conn)
     if pruned:
         print(f"  [db] rolling cleanup removed {pruned} old row(s) "
@@ -8176,8 +8790,8 @@ def main():
 
     print(f"[{start_time.strftime('%Y-%m-%d %H:%M %Z')}] Checking {len(tickers)} "
           f"ticker(s) for new news (sources: SEC, GoogleNews, GoogleNewsZH, "
-          f"GoogleNewsSite, Eastmoney, Eastmoney724, Sina724, Baidu, Tavily, "
-          f"DeepSeekSearch, RSS)...")
+          f"GoogleNewsSite, Eastmoney, Guba, Eastmoney724, Sina724, Baidu, "
+          f"Tavily, DeepSeekSearch, RSS)...")
 
     # Global Chinese fast-news wires - ONE fetch per wire per run, shared by
     # all tickers (filtered per ticker by its Chinese terms inside the loop).
@@ -8246,9 +8860,15 @@ def main():
             announcement is made ONCE and is not re-published.
             """
             last = get_last_fetched(conn, ticker, source)
-            since_dt = since_override or (
-                datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=EASTERN)
-                if last else datetime.now(EASTERN) - timedelta(hours=initial_hours))
+            if BACKFILL_HOURS:
+                # --lookback-hours: one window for every source, so the run
+                # answers "what was published in the last N hours" rather than
+                # "what appeared since the previous run".
+                since_dt = datetime.now(EASTERN) - timedelta(hours=BACKFILL_HOURS)
+            else:
+                since_dt = since_override or (
+                    datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=EASTERN)
+                    if last else datetime.now(EASTERN) - timedelta(hours=initial_hours))
             items = fetch_fn(since_dt)
             if items is None:
                 print(f"  [warn] {ticker} {source} fetch failed - NOT advancing "
@@ -8296,11 +8916,25 @@ def main():
         if zh_terms:
             # Google News, Chinese editions (CN + HK merged, newest first).
             if src_on("google_news_zh"):
-                zh_query = " ".join(zh_terms[:3]) + " when:14d"
-                fetch_source(
-                    "GoogleNewsZH",
-                    lambda sd: fetch_google_news_zh(zh_query, ticker, sd),
-                    src_status("google_news_zh"))
+                # One query PER NAME, not one query with all names AND-joined.
+                # Google News treats space-separated terms as AND, so the old
+                # "陆金所 陆控 平安普惠 when:14d" only returned articles naming
+                # all three. Measured 2026-11-01, items per query:
+                #   LU 1 -> 19, QFIN 1 -> 7, LX 2 -> 13, CAAS 0 -> 41, TIGR 9 -> 25
+                # (3 terms x 2 editions, deduped by normalized title inside the
+                #  fetcher and by URL in the ingest gate.)
+                def _gnzh(sd, terms=zh_terms[:3]):
+                    collected, failed = [], 0
+                    for term in terms:
+                        res = fetch_google_news_zh(f"{term} when:14d", ticker, sd)
+                        if res is None:
+                            failed += 1
+                            continue
+                        collected.extend(res)
+                    if failed == len(terms):
+                        return None      # total failure: do not advance delta
+                    return collected
+                fetch_source("GoogleNewsZH", _gnzh, src_status("google_news_zh"))
 
             # Eastmoney search - one query per term (capped), already
             # title-filtered by the fetcher.
@@ -8316,6 +8950,15 @@ def main():
                         out.extend(res)
                     return None if failed else out
                 fetch_source("Eastmoney", _em, src_status("eastmoney", strict=False))
+
+            # Eastmoney 股吧 - Chinese retail discussion + the Chinese write-up
+            # of a filing, per ticker, free and server-rendered. Strict
+            # relevance still applies, so board chatter that never names the
+            # company cannot reach the digest.
+            if src_on("guba"):
+                fetch_source("Guba",
+                             lambda sd: fetch_guba(ticker, sd, terms=zh_terms),
+                             src_status("guba"))
 
             # Baidu news (best-effort, one query using the main name).
             if src_on("baidu"):
@@ -8462,7 +9105,17 @@ def main():
         # 3) Google News English - includes the company's EN names/brands so
         #    subsidiary news is found even when the ticker symbol isn't in it.
         if src_on("google_news_en"):
-            en_query = " OR ".join([f"{ticker} stock"] + en_terms[:3])
+            # The date horizon is not decoration. Without `when:`, Google News
+            # orders by relevance, so the feed is dominated by old coverage and
+            # the delta filter then discards almost all of it. Measured
+            # 2026-11-01, items inside 14 days with the old query vs this one:
+            #   LU 8 -> 30, QFIN 1 -> 13, TIGR 5 -> 12, CAAS 2 -> 10
+            # (QFIN's whole fresh English feed was one item before the fix.)
+            en_name = str((meta or {}).get("name_en") or "").strip().strip('"')
+            parts = [f'"{en_name}"'] if en_name else []
+            parts.append(f"{ticker} stock")
+            parts.extend(en_terms[:3])
+            en_query = " OR ".join(parts) + " when:14d"
             fetch_source(
                 "GoogleNews",
                 lambda sd: fetch_rss(google_news_url(en_query, "en"), ticker, sd,
@@ -8917,6 +9570,15 @@ def main():
         if silent:
             record["source_warnings"] = silent
     record["duration_sec"] = round((datetime.now(EASTERN) - start_time).total_seconds(), 2)
+    # A scheduled run that delivered nothing is indistinguishable from a run
+    # that never happened, so after a couple of them say so once. Called BEFORE
+    # append_run_record so this run is not counted twice in the streak. Guarded:
+    # a status line must never be able to fail a run whose digest already went out.
+    try:
+        maybe_send_quiet_heartbeat(record, config, token, chat_id,
+                                   label=_run_label(start_time), dry_run=dry_run)
+    except Exception as exc:
+        print(f"  [warn] quiet-run heartbeat failed: {exc}", file=sys.stderr)
     append_run_record(record)
 
 
