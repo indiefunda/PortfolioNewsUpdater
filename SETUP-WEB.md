@@ -288,19 +288,22 @@ separate from the news cron jobs â€” a failure here must never affect your 
 ```bash
 crontab -e
 # 15 minutes after each news run, in BOTH seasons (the out-of-season line is a
-# no-op because the news run it follows did nothing). This replaces the earlier
-# two-line version, which was NOT DST-aware and INVERTED in winter: in EST
-# 13:30/21:15 UTC are 08:30/16:15 ET, i.e. BEFORE the 09:15/17:00 ET news runs,
-# so the archive always mirrored the previous run and the last run of the day
-# only appeared the next morning - the page the digest links to was missing
-# exactly the items in the digest.
+# no-op because the news run it follows did nothing). There are THREE news runs
+# now (00:00 / 09:15 / 17:00 ET), so the sync needs a line per run per season.
+# This replaces the earlier two-line version, which was NOT DST-aware and
+# INVERTED in winter: in EST 13:30/21:15 UTC are 08:30/16:15 ET, i.e. BEFORE the
+# news runs, so the archive always mirrored the previous run and the last run of
+# the day only appeared the next morning - the page the digest links to was
+# missing exactly the items in the digest.
+30 04 * * 1-5 cd $HOME && /usr/bin/python3 news_web.py --sync-firebase --project=YOUR-PROJECT-ID >> news_web.log 2>&1
+30 05 * * 1-5 cd $HOME && /usr/bin/python3 news_web.py --sync-firebase --project=YOUR-PROJECT-ID >> news_web.log 2>&1
 30 13 * * 1-5 cd $HOME && /usr/bin/python3 news_web.py --sync-firebase --project=YOUR-PROJECT-ID >> news_web.log 2>&1
 30 14 * * 1-5 cd $HOME && /usr/bin/python3 news_web.py --sync-firebase --project=YOUR-PROJECT-ID >> news_web.log 2>&1
 15 21 * * 1-5 cd $HOME && /usr/bin/python3 news_web.py --sync-firebase --project=YOUR-PROJECT-ID >> news_web.log 2>&1
 15 22 * * 1-5 cd $HOME && /usr/bin/python3 news_web.py --sync-firebase --project=YOUR-PROJECT-ID >> news_web.log 2>&1
 ```
 
-**Four lines** (the 09:15 and 17:00 ET runs, in both EDT and EST). The sync has
+**Six lines** (the 00:00, 09:15 and 17:00 ET runs, in both EDT and EST). The sync has
 no schedule guard of its own, so it simply follows whichever news run actually
 happened; a redundant sync is nearly free because the manifest means unchanged
 rows are never rewritten.

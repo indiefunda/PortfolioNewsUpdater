@@ -2,7 +2,8 @@
 
 Searches your tickers for **new** SEC filings, **Chinese** news (Google News
 zh-CN, Eastmoney, Sina/Eastmoney 7x24 wires, Tavily), English news, and RSS
-items **twice a day**. Everything found is stored in a SQLite news
+items **three times a day** (00:00 / 09:15 / 17:00 ET). Everything found is
+stored in a SQLite news
 database (rolling ~3 weeks), translated to English and scored 1–10 by
 **DeepSeek AI**; only the **top items by importance** are pushed to your
 Telegram. Runs on the same **free** Google Cloud VM as your price monitor,
@@ -818,10 +819,16 @@ real failure.
 
 ## How the schedule stays reliable across DST
 
-- **Four cron jobs** are installed (two runs × two seasons), firing at the
-  correct UTC times for **09:15 and 17:00 ET** in summer (EDT) and winter
-  (EST): 13:15/21:00 UTC and 14:15/22:00 UTC.
+- **Six cron jobs** are installed (three runs × two seasons), firing at the
+  correct UTC times for **00:00, 09:15 and 17:00 ET** in summer (EDT) and
+  winter (EST): 04:00/13:15/21:00 UTC and 05:00/14:15/22:00 UTC.
+- The 00:00 ET run exists because this watchlist is covered by Chinese
+  sources: it lands at 12:00–13:00 Beijing, so the Chinese morning is read
+  as it happens. Without it, everything published 08:00–22:00 Beijing waited
+  for the 09:15 ET run — up to sixteen hours. The 17:00 ET run is 06:00
+  Beijing, i.e. before the Chinese day starts; it exists for US after-hours
+  filings (6-K/8-K), not for Chinese news.
 - `news_updater.py` has a **DST-aware guard** that skips the out-of-season
-  jobs instantly, so exactly **two** real runs per day.
+  jobs instantly, so exactly **three** real runs per day.
 - The installer also enables the cron daemon at boot and installs Python deps
   with `sudo` (so cron can import them).

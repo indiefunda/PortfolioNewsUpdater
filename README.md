@@ -8,10 +8,11 @@ DeepSeek's own Chinese index) using each company's
 **Chinese name and its brands/subsidiaries** (e.g. LX → 乐信/分期乐/Fenqile, plus
 their official websites), stores everything in a small database, translates + scores it with AI (with a
 "what this means" impact sentence), and pushes only the most important items
-to Telegram — **twice a day, Monday to Friday**, pinned to US market time
-(DST-aware): **09:15 ET** before the open and **17:00 ET** an hour after the
-close, both deliberately placed **outside DeepSeek's peak-priced hours** so
-every AI call costs half price. (Weekends are skipped — cron is Mon–Fri.)
+to Telegram — **three times a day, Monday to Friday**, timed for both markets:
+**00:00 ET** (the Chinese news morning — 12:00–13:00 Beijing), **09:15 ET**
+before the US open and **17:00 ET** an hour after the close, all deliberately
+placed **outside DeepSeek's peak-priced hours** so every AI call costs half
+price. (Weekends are skipped — cron is Mon–Fri.)
 
 **Relevance first:** an item must really mention the company (name, alias,
 subsidiary or brand) — sector news that never names it, recycled coverage of
