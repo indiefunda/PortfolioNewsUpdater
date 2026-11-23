@@ -8,10 +8,11 @@
 #
 # What it does:
 #   1. Installs Python deps (requests, feedparser, edgartools, tzdata)
-#   2. Installs FOUR DST-aware cron jobs that run news_updater.py
-#      twice a day, Monday to Friday, pinned to US market time:
-#        Run 1  09:15 ET - 15 minutes before the 09:30 ET open
-#        Run 2  17:00 ET - one hour after the 16:00 ET close
+#   2. Installs SIX DST-aware cron jobs that run news_updater.py THREE times a
+#      day, Monday to Friday:
+#        Run 1  00:00 ET - the Chinese news morning (12:00-13:00 Beijing)
+#        Run 2  09:15 ET - 15 minutes before the 09:30 ET open
+#        Run 3  17:00 ET - one hour after the 16:00 ET close
 #   3. VERIFIES the deployment WITHOUT running the pipeline. It used to run
 #      `--force --dry-run` "to confirm it works", which was not safe: every
 #      database write is gated on --no-write, so that test marked the items it
@@ -21,16 +22,21 @@
 # Why a cron job per season? US Eastern time shifts by 1 hour between DST
 # seasons, but cron fires at fixed UTC times. So we install one job
 # per run per season:
-#     Summer (EDT, UTC-4): 09:15 = 13:15 UTC, 17:00 = 21:00 UTC
-#     Winter (EST, UTC-5): 09:15 = 14:15 UTC, 17:00 = 22:00 UTC
+#     Summer (EDT, UTC-4): 00:00 = 04:00, 09:15 = 13:15, 17:00 = 21:00 UTC
+#     Winter (EST, UTC-5): 00:00 = 05:00, 09:15 = 14:15, 17:00 = 22:00 UTC
 # news_updater.py carries a tiny DST-aware guard that makes the
-# out-of-season job an instant no-op, so exactly two real runs happen
+# out-of-season job an instant no-op, so exactly three real runs happen
 # per day. This is reliable because cron does the exact timing and the
 # correct job is always already installed - no re-setup at DST flips.
 #
-# Both runs deliberately land OUTSIDE DeepSeek's peak-priced windows
+# All three runs deliberately land OUTSIDE DeepSeek's peak-priced windows
 # (01:00-04:00 / 06:00-10:00 UTC Mon-Fri, when API tokens cost DOUBLE):
-# all four UTC times above are off-peak, so every AI call is half price.
+# every UTC time above is off-peak, so every AI call is half price.
+#
+# LINE ENDINGS: this file is uploaded to the VM and executed by bash. It MUST
+# be LF-only. A CRLF copy dies with "line 35: $'\r': command not found" and the
+# upload silently leaves the server on its previous config.
+# _audit/check_line_endings.py enforces it.
 # ============================================================
 
 # NOTE on `set -e`: it is deliberately NOT set. This script runs unattended on

@@ -65,6 +65,7 @@ OFFLINE = [
     ("py", "check_batch_quotes.py", []),
     ("py", "show_pane_order.py", []),
     ("py", "verify_docs.py", []),
+    ("py", "check_line_endings.py", []),
     ("node", "test_tabs.js", []),
     ("node", "test_panel_guard.js", []),
 ]
