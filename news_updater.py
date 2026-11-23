@@ -2,29 +2,32 @@
 """
 PortfolioNewsUpdater - free stock news monitor (v2 - Chinese-first).
 
-Runs on a Google Cloud "Always Free" e2-micro VM. Twice a day, Monday to Friday
-(09:15 and 17:00 ET - the cron entries carry day-of-week 1-5) it checks the
-configured tickers for NEW information since the
-last run - and for Chinese companies it searches CHINESE news sources
-using the company's Chinese name and its subsidiaries (e.g. LX -> 乐信,
-分期乐, 桔子理财), because that is where the real edge is for US-listed
-Chinese companies. Everything found is stored in a SQLite news database,
-translated to English and scored by AI, and only the most important items
-are pushed to Telegram.
+Runs on a Google Cloud "Always Free" e2-micro VM. Three times a day, Monday to
+Friday (00:00, 09:15 and 17:00 ET - the cron entries carry day-of-week 1-5) it
+checks the configured tickers for NEW information since the last run - and for
+Chinese companies it searches CHINESE news sources using the company's Chinese
+name and its subsidiaries (e.g. LX -> 乐信, 分期乐, 桔子理财), plus official
+HKEX filings for dual-listed ADRs/HK stocks, because that is where the real
+edge is for US-listed Chinese companies. Everything found is stored in a SQLite
+news database, translated to English, entity-verified and scored by AI, and
+only the most important items are pushed to Telegram.
 
 Pipeline (v2):
-  TICKERS (+ Chinese names/aliases/subsidiaries + websites, auto-discovered)
-    -> [SEC EDGAR (6-K/8-K content extracted), Google News EN/ZH, Google News
-       site: (official websites), Eastmoney, Baidu, Tavily news search,
-       DeepSeek Search (Chinese in-house index), RSS]
-    -> NORMALIZE -> DEDUPLICATE (SQLite exact hash)
-    -> store EVERY new item in the `news` table
-    -> AI ANALYSIS (one batched call per ticker): translate to English,
-       summarize, categorize, importance 1-10, sentiment, push/store, AND
-       folded dedup (known_event vs the `seen` ledger - no separate call)
-    -> PUSH selection: importance floor + AI veto + regulatory force-push,
-       ranked by importance (Chinese sources weigh higher), per-ticker cap,
-       max_digest_items -> TELEGRAM digest (split into <=4000-char messages)
+  TICKERS (+ Chinese names/aliases/subsidiaries + websites + HK codes)
+    -> [SEC EDGAR official JSON (exact acceptanceDateTime + 6-K/8-K exhibit
+       text), HKEX official filings (prefix.do -> stockId -> titleSearchServlet),
+       Yahoo Finance & Seeking Alpha ticker RSS, Eastmoney 股吧 (Guba),
+       Google News EN/ZH, Google News site: (official websites), Eastmoney,
+       Eastmoney/Sina 7x24 wires, Tavily, DeepSeek Search (Chinese index), RSS]
+    -> NORMALIZE -> RELEVANCE + JUNK GATES -> DEDUPLICATE (SQLite exact hash)
+    -> stage every new item; AI ANALYSIS (one batched call per ticker):
+       entity relevance check, translate to English, summarize, categorize,
+       importance 1-10, sentiment, push/store, AND folded dedup (same-batch
+       duplicate_of + known_event vs pushed_stories ledger)
+    -> promote ONE canonical row per event into `news`
+    -> PUSH selection: fail-closed AI check + primary-event protection +
+       age/repeat gates + regulatory force-push, ranked by importance (Chinese
+       sources weigh higher), per-ticker cap, max_digest_items -> TELEGRAM
     -> ROLLING CLEANUP: news kept 21 days, dedup hashes 21 days (configurable)
 
 New CLI modes:
@@ -9375,9 +9378,10 @@ def main():
         return sources_cfg.get(key, True)
 
     print(f"[{start_time.strftime('%Y-%m-%d %H:%M %Z')}] Checking {len(tickers)} "
-          f"ticker(s) for new news (sources: SEC, GoogleNews, GoogleNewsZH, "
-          f"GoogleNewsSite, Eastmoney, Guba, Eastmoney724, Sina724, Baidu, "
-          f"Tavily, DeepSeekSearch, RSS)...")
+          f"ticker(s) for new news (sources: SEC, HKEX, YahooFinance, "
+          f"SeekingAlpha, GoogleNews, GoogleNewsZH, GoogleNewsSite, "
+          f"Eastmoney, Guba, Eastmoney724, Sina724, Baidu, Tavily, "
+          f"DeepSeekSearch, RSS)...")
 
     # Global Chinese fast-news wires - ONE fetch per wire per run, shared by
     # all tickers (filtered per ticker by its Chinese terms inside the loop).

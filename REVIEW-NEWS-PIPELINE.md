@@ -103,5 +103,28 @@ more defects. All are fixed and pinned by tests; the suite is now **31 checks**.
 | Quality | Auto-generated US filler and `javascript:` links. | Filler patterns added; only `http(s)` becomes a link in either reader. |
 | Tests / docs | 67 hardcoded `F:\...` paths (the suite could not run on a clone); setup docs embedded one user's project id and home directory. | Paths derive from `__file__` (verified from a clone); docs de-personalised, with a swap checklist and the access-allowlist deploy order. |
 
-Still open from section C: **G1** cross-tier duplication, **G2** HKEX filings,
-**G3** press-release wires, and local-language editions — unchanged.
+Still open from section C: **G1** cross-tier duplication and local-language
+editions for non-Chinese/non-English markets. **G2 (HKEX filings)** is now
+**closed**, and **G3 (press-release coverage)** is substantially closed via
+Yahoo Finance & Seeking Alpha ticker-scoped RSS (carrying GlobeNewswire / PR
+Newswire releases).
+
+---
+
+## G. Recall, relevance & primary-source overhaul — 2026-11-23
+
+An end-to-end audit against QFIN, LU, and LX (verified with offline regression
+tests in `_audit/test_alpha_fixes.py` and a live 14-day dry run) closed 10
+pipeline defects and added four free, ticker-scoped primary sources:
+
+| Area | What was wrong | Now |
+|---|---|---|
+| After-hours SEC & date-only delta | `_parse_pub` anchored date-only strings at 12:00 ET, so any filing or URL-dated item published after the 17:00 ET run was dropped next morning as `older_than_delta`. | `_pub_before_since` compares date-only values by calendar day; `fetch_sec_filings` now uses SEC's official submissions JSON API (`data.sec.gov/submissions/CIK{cik}.json`) with exact `acceptanceDateTime` and clean Exhibit 99.x titles. |
+| Rolling DeepSeek lookbacks | `DeepSeekCorp` / `DeepSeekHK` (21d) and `DeepSeekPress` (7d) paid for multi-week searches whose hits >4d old were immediately killed by the 96h ingest and 72h push gates. | `fetch_source` passes per-source `max_age_hours_override` and `max_push_age_hours` ceilings matching each rolling window. |
+| Case-sensitive EN matching | `_term_in_text` matched ASCII terms case-sensitively, dropping uppercase headlines (`QFIN Holdings...`, `LUFAX...`, `LEXINFINTECH...`) in Tavily & DeepSeek. | Case-insensitive word-boundary matching for Latin/English terms. |
+| Discovered brands & stems | `discover_brands` stored brands (`平安普惠`, `奇富借条`) in `keywords`, which `build_zh_terms` searched and `resolve_relevance` ignored; `LexinFintech` did not derive `Lexin`. | `resolve_relevance` includes safe `keywords`; `_latin_name_variants` derives compound brand stems; `CORPORATE_CONTEXT_WORDS` includes reverse split / ADS / SEC / HKEX terms. |
+| `LX` / `LU` collisions & AI gate | `LX Semicon`, `LX Pantos`, `LX International`, and `Lu Zhiqiang resigns...` passed `passes_relevance` as `company`, and ticker-mode `ai_analyze` had no `relevant` question or today's date. | Negative homonym guard + ALL-CAPS requirement for 1–2 letter tickers; ticker-mode `ai_analyze` injects `TODAY'S DATE (ET)` and enforces `relevant: true/false` in `_event_groups` and `select_push_items`. |
+| Staging, grouping & trim loss | `_event_groups` keyed `_number` globally across tickers; macro `promote_run` marked all `run_id` staging rows `promoted=1`; items trimmed past `max_items_per_run` were lost behind an advanced delta. | `_event_groups` keys by `(ticker, _number)`; `promote_run` scopes staging updates to handled tickers; trimmed items are saved unscored into `news` for `rescue_orphans`. |
+| 7×24 wires & macro GNews | Per-ticker wires skipped company mentions that also matched `is_macro()`; `MACRO_GNEWS_QUERY` AND-joined 9 words; Eastmoney `_em` discarded all terms on 1 failure. | Explicit company mentions are always kept on per-ticker wires; `MACRO_GNEWS_QUERY` uses `OR` + `when:7d`; `_em` only fails when all terms fail. |
+| Wordlists & fail-closed | `#` comments lived inside triple-quoted wordlists; `\bLLP\b` never matched lowercased text; regulatory keyword boost overrode AI fail-closed when no key was set. | `_wordlist()` strips comments; `is_junk_content` matches case-insensitively and filters live law-firm/Xueqiu/Yahoo quote templates; `_ai_unavailable` strictly blocks pushes. |
+| **New primary sources (G2 closed)** | HKEX returned 0 because `titleSearchServlet` needs internal `stockId`; no ticker-scoped English RSS. | Added free **HKEX** (`prefix.do` → `stockId` → `titleSearchServlet.do`, auto-mapped via `KNOWN_HK_CODES` for `QFIN`/`LU`/ADRs, treated as `is_primary_event`), **Yahoo Finance** & **Seeking Alpha** ticker RSS, and Guba `stockbar_name` matching. |

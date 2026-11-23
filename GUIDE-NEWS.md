@@ -241,9 +241,9 @@ on the market, so expect this when you replace the list:
 
 | New holdings | What you get |
 |---|---|
-| **US-listed Chinese ADRs** | The full design: Chinese wires/portals, English + SEC, Chinese macro. |
-| **HK-listed Chinese names** | Good: Chinese sources + English + SEC-less fundamentals; **no HKEX filings** (documented gap). |
-| **US / UK / EU blue chips** | SEC (US only) + Google News EN + Tavily. English-name matching now derives the headline form, but add `aliases_en` for rebrands. The macro tier is China-specific and is **skipped automatically** when no holding has a Chinese name. |
+| **US-listed Chinese ADRs** | The full design: SEC EDGAR JSON (exact timestamps + 6-K exhibits), **official HKEX filings** for dual-listed names (QFIN `03660`, LU `06623`, etc.), Eastmoney 股吧 (Guba) + 7x24 wires, per-name Google News zh/EN, Yahoo Finance + Seeking Alpha RSS, DeepSeek Search, Chinese macro. |
+| **HK-listed Chinese names** | Strong: **official HKEX filings** (via `prefix.do` → `stockId` → `titleSearchServlet.do`), Chinese portals/wires, English + DeepSeek Search. |
+| **US / UK / EU blue chips** | SEC EDGAR JSON (US only) + Yahoo Finance + Seeking Alpha + Google News EN + Tavily. English-name matching derives headline forms and compound stems, and you can add `aliases_en` for rebrands. The macro tier is China-specific and is **skipped automatically** when no holding has a Chinese name. |
 | **Japan / other non-English, non-Chinese** | Thin: there is no `hl=ja`/`hl=de` edition, so only English and Chinese coverage is searched. |
 
 Checklist for a swap:
@@ -682,15 +682,9 @@ paid source by two orders of magnitude:
   meter (DeepSeek: n/100 today…).
 - **Where it runs:** a fan-out per ticker, all on the same cheap budget:
   1. **baseline** — `<name> 新闻 after:<date> lang:zh` (fresh news);
-  2. **corporate actions** — `合股 并股 拆股 ADS比例变更` over a **rolling
-     21-day window**. Announcements are made once, so a 24 h delta never sees
-     them; this is what found the LU 1-for-10 reverse split;
-  3. **HK listing code** — `<code> <name>` over the same 21-day window when
-     `ticker_meta` has an `hk_code` (LU `06623`, QFIN `03660`). HKEX
-     announcements and the Chinese portals' summaries are indexed there;
-  4. **rotating press site** — one of 证券时报/财联社/第一财经/21世纪经济报道/
-     中国证券报 per day, over the last 7 days (`site:` + `after:` works;
-     a multi-site OR with `before:`/`lang:` returned almost nothing).
+  2. **corporate actions** — 14 event words (`财报 业绩 公告 回购 减持 私有化 监管 处罚 高管 合股 并股 拆股 ADS比例变更`) over a **rolling 21-day window** (with ingest/push age ceilings lifted to match so finds older than 4 days are not discarded);
+  3. **HK listing code** — `<code> <name>` over the same 21-day window using `ticker_meta.hk_code` or built-in `KNOWN_HK_CODES` (LU `06623`, QFIN `03660`, BABA `09988`, etc.). Complements the direct free **HKEX** source with Chinese portal summaries;
+  4. **rotating press site** — one of 证券时报/财联社/第一财经/21世纪经济报道/中国证券报 per day, over the last 7 days (with a 7-day age ceiling).
   Plus one macro query and up to two discovery queries.
 - **Aliases matter:** the HK press writes 陆控, not 陆金所 — that alias is in
   `ticker_meta` and is what lets those summaries through the relevance gate.

@@ -1,46 +1,54 @@
 # 📰 PortfolioNewsUpdater
 
 A personal stock-news monitor that actually finds the news that matters for
-**US-listed Chinese companies**. It searches **Chinese-language sources**
-(Google News zh-CN, 东方财富/Eastmoney, the **Eastmoney + Sina 7x24
-real-time news wires**, **EXA neural search**, Tavily, and **DeepSeek Search** —
-DeepSeek's own Chinese index) using each company's
-**Chinese name and its brands/subsidiaries** (e.g. LX → 乐信/分期乐/Fenqile, plus
-their official websites), stores everything in a small database, translates + scores it with AI (with a
-"what this means" impact sentence), and pushes only the most important items
+**US-listed Chinese companies** (and any US/HK watchlist). It combines
+**ticker-scoped primary feeds** (**SEC EDGAR official JSON** with exact
+to-the-second filing timestamps and 6-K/8-K exhibit text, **official HKEX
+filings** for dual-listed ADRs like QFIN `03660.HK` / LU `06623.HK` and HK
+stocks, **Eastmoney 股吧/Guba**, **Yahoo Finance** & **Seeking Alpha** ticker
+RSS) with **Chinese-language search & wires** (per-name Google News zh-CN/HK,
+the **Eastmoney + Sina 7x24 real-time news wires**, **EXA neural search**,
+Tavily, and **DeepSeek Search** — DeepSeek's own Chinese index) using each
+company's **Chinese name, discovered brands, and subsidiaries** (e.g. LX →
+乐信/分期乐/Fenqile, plus their official websites). Everything found is stored
+in a small database, entity-verified, translated and scored with AI (with a
+"what this means" impact sentence), and only the most important items are pushed
 to Telegram — **three times a day, Monday to Friday**, timed for both markets:
 **00:00 ET** (the Chinese news morning — 12:00–13:00 Beijing), **09:15 ET**
 before the US open and **17:00 ET** an hour after the close, all deliberately
 placed **outside DeepSeek's peak-priced hours** so every AI call costs half
 price. (Weekends are skipped — cron is Mon–Fri.)
 
-**Relevance first:** an item must really mention the company (name, alias,
-subsidiary or brand) — sector news that never names it, recycled coverage of
-an event you already have, and cross-outlet copies of the same story are
-dropped or collapsed before they can reach you. A story about the insurance
-industry is not a HUIZ alert.
+**Relevance first:** every item passes both mechanical company-mention /
+homonym guards (blocking collisions like South Korea's LX Semicon / LX Pantos
+for `LX` or surname "Lu" for `LU`, plus law-firm claim-farming and quote-page
+templates) **and** an AI entity-relevance check in ticker mode. Recycled
+coverage of an event you already have and cross-outlet copies of the same story
+are dropped or collapsed before they can reach you.
 
 **Any watchlist, not just this one:** each ticker's Chinese name, English short
-form and `aliases_en` are used to match headlines, so a legal name like "Toyota
-Motor Corporation" still matches "Toyota". Swapping the whole portfolio works —
-with Chinese/HK names the Chinese sources carry it; for US names you get
-SEC + Google News + Tavily and the China-macro tier switches itself off. See
-**Swapping the whole watchlist** in GUIDE-NEWS.md for the checklist.
+form (including compound stems like `LexinFintech` → `Lexin`), discovered
+brands, and `aliases_en` are used to match headlines, so a legal name like
+"Toyota Motor Corporation" still matches "Toyota". Swapping the whole portfolio
+works — with Chinese/HK names the Chinese sources + HKEX carry it; for US names
+you get SEC + Yahoo Finance + Seeking Alpha + Google News + Tavily and the
+China-macro tier switches itself off. See **Swapping the whole watchlist** in
+GUIDE-NEWS.md for the checklist.
 
 **Two ways to use it:** the scheduled watchlist above; and the panel's
 **🔎 Deep search** tab for a one-off look at *any* ticker — it discovers that
 company's brands on the fly, searches the last 1–6 months, scores each article,
 and gives a short bullish/bearish read. **It saves nothing.**
 
-**The edge:** a penalty to 分期乐, a HK subsidiary's license news, an
-official-site announcement, a flash item on the Chinese wire, a **semantic
-EXA find** ("the Shenzhen-based insurer" → Huize), a **DeepSeek Search find**
-from its own Chinese index — or a **huge China macro
-move (rate cuts, stimulus, assisted-loan regulation) pushed in a dedicated
-📢 CHINA MACRO section** — the stuff US English media never covers, delivered
-hours earlier. (Per-ticker EXA is **off** by default: it cost a credit per
-ticker per run and almost never returned an item about the company. EXA is
-still used for the macro tier and for company discovery.)
+**The edge:** an official **HKEX** earnings-date, buyback, or inside-information
+filing hours before US markets open, a penalty to 分期乐, an official-site
+announcement, a flash item on the Chinese 7x24 wire, a **Guba** Chinese
+breakdown of a filing, a **DeepSeek Search** rolling corporate-action find — or
+a **huge China macro move (rate cuts, stimulus, assisted-loan regulation)
+pushed in a dedicated 📢 CHINA MACRO section** — the stuff US English media
+never covers, delivered hours earlier. (Per-ticker EXA is **off** by default:
+it cost a credit per ticker per run and almost never returned an item about the
+company. EXA is still used for the macro tier and for company discovery.)
 
 - Everything runs on a **free** Google Cloud e2-micro VM ($0).
 - Cost is **under $1/month** (see below): free sources + a tiny DeepSeek Search

@@ -136,10 +136,14 @@ DEFAULT_CONFIG = {
     "deepseek_max_monthly_searches": 2000,
     "sources": {
         "sec": True,
+        "hkex": True,  # Official HKEX filings (prefix.do -> stockId -> titleSearchServlet)
+        "yahoo_finance": True,  # Yahoo Finance per-ticker RSS (PR wires, earnings, Nasdaq notices)
+        "seeking_alpha": True,  # Seeking Alpha per-ticker RSS (flashes, earnings, transcripts)
         "google_news_zh": True,
         "google_news_site": True,  # official company websites (site: search)
         "google_news_macro": True,  # macro query (rate cuts / loan regulation)
         "eastmoney": True,
+        "guba": True,  # Eastmoney 股吧 per-stock Chinese board
         "eastmoney_724": True,  # Eastmoney 7x24 fast-news wire (real-time tape)
         "sina_724": True,  # Sina 7x24 fast-news wire
         "exa": True,  # EXA neural per-ticker impact search
@@ -630,7 +634,7 @@ HTML = """<!DOCTYPE html>
     <button class="btn-ghost" onclick="copyWebUrl()">📋 Copy link</button>
     <span class="status" id="webAppUrl" style="margin-bottom:0;flex:1">—</span>
   </div>
-  <div class="sub">Searches SEC (with 6-K/8-K content), Chinese news (乐信/分期乐… via Google News zh, Eastmoney, Tavily, official websites), English news and RSS — translates &amp; scores everything with AI, pushes the top items to Telegram. Runs twice a day at 9:15 ET (pre-open) &amp; 17:00 ET (post-close), auto-adjusted for DST.</div>
+  <div class="sub">Searches SEC EDGAR (exact timestamps + 6-K/8-K exhibits), HKEX official filings, Chinese news (乐信/分期乐… via Google News zh, Eastmoney 股吧 &amp; 7x24 wires, DeepSeek Search, Tavily, official websites), and English ticker feeds (Yahoo Finance, Seeking Alpha, Google News, RSS) — entity-verifies, translates &amp; scores everything with AI, and pushes the top items to Telegram. Runs three times a day Mon–Fri at 00:00 ET (China morning), 09:15 ET (pre-open) &amp; 17:00 ET (post-close), auto-adjusted for DST.</div>
   <div class="tabs" id="tabbar">
     <button class="tab" data-tab="scan" onclick="showTab('scan')">🔎 Deep search</button>
     <button class="tab" data-tab="setup" onclick="showTab('setup')">⚙️ Setup &amp; schedule</button>

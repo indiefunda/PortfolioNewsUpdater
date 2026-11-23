@@ -12,13 +12,13 @@ import sys
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 B = ROOT
-nu_src = io.open(B + r"\news_updater.py", encoding="utf-8").read()
-cm_src = io.open(B + r"\cloud_manager.py", encoding="utf-8").read()
-sh_src = io.open(B + r"\setup_cloud.sh", encoding="utf-8").read()
-readme = io.open(B + r"\README.md", encoding="utf-8").read()
-guide = io.open(B + r"\GUIDE-NEWS.md", encoding="utf-8").read()
+nu_src = io.open(os.path.join(B, "news_updater.py"), encoding="utf-8").read()
+cm_src = io.open(os.path.join(B, "cloud_manager.py"), encoding="utf-8").read()
+sh_src = io.open(os.path.join(B, "setup_cloud.sh"), encoding="utf-8").read()
+readme = io.open(os.path.join(B, "README.md"), encoding="utf-8").read()
+guide = io.open(os.path.join(B, "GUIDE-NEWS.md"), encoding="utf-8").read()
 
-spec = importlib.util.spec_from_file_location("nu", B + r"\news_updater.py")
+spec = importlib.util.spec_from_file_location("nu", os.path.join(B, "news_updater.py"))
 nu = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nu)
 
@@ -65,8 +65,8 @@ check("docs describe pushed_stories as the history",
 
 # 6. Tavily caps agree everywhere
 import json
-ex = json.load(io.open(B + r"\config_local.example.json", encoding="utf-8"))
-cm = importlib.util.spec_from_file_location("cm", B + r"\cloud_manager.py")
+ex = json.load(io.open(os.path.join(B, "config_local.example.json"), encoding="utf-8"))
+cm = importlib.util.spec_from_file_location("cm", os.path.join(B, "cloud_manager.py"))
 cmm = importlib.util.module_from_spec(cm)
 cm.loader.exec_module(cmm)
 vals = {
