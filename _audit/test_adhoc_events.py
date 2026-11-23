@@ -11,6 +11,8 @@ BASE = ROOT
 sys.path.insert(0, BASE)
 os.chdir(BASE)
 import news_updater as nu
+import datetime as _dt
+RECENT = (_dt.date.today() - _dt.timedelta(days=3)).isoformat()
 
 fails = []
 def check(name, cond, detail=""):
@@ -38,16 +40,16 @@ RECYCLED = ("乐信2024年财报回顾", "GoogleNewsZH", "https://news.example/5
 OTHER = ("乐信宣布3亿美元回购计划", "GoogleNewsZH", "https://news.example/6")
 
 def fake_rss(url, ticker, since, source=None, lang=None, **kw):
-    return [{"title": t, "url": u, "snippet": "", "date": "2026-10-15",
+    return [{"title": t, "url": u, "snippet": "", "date": RECENT,
              "source": source, "lang": lang or "zh"}
             for t, s, u in (COPIES + [JUNK, RECYCLED, OTHER]) if s == source]
 
 nu.fetch_rss = fake_rss
 nu.fetch_eastmoney_search = lambda term, since=None, terms=None: [
-    {"title": t, "url": u, "snippet": "", "date": "2026-10-15", "source": "Eastmoney", "lang": "zh"}
+    {"title": t, "url": u, "snippet": "", "date": RECENT, "source": "Eastmoney", "lang": "zh"}
     for t, s, u in COPIES if s == "Eastmoney"]
 nu.fetch_tavily = lambda q, sec, cfg, since=None, limit=8, topic="news", terms=None: [
-    {"title": t, "url": u, "snippet": "", "date": "2026-10-15", "source": "Tavily", "lang": "en"}
+    {"title": t, "url": u, "snippet": "", "date": RECENT, "source": "Tavily", "lang": "en"}
     for t, s, u in COPIES if s == "Tavily"]
 # The DeepSeek source is newer than this fixture; stub it so the test stays
 # offline (a real call with the fake key would log a 401 and hit the network).

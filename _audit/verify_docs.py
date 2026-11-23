@@ -27,8 +27,8 @@ def check(name, ok, detail=""):
     results.append((name, ok, detail))
 
 # 1. schedule times
-check("run times are 09:15 and 17:00 ET",
-      nu.SCHEDULE_RUN_TIMES == (nu.dtime(9, 15), nu.dtime(17, 0)),
+check("run times are 00:00, 09:15 and 17:00 ET",
+      nu.SCHEDULE_RUN_TIMES == (nu.dtime(0, 0), nu.dtime(9, 15), nu.dtime(17, 0)),
       str(nu.SCHEDULE_RUN_TIMES))
 check("docs no longer mention 16:45 ET",
       "16:45" not in readme and "16:45" not in guide)

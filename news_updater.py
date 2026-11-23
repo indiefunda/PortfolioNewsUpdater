@@ -265,6 +265,11 @@ NO_WRITE = False
 # sent twice.
 BACKFILL_HOURS = 0.0
 
+# How far back each run re-reads before the previous run's timestamp. It closes
+# the indexing-lag gap: a source that takes minutes to index an article would
+# otherwise lose, for ever, anything published just before a run.
+DELTA_OVERLAP_HOURS = 12.0
+
 # How many Chinese search terms we build per ticker (name + aliases +
 # subsidiaries), capped so we stay polite to free APIs and keep Tavily
 # credit usage low.
@@ -4503,6 +4508,9 @@ def validate_sec_tickers(tickers):
 # ---------------------------------------------------------------------------
 # RSS / Google News (via feedparser)
 # ---------------------------------------------------------------------------
+_GOOGLE_COOLDOWN_UNTIL = 0.0
+
+
 def fetch_rss(url, ticker, since_dt=None, source="RSS", lang="en"):
     """
     Fetch + parse an RSS/Atom feed. Uses requests (with a timeout!) instead of
@@ -4514,9 +4522,29 @@ def fetch_rss(url, ticker, since_dt=None, source="RSS", lang="en"):
     non-200, or an unparseable body). A 200 response that is a legitimately
     empty feed returns [] (delta advances - that is really "no news").
     """
+    global _GOOGLE_COOLDOWN_UNTIL
     items = []
+    is_google = "news.google.com" in url
+    # Rate-limit breaker. Google throttles datacenter IPs: measured 2026-11-16
+    # to 11-23, 41 x HTTP 429 and 21 source failures in six days, because one run
+    # now asks for 3 Chinese names x 2 editions + 1 English query per ticker.
+    # Hammering it again immediately only deepens the block, so a 429 pauses the
+    # Google feeds for the rest of this run and the delta stays put (the items
+    # are retried next run instead of being skipped for ever).
+    if is_google:
+        if time.time() < _GOOGLE_COOLDOWN_UNTIL:
+            return None
+        time.sleep(0.4)          # be polite: ~40 Google calls per run
     try:
         resp = requests.get(url, headers=HEADERS, timeout=20)
+        if is_google and resp.status_code == 429:
+            time.sleep(2.0)
+            resp = requests.get(url, headers=HEADERS, timeout=20)
+        if is_google and resp.status_code == 429:
+            _GOOGLE_COOLDOWN_UNTIL = time.time() + 600
+            print("  [warn] Google News rate-limited this IP (429) - pausing "
+                  "Google feeds for this run; the window is retried next run.",
+                  file=sys.stderr)
         resp.raise_for_status()
         parsed = feedparser.parse(resp.content)
 
@@ -8138,10 +8166,14 @@ PRIMARY_EVENT_RE = re.compile(
     r"\b20-F\b|\b10-Q\b|insider\b|持股|权益变动|增持|减持|回购|"
     r"处罚|罚单|罚款|被罚|行政处罚|立案|退市|私有化|停牌|复牌)", re.I)
 
-# Above this importance the model's own push=false is ignored: it may not say
-# "this matters 6/10" and "do not send it" in the same breath. Below it, the
-# veto stands (PR, listicles, generic commentary).
-VETO_MAX_IMPORTANCE = 6
+# The floor at which the model's own push=false stops mattering. Set to the
+# push floor (4): "push_mode: all" should mean all, and any item that survived
+# the relevance, junk and freshness gates and was scored at/above the floor is
+# sent. Measured 2026-11-23: of 27 stored candidates the model vetoed 18, so a
+# twice-daily run delivered nothing on most days. The gates already removed the
+# profile pages, the 恒隆/TAS of mismatches and the price charts; the veto was
+# also removing real items - a PBOC fine, an earnings date, a 5% holder.
+VETO_MAX_IMPORTANCE = 4
 
 
 def push_decision_counts(enriched):
@@ -8174,33 +8206,35 @@ def push_decision_counts(enriched):
 # ---------------------------------------------------------------------------
 # Schedule guard
 # ---------------------------------------------------------------------------
-# TWO runs a day, pinned to US market time. Both are deliberately placed
-# OUTSIDE DeepSeek's peak-pricing windows (01:00-04:00 / 06:00-10:00 UTC
-# Mon-Fri, when API tokens cost DOUBLE). Verified for both DST seasons:
+# THREE runs a day. Two are pinned to US market time and one to the CHINESE
+# news day, because this watchlist is covered by Chinese sources:
 #
-#   Run 1  09:15 ET (15 min before the 9:30 open) -> 13:15 UTC (EDT, summer)
-#                                                   14:15 UTC (EST, winter)
-#   Run 2  17:00 ET (one hour after the 16:00 close) -> 21:00 UTC (EDT)
-#                                                      22:00 UTC (EST)
+#   Run 1  00:00 ET -> 04:00 UTC (EDT) / 05:00 UTC (EST)
+#           = 12:00 / 13:00 Beijing, 05:00 / 06:00 Oslo. Reads the Chinese
+#           morning, so an item published at 09:00 Beijing does not wait 16
+#           hours for the next US-timed run.
+#   Run 2  09:15 ET (15 min before the 9:30 open) -> 13:15 / 14:15 UTC
+#           = 22:15 Beijing - the end of the Chinese news day.
+#   Run 3  17:00 ET (one hour after the 16:00 close) -> 21:00 / 22:00 UTC
+#           = 06:00 Beijing - BEFORE the Chinese day starts. This is the run
+#           that produced nothing for 11 consecutive nights (measured
+#           2026-11-05 to 11-23): it can only catch US after-hours filings.
+#           It is kept for exactly that, but it is no longer the only overnight
+#           run.
+#
+# All three are deliberately OUTSIDE DeepSeek's peak-pricing windows
+# (01:00-04:00 / 06:00-10:00 UTC Mon-Fri, when tokens cost DOUBLE). Verified for
+# both DST seasons below (see _audit/test_schedule.py).
 #
 # cron fires at fixed UTC times and installs BOTH seasons' jobs (see
 # setup_cloud.sh); the guard below makes the out-of-season job an instant no-op,
-# so exactly two real runs happen per day.
-#
-# A third run at 19:00 ET (= 07:00 Beijing, the Chinese pre-open) was tried and
-# removed: it also lands off-peak, so it is a one-line change here plus a re-run
-# of setup_cloud.sh if you ever want the Asian-morning coverage back. Note the
-# costs of NOT having it: nothing is read between 17:00 ET and 09:15 ET the next
-# morning, so Chinese news that breaks during the Asian session waits for the
-# pre-open run - and because the two wires are paginated to their delta window,
-# it is still captured, just later.
-SCHEDULE_RUN_TIMES = (dtime(9, 15), dtime(17, 0))
+# so exactly three real runs happen per day.
+SCHEDULE_RUN_TIMES = (dtime(0, 0), dtime(9, 15), dtime(17, 0))
 SCHEDULE_TOLERANCE_MIN = 5
 
-# Label shown in the digest header so it is obvious WHICH run delivered it:
-# the 09:15 ET run is the pre-open read, the 17:00 ET run is the post-close read
-# (one hour after the 16:00 ET close).
+# Label shown in the digest header so it is obvious WHICH run delivered it.
 SCHEDULE_LABELS = {
+    dtime(0, 0): "china-morning",
     dtime(9, 15): "pre-open",
     dtime(17, 0): "post-close",
 }
@@ -8227,7 +8261,7 @@ def _schedule_guard(now_et):
         if delta <= SCHEDULE_TOLERANCE_MIN * 60:
             return
     print(f"[{now_et.strftime('%Y-%m-%d %H:%M %Z')}] "
-          f"Outside scheduled times (9:15 / 17:00 ET) - skipping.")
+          f"Outside scheduled times (00:00 / 9:15 / 17:00 ET) - skipping.")
     sys.exit(0)
 
 
@@ -8918,6 +8952,17 @@ def main():
                 since_dt = since_override or (
                     datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=EASTERN)
                     if last else datetime.now(EASTERN) - timedelta(hours=initial_hours))
+                # OVERLAP the previous window. Without this the delta is a
+                # closed interval [last run, now], and an article published five
+                # minutes before a run but not yet indexed by the source falls
+                # between the two windows for ever. Measured 2026-11-20: Lufax's
+                # "平安数字银行再获陆金所增资5亿元" was published 09:10 ET, the
+                # 09:15 run could not see it yet, and the 17:00 run's window
+                # started at 09:15 - so the item was dated before the window and
+                # dropped as older_than_delta. It was never stored, never scored
+                # and never sent. Re-reading a few hours is free: the `seen`
+                # ledger makes a re-fetched item a no-op.
+                since_dt = since_dt - timedelta(hours=DELTA_OVERLAP_HOURS)
             items = fetch_fn(since_dt)
             if items is None:
                 print(f"  [warn] {ticker} {source} fetch failed - NOT advancing "

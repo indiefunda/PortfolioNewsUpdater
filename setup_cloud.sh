@@ -88,11 +88,10 @@ echo "[3/3] Setting up the DST-aware 2x-daily schedule (cron)..."
 # an old or broken schedule).
 sudo rm -f /etc/cron.d/news-summer /etc/cron.d/news-winter 2>/dev/null || true
 
-# Compute both seasons' UTC firing times from the SAME source of truth as
-# news_updater.py (America/New_York DST rules). This keeps the schedule
-# correct for every year automatically. Runs (ET): 09:15 (15 min before the
-# 09:30 open) and 17:00 (one hour after the 16:00 close). Both land off-peak
-# for AI pricing in BOTH seasons (13:15/21:00 UTC in EDT, 14:15/22:00 in EST).
+# Compute both seasons UTC firing times from the SAME source of truth as
+# news_updater.py (America/New_York DST rules). Runs (ET): 00:00 (the Chinese
+# news morning - 12:00/13:00 Beijing), 09:15 (pre-open) and 17:00 (post-close).
+# All three land off-peak for AI pricing in BOTH seasons.
 SCHEDULE_JSON="$("$PYTHON" - <<'PYEOF'
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -113,7 +112,7 @@ def cron_fields(month, day, hour, minute):
     return u.strftime("%M"), u.strftime("%H")
 # July 1 = EDT (summer), Jan 1 = EST (winter). Each run gets its OWN line
 # because the minutes differ between runs.
-RUNS = [(9, 15), (17, 0)]
+RUNS = [(0, 0), (9, 15), (17, 0)]
 for season, month, day in (("summer", 7, 1), ("winter", 1, 1)):
     for i, (h, m) in enumerate(RUNS):
         mn, hr = cron_fields(month, day, h, m)
@@ -154,7 +153,7 @@ GREP="$(command -v grep || echo /bin/grep)"
 # pairs, so a failed SCHEDULE_JSON parse used to produce an EMPTY schedule that
 # still got "installed" and reported as success - leaving the VM with no jobs.
 SCHEDULE_COUNT="$(printf '%s\n%s\n' "$SUMMER_LINES" "$WINTER_LINES" | "$GREP" -c 'news_updater' || true)"
-if [ "${SCHEDULE_COUNT:-0}" -lt 4 ]; then
+if [ "${SCHEDULE_COUNT:-0}" -lt 6 ]; then
   echo "  ❌ Built only ${SCHEDULE_COUNT:-0} cron line(s); expected 4 (2 runs x 2 seasons)."
   echo "     The schedule could not be derived - nothing was installed."
   exit 1

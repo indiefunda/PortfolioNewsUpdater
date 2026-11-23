@@ -18,8 +18,8 @@ spec.loader.exec_module(nu)
 
 UTC = ZoneInfo("UTC")
 PEAK = [(1, 4), (6, 10)]           # DeepSeek double-price windows (UTC, Mon-Fri)
-CRON_SLOTS = [(13, 15), (21, 0), (14, 15), (22, 0)]   # what cron now fires
-EXPECTED_RUNS_PER_DAY = 2
+CRON_SLOTS = [(4, 0), (5, 0), (13, 15), (21, 0), (14, 15), (22, 0)]   # what cron now fires
+EXPECTED_RUNS_PER_DAY = 3
 
 print("cron slots (UTC) -> behavior")
 print("-" * 72)
@@ -67,7 +67,7 @@ for label, month, day in (("EDT week", 7, 6), ("EST week", 1, 5)):
                 fired += 1
                 if any(lo <= hh < hi for lo, hi in PEAK):
                     peak_fired += 1
-    expected = EXPECTED_RUNS_PER_DAY * 5     # two runs x five weekdays
+    expected = EXPECTED_RUNS_PER_DAY * 5     # three runs x five weekdays
     good = fired == expected and peak_fired == 0
     if not good:
         fail += 1
