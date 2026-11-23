@@ -463,18 +463,23 @@ JUNK_CONTENT_PATTERNS = (
     r"investors? (?:with losses|may seek|encouraged|urged)",
     r"shareholders? (?:who lost|urged|encouraged)",
     r"deadline (?:soon|approaching|reminder)", r"lead plaintiff",
-    r"law offices? of", r"\bLLP\b", r"law firm",
+    r"law offices? of", r"\bllp\b", r"law firm", r"\blaw\s+group\b",
+    r"\bsbs law\b", r"opportunity to lead", r"stockholder reminder",
+    r"shareholder reminder", r"securities fraud (?:class action|lawsuit)",
     r"encouraged to (?:contact|secure)", r"shareholder rights",
     r"reminds investors", r"investigation on behalf of",
     r"集体诉讼", r"投资者索赔",
     # Quote / valuation / template pages.
     r"stock price,? news,? quote", r"quote & history", r"stock valuation",
     r"peer comparison", r"consensus (?:target|price target|rating)",
-    # Chinese quote/profile template pages, which DeepSeek's Chinese index
-    # surfaces readily: "乐信(LX)_个股概览_股票价格_实时行情_走势图...",
-    # "乐信(NASDAQ:LX)-公司资料-美股-搜狐", "...-财务概况-英为财情".
+    r"stock forecast & analyst predictions", r"stock price prediction",
+    r"analyst ratings,? estimates", r"insider ownership and holdings",
+    r"\bincome statement\b", r"\bbalance sheet\b",
+    r"\bcash flow(?:\s+statement|\s*[-–—|])", r"\btechnical analysis\b",
+    # Chinese quote/profile/discussion template pages (DeepSeek / Xueqiu):
+    # "乐信(LX)_个股概览_...", "陆控(LU)_陆控怎么样 - 热门讨论 - 雪球".
     r"个股概览", r"实时行情", r"走势图", r"行情走势", r"公司资料",
-    r"公司概况", r"财务概况",
+    r"公司概况", r"财务概况", r"热门讨论", r"怎么样\s*[-–—]",
     # Profile / quote pages the new DeepSeek fan-out surfaced for quiet names.
     r"公司做什麼|公司做什么", r"首页概览|首頁概覽", r"过往股价|過往股價",
     r"公司简介|公司簡介", r"公司概览|公司概覽",
@@ -485,7 +490,7 @@ JUNK_CONTENT_PATTERNS = (
     # "元保 (YB)" and "元保_F10"), and they were being stored at importance 2.
     r"^\S+\s*\([a-z0-9.\-]{1,6}\)\s*$", r"(?<![a-z0-9])f10(?![a-z0-9])",
     r"reaches? new (?:1|one)-year (?:low|high)",
-    r"sets new (?:12|twelve)-month (?:low|high)",
+    r"(?:sets|hits?) new (?:12|twelve)-month (?:low|high)",
     r"stock (?:holds|holding) (?:ground|steady)",
     r"here'?s what happened", r"stock price today",
     # US auto-generated filler (Zacks/Yahoo/MarketBeat templates). A non-Chinese
@@ -494,7 +499,7 @@ JUNK_CONTENT_PATTERNS = (
     r"what you should know", r"shares? (?:sold|bought|acquired|purchased) by",
     r"(?:gains?|falls?|slides?|rises?|drops?|jumps?) as (?:the )?market",
     r"stock price (?:down|up|falls?|rises?|jumps?|drops?|slides?)",
-    r"should you (?:buy|sell|hold)", r"time to buy",
+    r"should you (?:buy|sell|hold)", r"time to (?:buy|sell)",
     r"press releases?$", r"earnings calendar for", r"options chain",
 )
 
@@ -510,7 +515,14 @@ def is_junk_content(text):
     if not text:
         return False
     low = str(text).lower()
-    return any(re.search(p, low) for p in JUNK_CONTENT_PATTERNS)
+    if any(re.search(p, low, re.IGNORECASE) for p in JUNK_CONTENT_PATTERNS):
+        return True
+    # Bare quote pages wrapped with an outlet tail, e.g.
+    # "Lufax Holding Ltd (0VU2.F) - Yahoo! Finance Canada".
+    stripped = re.sub(r"\s+[-–—|]\s+[^-–—|]{2,40}$", "", low).strip()
+    if stripped and re.fullmatch(r"[^()]{2,60}\([a-z0-9.:_\-]{2,14}\)", stripped):
+        return True
+    return False
 # How many of a ticker's already-pushed titles the mechanical repeat gate
 # compares a new candidate against.
 PUSH_REPEAT_HISTORY = 160
@@ -589,6 +601,23 @@ def _parse_pub(s, naive_tz=EASTERN):
         except Exception:
             continue
     return None
+
+
+def _pub_before_since(raw_date, pub_dt, since_dt):
+    """
+    True when an item's publish time is strictly older than `since_dt`.
+
+    DATE-ONLY strings (SEC filing_date, URL-extracted dates, date-only Tavily
+    hits) are anchored at 12:00 ET by _parse_pub. Comparing 12:00 ET against an
+    evening run's `since_dt` (e.g. 17:00 ET on the same day) dropped EVERY
+    after-hours filing as older_than_delta. For date-only values, compare by
+    calendar day instead - the `seen` ledger prevents same-day duplicates.
+    """
+    if since_dt is None or pub_dt is None:
+        return False
+    if _is_date_only(raw_date):
+        return pub_dt.astimezone(EASTERN).date() < since_dt.astimezone(EASTERN).date()
+    return pub_dt < since_dt
 
 # ---------------------------------------------------------------------------
 # File helpers
@@ -1358,21 +1387,33 @@ def _event_groups(items, drop_known=True):
     "recycled/older story" - history the user asked to see, just flagged.
 
     Returns (canonical_items, dropped_items). A dropped item is either a copy of
-    a canonical item in this batch, or a recycled story already delivered.
+    a canonical item in this batch, an AI-rejected irrelevant item, or a recycled
+    story already delivered.
     """
+    # ai_analyze numbers each ticker's batch 1..N independently, so the lookup
+    # MUST be keyed by (ticker, _number); a bare _number collided across tickers
+    # and attached QFIN copies onto LU/LX rows.
     by_num = {}
-    for idx, it in enumerate(items, 1):
+    per_ticker_idx = {}
+    for it in items:
+        tk = str(it.get("ticker") or "")
+        per_ticker_idx[tk] = per_ticker_idx.get(tk, 0) + 1
         if not it.get("_number"):
-            it["_number"] = idx
-        by_num[it["_number"]] = it
+            it["_number"] = per_ticker_idx[tk]
+        by_num[(tk, it["_number"])] = it
     dropped, copies = [], {}
     for it in items:
+        if it.get("relevant") is False:
+            it["_drop_reason"] = "ai_irrelevant"
+            dropped.append(it)
+            continue
         if it.get("is_known") and drop_known:
             it["_drop_reason"] = "already_delivered"
             dropped.append(it)
             continue
         if it.get("is_dup"):
-            canon = by_num.get(it.get("_dup_of"))
+            tk = str(it.get("ticker") or "")
+            canon = by_num.get((tk, it.get("_dup_of")))
             if canon is not None and canon is not it:
                 copies.setdefault(id(canon), []).append(it)
                 it["_drop_reason"] = "same_event"
@@ -1401,7 +1442,7 @@ def _event_groups(items, drop_known=True):
     return canonical, dropped
 
 
-def promote_run(conn, items, run_id=None):
+def promote_run(conn, items, run_id=None, tickers=None):
     """
     Promote the canonical item of each event into `news`; drop its copies.
 
@@ -1409,12 +1450,13 @@ def promote_run(conn, items, run_id=None):
     row has to exist for the update to land).
     Returns (promoted, merged_copies, already_delivered).
     """
-    if NO_WRITE or conn is None or not items:
+    if NO_WRITE or conn is None or (not items and not (run_id and tickers)):
         return 0, 0, 0
-    canonical, dropped = _event_groups(items)
+    canonical, dropped = _event_groups(items) if items else ([], [])
     known = sum(1 for it in dropped
                 if it.get("_drop_reason") == "already_delivered")
-    copies = len(dropped) - known
+    copies = sum(1 for it in dropped
+                 if it.get("_drop_reason") == "same_event")
     for it in canonical:
         row = dict(it)
         insert_news(conn, it)          # carries sources_count / also_seen
@@ -1430,17 +1472,28 @@ def promote_run(conn, items, run_id=None):
             except sqlite3.Error:
                 pass
         it["_promoted"] = True
-    # Every staged row for this run is now "handled", promoted or not, so the
-    # leftovers pass cannot re-promote it later.
+    # Mark ONLY the staged rows handled by THIS promotion pass (scoped by
+    # ticker / staging_id). Previously `WHERE run_id=?` ran during macro
+    # promotion BEFORE per-ticker AI analysis, marking every un-analyzed
+    # per-ticker staged row as promoted=1 and defeating crash recovery.
     try:
-        if run_id:
-            conn.execute("UPDATE staging SET promoted=1 WHERE run_id=?", (run_id,))
-        else:
-            ids = [it.get("_staging_id") for it in items if it.get("_staging_id")]
+        handled_tickers = sorted({str(t) for t in (tickers or []) if t}
+                                 | {str(it.get("ticker") or "")
+                                    for it in items if it.get("ticker")})
+        ids = [it.get("_staging_id") for it in items if it.get("_staging_id")]
+        if run_id and handled_tickers:
+            placeholders = ",".join("?" * len(handled_tickers))
+            conn.execute(
+                f"UPDATE staging SET promoted=1 WHERE run_id=? "
+                f"AND ticker IN ({placeholders})",
+                (run_id, *handled_tickers))
+        elif ids:
             for i in range(0, len(ids), 200):
                 chunk = ids[i:i + 200]
                 conn.execute("UPDATE staging SET promoted=1 WHERE id IN (%s)"
                              % ",".join("?" * len(chunk)), chunk)
+        elif run_id:
+            conn.execute("UPDATE staging SET promoted=1 WHERE run_id=?", (run_id,))
         conn.commit()
     except sqlite3.Error:
         pass
@@ -2017,13 +2070,24 @@ UNIT_PREFIXES = set("美欧港日加澳亿万")
 def _term_in_text(term, text):
     """
     Does 'term' appear in 'text' as a REAL mention (not a coincidental
-    substring)? Long (>=3 char) and ASCII terms are specific enough to use a
-    plain substring test; 2-character CJK terms need the boundary rule above.
+    substring)? Long (>=3 char) CJK terms use substring matching; Latin/English
+    terms match case-insensitively with alphanumeric word boundaries (so 'Qfin'
+    matches 'QFIN Holdings...' without matching inside unrelated words);
+    2-character CJK terms use the boundary rule above.
     """
     if not term or not text:
         return False
+    term = str(term)
+    text = str(text)
+    if not is_chinese(term):
+        low_t = term.lower()
+        low_h = text.lower()
+        if re.fullmatch(r"[a-z0-9 .\-&]+", low_t):
+            return bool(re.search(
+                r"(?<![a-z0-9])" + re.escape(low_t) + r"(?![a-z0-9])", low_h))
+        return low_t in low_h
     n = len(term)
-    if n >= 3 or not is_chinese(term):
+    if n >= 3:
         return term in text
     idx = text.find(term)
     while idx >= 0:
@@ -2340,9 +2404,11 @@ def _same_story(a, b):
 # encodes SIGNAL, not volume: a Chinese-language report, a filing or the
 # company's own site beats a syndication aggregator.
 STORY_SOURCE_RANK = {
-    "SEC": 0, "RSS": 1, "GoogleNewsSite": 2, "GoogleNewsZH": 3,
-    "Eastmoney": 4, "Eastmoney724": 5, "Sina724": 6, "Tavily": 7,
-    "GoogleNews": 8, "Exa": 9, "Baidu": 10,
+    "SEC": 0, "HKEX": 0, "RSS": 1, "GoogleNewsSite": 2, "DeepSeekHK": 2,
+    "DeepSeekCorp": 2, "GoogleNewsZH": 3, "Guba": 3, "Eastmoney": 4,
+    "DeepSeekPress": 4, "DeepSeekSearch": 5, "Eastmoney724": 5, "Sina724": 6,
+    "YahooFinance": 6, "SeekingAlpha": 6, "Tavily": 7, "GoogleNews": 8,
+    "Exa": 9, "Baidu": 10,
 }
 
 
@@ -2720,10 +2786,20 @@ labs laboratories partners trust platforms technologies technology
 wholesale stores retail holdings insurance financial bancorp
 """.split())
 
+def _wordlist(block):
+    """Split a multiline wordlist into lowercase tokens, ignoring # comments."""
+    out = set()
+    for line in (block or "").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            out.update(w.lower() for w in line.split())
+    return frozenset(out)
+
+
 # Additional words that must never become a standalone alias: they are either
 # ordinary English, a geography, or a whole-sector noun that would make any
 # industry story look like company news ("solar", "bank", "energy").
-_GENERIC_ALIAS_EXTRA = frozenset("""
+_GENERIC_ALIAS_EXTRA = _wordlist("""
 africa america american asia asian australia britain british canada canadian
 china chinese europe european france french general germany german global hong
 india indian japan japanese korea korean singapore taiwan uk united world
@@ -2740,7 +2816,7 @@ daniel joseph andrew edward peter paul mary anne elizabeth
 # "Tiger", and "One Day Tiger Safari" is not a brokerage story. The full phrase
 # still matches; only the standalone token is refused.
 tiger moomoo
-""".split())
+""")
 
 
 def _alias_is_usable(value):
@@ -2777,6 +2853,8 @@ def _latin_name_variants(name):
       * an ALL-CAPS acronym head (LVMH)
       * the first token when everything after it is a descriptor
         (Toyota Motor -> Toyota)
+      * compound brand prefix when a single token ends in Fintech/Insurtech/Tech
+        (LexinFintech -> Lexin)
       * a distinctive final token (Walt Disney -> Disney, Charles Schwab ->
         Schwab). This is a heuristic and the guard list is what keeps it safe.
     """
@@ -2808,6 +2886,12 @@ def _latin_name_variants(name):
             add(first)
         if rest and all(w.lower() in _NAME_DESCRIPTOR_WORDS for w in rest):
             add(first)
+        # Compound brand stem: "LexinFintech" -> "Lexin" (headlines routinely
+        # drop the "Fintech" / "Insurtech" suffix).
+        m_comp = re.match(r"^([A-Za-z]{5,}?)(?:fintech|insurtech|tech)$",
+                          first, re.IGNORECASE)
+        if m_comp and not rest:
+            add(m_comp.group(1))
         if len(words) >= 2:
             last = words[-1]
             if len(last) >= 5 and last.lower() not in _NAME_DESCRIPTOR_WORDS:
@@ -2942,22 +3026,53 @@ def resolve_relevance(meta):
     # are the only reliable way to supply that (see _latin_name_variants).
     names += [str(x) for x in (meta.get("aliases_en") or [])]
     names = [n.strip() for n in names if n and n.strip()]
+    # Subsidiary/brand names (分期乐, Fenqile, 奇富借条, 360数科...) PLUS safe
+    # discovered `keywords` (discover_brands writes brand names like 平安普惠,
+    # 平安陆金所, 元保数科 into `keywords` and build_zh_terms searches them;
+    # previously resolve_relevance ignored `keywords`, so results found via
+    # those brands were immediately discarded as "unrelated").
+    subs = [
+        str(x).strip() for x in ((meta.get("subsidiaries_zh") or [])
+                                 + (meta.get("subsidiaries_other") or []))
+        if x and str(x).strip()]
+    sub_seen = {s.lower() for s in subs} | {n.lower() for n in names}
+    for kw in (meta.get("keywords") or []):
+        v = str(kw or "").strip()
+        if not v or v.lower() in sub_seen:
+            continue
+        if "http" in v.lower() or re.fullmatch(r"[a-z0-9.\-]+\.[a-z]{2,}", v.lower()):
+            continue
+        if is_chinese(v):
+            if len(v) < 2 or re.search(r"\s", v):
+                continue
+            if any(w in v for w in _QUERY_WORDS) or is_generic_term(v):
+                continue
+        else:
+            if re.fullmatch(r"[A-Za-z0-9.\-]{1,8}", v) and v.upper() == v:
+                continue
+            if not _alias_is_usable(v):
+                continue
+        sub_seen.add(v.lower())
+        subs.append(v)
     return {
         "names": names,
-        # Subsidiary/brand names (分期乐, Fenqile, 奇富借条, 360数科...). News
-        # about a subsidiary IS news about the stock, so these count as a
-        # genuine mention too - they just cannot be the ONLY thing a query is
-        # built from.
-        "subsidiary_names": [
-            str(x).strip() for x in ((meta.get("subsidiaries_zh") or [])
-                                     + (meta.get("subsidiaries_other") or []))
-            if x and str(x).strip()],
+        "subsidiary_names": subs,
         "domains": build_site_domains(meta),
         "ticker": str(meta.get("ticker") or ""),
         "sector_tokens": sector_tokens_for(meta),
         "strict": False,
         "strong": bool(names),
     }
+
+
+# Known homonym organizations that collide with short ADR tickers in English
+# financial headlines (e.g. Korea's LG spin-off LX Group: LX Semicon, LX Pantos,
+# LX Hausys, LX International, LX MMA; unrelated Chinese surname "Lu <Given>").
+_TICKER_HOMONYM_PATTERNS = {
+    "lx": re.compile(
+        r"\blx\s+(?:semicon|pantos|hausys|international|mma|mdi|group|"
+        r"holdings\s+corp)\b", re.IGNORECASE),
+}
 
 
 def passes_relevance(item, meta, resolved):
@@ -2975,8 +3090,14 @@ def passes_relevance(item, meta, resolved):
       'unrelated' - nothing to do with the company or its sector. Dropped, and
                     never sent to the AI.
     """
+    # Official primary-exchange filings fetched by exact CIK / HKEX stockId are
+    # unambiguously about the company (an HKEX title like "董事會會議日期..."
+    # does not repeat the issuer's name inside the document title).
+    if str(item.get("source") or "") in ("SEC", "HKEX"):
+        return "company"
     hay = " ".join(str(item.get(k) or "") for k in ("title", "snippet")).lower()
-    title_l = strip_outlet_tail(item.get("title")).lower()
+    raw_title = strip_outlet_tail(item.get("title"))
+    title_l = raw_title.lower()
     # The NAME must be in the TITLE. Matching title+snippet let an aggregator
     # page qualify through its sidebar: a Yahoo Finance page headed "Yiren Digital
     # Ltd. (YRD) Stock Price..." was stored as LX news because its excerpt listed
@@ -2985,8 +3106,8 @@ def passes_relevance(item, meta, resolved):
     # regulation reaches the digest through the industry-theme source instead.
     if mentions_company(title_l, resolved["names"]):
         return "company"
-    # A subsidiary/brand mention (分期乐, Fenqile, 奇富借条) in the title is a real
-    # company mention: the news is about the stock's own business.
+    # A subsidiary/brand mention (分期乐, Fenqile, 奇富借条, 平安普惠) in the title
+    # is a real company mention: the news is about the stock's own business.
     if mentions_company(title_l, resolved.get("subsidiary_names") or []):
         return "company"
     snippet_only = mentions_company(hay, resolved["names"]) or \
@@ -3011,18 +3132,26 @@ def passes_relevance(item, meta, resolved):
     # any symbol containing a digit or dot (0700.HK, BRK.B) are unambiguous.
     ticker = str(item.get("ticker") or "").lower()
     if ticker and re.search(r"(?<![a-z0-9])" + re.escape(ticker) + r"(?![a-z0-9])", title_l):
-        ambiguous = (len(ticker) <= 2) or (ticker in PROSE_COLLISION_WORDS)
-        if not ambiguous:
-            return "company"
-        if _formal_symbol_form(ticker, title_l):
-            return "company"
-        # Even in the title, a one/two-letter symbol is usually an ordinary word
-        # or another company: "Lu Xun's former residence", "Lu Zhiqiang resigns
-        # as chairman", "LX Pantos to build a logistics center". Accept it only
-        # when the headline is otherwise about a listed company.
-        if any(re.search(r"(?<![a-z])" + re.escape(w) + r"(?![a-z])", title_l)
-               for w in CORPORATE_CONTEXT_WORDS):
-            return "company"
+        homonym_re = _TICKER_HOMONYM_PATTERNS.get(ticker)
+        if homonym_re and homonym_re.search(raw_title):
+            pass
+        else:
+            ambiguous = (len(ticker) <= 2) or (ticker in PROSE_COLLISION_WORDS)
+            if not ambiguous:
+                return "company"
+            if _formal_symbol_form(ticker, title_l):
+                return "company"
+            # For 1-2 letter tickers (LU, LX, YB), require ALL-CAPS symbol usage
+            # in the original headline AND a corporate context word. That blocks
+            # person surnames ("Lu Zhiqiang resigns as chairman") and ordinary
+            # words while keeping real ticker headlines ("LU reports Q3 results",
+            # "LU reverse split takes effect").
+            caps_ok = (len(ticker) > 2) or bool(re.search(
+                r"(?<![A-Za-z0-9])" + re.escape(ticker.upper()) + r"(?![A-Za-z0-9])",
+                raw_title))
+            if caps_ok and any(re.search(r"(?<![a-z0-9\-])" + re.escape(w) + r"(?![a-z0-9\-])", title_l)
+                               for w in CORPORATE_CONTEXT_WORDS):
+                return "company"
     for domain in resolved["domains"]:
         if domain and domain in hay:
             return "company"
@@ -3050,7 +3179,8 @@ def ingest_items(conn, all_new, source, items, ticker, since_dt, max_age_hours,
       1. delta filter (pub_dt < since_dt -> too old for this source)
       2. story_tokens computed once, reused by relevance, dedup and the
          repeat gate downstream
-      3. hard freshness backstop (MAX_NEWS_AGE_HOURS)
+      3. hard freshness backstop (MAX_NEWS_AGE_HOURS, or per-item override
+         for rolling-window corporate/HK sources)
       4. RELEVANCE: does it mention the company, or is it merely its sector?
       5. exact per-source dedup (the source+url hash in `seen`)
     Returns the number of items accepted into `all_new`. `report` collects drop
@@ -3074,13 +3204,15 @@ def ingest_items(conn, all_new, source, items, ticker, since_dt, max_age_hours,
         # helper, and storing them all as "DeepSeekSearch" hid which query
         # found them.
         item["source"] = source
-        pub_dt = _parse_pub(item.get("date", ""))
-        if since_dt is not None and pub_dt and pub_dt < since_dt:
+        raw_date = item.get("date", "")
+        pub_dt = _parse_pub(raw_date)
+        if _pub_before_since(raw_date, pub_dt, since_dt):
             bump("older_than_delta")
             continue
         if not item.get("_story_tokens"):
             item["_story_tokens"] = story_tokens(item.get("title", ""))
-        if _is_stale_item(item, max_age_hours):
+        item_max_age = item.get("_max_age_hours", max_age_hours)
+        if _is_stale_item(item, item_max_age):
             bump("stale")
             continue
         if relevance_resolved is not None:
@@ -3297,7 +3429,9 @@ CORPORATE_CONTEXT_WORDS = (
     # ticker is a 2-letter word ("beats" alone would not be, but the ticker must
     # also be present for this path to matter).
     "beats", "misses", "tops", "lags", "forecast",
-    "ceo", "cfo", "dividend", "buyback", "acquisition", "merger", "ipo",
+    "ceo", "cfo", "dividend", "buyback", "repurchase", "acquisition", "merger", "ipo",
+    "reverse", "split", "ratio", "ads", "adr", "sec", "filing", "6-k", "13g", "13d",
+    "nasdaq", "nyse", "hkex", "privatization", "delist", "delisted", "compliance",
     "regulator", "regulatory", "penalty", "fine", "investigation", "license",
     "delisting", "lawsuit", "partnership", "launch", "expands", "expansion",
     # Analyst vocabulary and the standard market verbs: for a word-like ticker
@@ -3322,7 +3456,7 @@ CORPORATE_CONTEXT_WORDS = (
 # company-name match. Real brand names of the same length are unaffected
 # (Apple, Tesla, Visa, Uber, Meta, Nvidia, Opendoor, LexinFintech), which a
 # blanket "short tickers need context" rule would have broken.
-PROSE_COLLISION_WORDS = frozenset("""
+PROSE_COLLISION_WORDS = _wordlist("""
 open five play love true move live good nice hope blue bell rock gold sand cash
 home tech food life time work week year day way own new old big low high free
 full best more most only just much many same next last first call plan post
@@ -3335,7 +3469,7 @@ off out top buy sell hold gain lose rise fall drop jump
 # ("Visa rules for tourists" is not Visa Inc.; "Visa expands settlement" is).
 # Kept in the PROSE list (not dropped as an alias): it IS the company's name.
 visa delta gap
-""".split())
+""")
 
 
 def _formal_symbol_form(ticker, title_l):
@@ -4361,6 +4495,10 @@ def fetch_sec_exhibit_text(filing_url, max_chars=3000, timeout=20):
                                headers={"User-Agent": SEC_USER_AGENT}, timeout=timeout)
             doc.raise_for_status()
             text = re.sub(r"\s+", " ", strip_tags(doc.text)).strip()
+            text = re.sub(
+                r"^(?:EX-\d+(?:\.\d+)?\s+\d+\s+\S+\.htm\s*)?"
+                r"(?:EXHIBIT\s+\d+(?:\.\d+)?\s*){1,3}",
+                "", text, flags=re.IGNORECASE).strip()
         except Exception:
             continue
         # A cover page is short; the press release is not.
@@ -4369,21 +4507,140 @@ def fetch_sec_exhibit_text(filing_url, max_chars=3000, timeout=20):
     return ""
 
 
+_SEC_TICKER_CIK_CACHE = None
+
+
+def _sec_ticker_to_cik(ticker):
+    """Resolve a US ticker symbol to a 10-digit SEC CIK using SEC's official map."""
+    global _SEC_TICKER_CIK_CACHE
+    sym = str(ticker or "").strip().upper()
+    if not sym:
+        return ""
+    if _SEC_TICKER_CIK_CACHE is None:
+        resp = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers={"User-Agent": SEC_USER_AGENT},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        raw = resp.json() or {}
+        cmap = {}
+        for row in raw.values():
+            tk = str(row.get("ticker") or "").strip().upper()
+            cik_str = str(row.get("cik_str") or "").strip()
+            if tk and cik_str:
+                cmap[tk] = cik_str.zfill(10)
+        _SEC_TICKER_CIK_CACHE = cmap
+    return _SEC_TICKER_CIK_CACHE.get(sym, "") or _SEC_TICKER_CIK_CACHE.get(sym.replace(".", "-"), "")
+
+
+def _fetch_sec_filings_json(ticker, since_dt, conn=None):
+    """
+    Fetch SEC filings directly from SEC's official JSON submissions API
+    (`data.sec.gov/submissions/CIK{cik}.json`).
+
+    Why this beats date-only edgartools:
+      * gives exact to-the-second `acceptanceDateTime` (UTC -> ET), eliminating
+        the noon-ET bug that silently dropped after-hours 6-Ks / 13Gs / 13Ds;
+      * works with plain `requests` even when `edgartools` is not installed;
+      * enriches 6-K / 8-K filings with Exhibit 99.x press-release text.
+    """
+    cik10 = _sec_ticker_to_cik(ticker)
+    if not cik10:
+        return []
+    resp = requests.get(
+        f"https://data.sec.gov/submissions/CIK{cik10}.json",
+        headers={"User-Agent": SEC_USER_AGENT},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json() or {}
+    company_name = str(data.get("name") or ticker).strip()
+    cik_num = str(int(cik10))
+    recent = (data.get("filings") or {}).get("recent") or {}
+    forms = recent.get("form") or []
+    dates = recent.get("filingDate") or []
+    acc_times = recent.get("acceptanceDateTime") or []
+    accs = recent.get("accessionNumber") or []
+    prim_docs = recent.get("primaryDocument") or []
+    allowed = set(SEC_FORMS)
+    since_day = since_dt.astimezone(EASTERN).strftime("%Y-%m-%d") if since_dt else ""
+    items = []
+    for i, form in enumerate(forms):
+        if form not in allowed:
+            continue
+        filed = str(dates[i] if i < len(dates) else "")
+        acc_dt = str(acc_times[i] if i < len(acc_times) else "")
+        # Exact acceptanceDateTime (UTC -> ET) when present; else calendar filingDate.
+        pub_raw = acc_dt or filed
+        pub_dt = _parse_pub(pub_raw)
+        if since_dt is not None:
+            if pub_dt is not None:
+                if _pub_before_since(pub_raw, pub_dt, since_dt):
+                    continue
+            elif filed and since_day and filed < since_day:
+                continue
+        acc = str(accs[i] if i < len(accs) else "").strip()
+        url = (f"https://www.sec.gov/Archives/edgar/data/{cik_num}/"
+               f"{acc.replace('-', '')}/") if acc else ""
+        title = f"{company_name} - {form} filed {filed}"
+        snippet = ""
+        already_seen = (conn is not None
+                        and not is_new(conn, ticker, "SEC",
+                                       acc or f"{form}-{filed}", title))
+        if form in ("6-K", "6-K/A", "8-K", "8-K/A") and url and not already_seen:
+            try:
+                exhibit = fetch_sec_exhibit_text(url)
+                if not exhibit and i < len(prim_docs) and prim_docs[i]:
+                    doc = requests.get(f"{url}{prim_docs[i]}",
+                                       headers={"User-Agent": SEC_USER_AGENT},
+                                       timeout=15)
+                    if doc.ok:
+                        suffix, snippet = _extract_sec_substance(
+                            form, strip_tags(doc.text))
+                        if suffix:
+                            title = f"{company_name} - {form}: {suffix}"
+                if exhibit:
+                    snippet = exhibit[:300]
+                    title = f"{company_name} - {form}: {exhibit[:130]}"
+            except Exception as exc:
+                print(f"  [warn] SEC {ticker} {form} enrichment failed: {exc}",
+                      file=sys.stderr)
+        date_et = pub_dt.astimezone(EASTERN).strftime("%Y-%m-%d %H:%M:%S") if pub_dt else filed
+        items.append({
+            "source": "SEC",
+            "ticker": ticker,
+            "id": acc or f"{form}-{filed}",
+            "title": title,
+            "url": url,
+            "date": date_et,
+            "lang": "en",
+            "snippet": snippet,
+            "form": form,
+            "company": company_name,
+        })
+    return items
+
+
 def fetch_sec_filings(ticker, since_dt, conn=None):
     """
-    SEC filings for this ticker filed since since_dt, using edgartools.
+    SEC filings for this ticker filed since since_dt.
 
-    'conn' (the DB) lets us skip the expensive primary-document fetch for
-    filings already seen in previous runs - the delta date filter already
-    limits the list, but after a long gap or a re-run we avoid re-downloading
-    documents just to re-dedupe them.
+    Uses SEC's official submissions JSON API first (exact acceptanceDateTime,
+    no noon-ET after-hours loss, works without edgartools), falling back to
+    edgartools if the JSON request fails.
 
     Returns a list of items, or None if the fetch FAILED (so the caller knows
     NOT to advance the delta timestamp and risk missing news).
     """
-    if not SEC_AVAILABLE:
-        print("  [warn] edgartools not installed - skipping SEC.")
-        return None
+    try:
+        return _fetch_sec_filings_json(ticker, since_dt, conn=conn)
+    except Exception as json_exc:
+        if not SEC_AVAILABLE:
+            print(f"  [error] SEC {ticker}: {json_exc}", file=sys.stderr)
+            return None
+        print(f"  [warn] SEC JSON {ticker} failed ({json_exc}); trying edgartools...",
+              file=sys.stderr)
     items = []
     try:
         set_identity(SEC_IDENTITY)
@@ -4405,11 +4662,6 @@ def fetch_sec_filings(ticker, since_dt, conn=None):
                 url = ""
             title = f"{company_name} - {form} filed {filed}"
             snippet = ""
-            # Enrichment: pull the primary document text for the forms where
-            # the substance matters (6-K for ADRs; 8-K/Form 4/3 for US names)
-            # and extract WHAT happened. Fully guarded - any failure keeps the
-            # plain title (never break the SEC fetch). Skip the download for
-            # filings already seen in a previous run (deduped anyway).
             already_seen = (conn is not None
                             and not is_new(conn, ticker, "SEC",
                                            acc or f"{form}-{filed}", title))
@@ -4417,13 +4669,6 @@ def fetch_sec_filings(ticker, since_dt, conn=None):
                 try:
                     text = f.text()
                     suffix, snippet = _extract_sec_substance(form, text)
-                    # The substance of an ADR 6-K is in EXHIBIT 99.x (the press
-                    # release): the primary document is a cover page + an
-                    # "Exhibit 99.1" line + a signature, and it usually does NOT
-                    # contain the "INFORMATION CONTAINED IN THIS REPORT" heading
-                    # the extractor looks for (verified on two real QFIN 6-Ks).
-                    # Without this, every 6-K reached the AI as a bare "form
-                    # filed <date>" with an empty snippet.
                     if not snippet and form in ("6-K", "6-K/A", "8-K", "8-K/A") and url:
                         exhibit = fetch_sec_exhibit_text(url)
                         if exhibit:
@@ -4450,6 +4695,194 @@ def fetch_sec_filings(ticker, since_dt, conn=None):
         print(f"  [error] SEC {ticker}: {exc}", file=sys.stderr)
         return None
     return items
+
+
+# ---------------------------------------------------------------------------
+# HKEX Official Filings (dual-listed Chinese ADRs + HK stocks: 03660, 06623...)
+# ---------------------------------------------------------------------------
+# HKEX's titleSearchServlet requires the internal numeric `stockId`, NOT the
+# 5-digit stock code - that is why passing "00700" directly returned 0 rows.
+# Resolving code/name via `prefix.do` first yields the real `stockId`, giving
+# clean, real-time Inside Information, Earnings Dates, Buyback disclosures
+# (Next Day Disclosure Returns) and Connected Transactions hours before US open.
+HKEX_PREFIX_API = "https://www1.hkexnews.hk/search/prefix.do"
+HKEX_SEARCH_API = "https://www1.hkexnews.hk/search/titleSearchServlet.do"
+HKEX_ROUTINE_RE = re.compile(
+    r"(?:證券變動月報表|证券变动月报表|monthly return of equity issuer|"
+    r"公司資料表|company information sheet|list of directors and their role)",
+    re.IGNORECASE,
+)
+_HKEX_STOCKID_CACHE = {}
+# Built-in HK listing codes for major dual-listed Chinese fintech ADRs so HKEX
+# works out of the box even before the user edits ticker_meta.hk_code.
+KNOWN_HK_CODES = {
+    "QFIN": "03660",
+    "LU": "06623",
+    "BABA": "09988",
+    "JD": "09618",
+    "BIDU": "09888",
+    "NTES": "09999",
+    "NIO": "09866",
+    "XPEV": "09868",
+    "LI": "02015",
+    "TME": "01698",
+    "BILI": "09626",
+    "ZTO": "02057",
+    "YUMC": "09987",
+    "TCOM": "09961",
+    "HTHT": "01179",
+    "WB": "09898",
+    "BZ": "02076",
+    "BEKE": "02423",
+    "MNSO": "09896",
+    "GDS": "09698",
+    "ZLAB": "09688",
+    "BGNE": "06160",
+}
+
+
+def resolve_hkex_stock(hk_code="", ticker="", name_zh=""):
+    """Resolve an HKEX 5-digit code (e.g. '03660') to (stockId, code, name)."""
+    code = re.sub(r"\D", "", str(hk_code or ""))
+    if not code and ticker:
+        tk = str(ticker).strip().upper()
+        if tk.endswith(".HK"):
+            code = re.sub(r"\D", "", tk[:-3]).zfill(5)
+        elif tk in KNOWN_HK_CODES:
+            code = KNOWN_HK_CODES[tk]
+    if code:
+        code = code.zfill(5)[:5]
+    query = code or str(name_zh or "").strip()
+    if not query:
+        return None
+    if query in _HKEX_STOCKID_CACHE:
+        return _HKEX_STOCKID_CACHE[query]
+    try:
+        resp = requests.get(
+            HKEX_PREFIX_API,
+            params={"callback": "cb", "lang": "ZH", "type": "A",
+                    "name": query, "market": "SEHK"},
+            headers={**WIRE_HEADERS,
+                     "Referer": "https://www1.hkexnews.hk/search/titlesearch.xhtml?lang=zh"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        txt = resp.text.strip()
+        lpar, rpar = txt.find("("), txt.rfind(")")
+        if lpar < 0 or rpar <= lpar:
+            return None
+        data = json.loads(txt[lpar + 1:rpar])
+        infos = data.get("stockInfo") or []
+        pick = None
+        for info in infos:
+            c = str(info.get("code") or "").zfill(5)
+            if code and c == code:
+                pick = info
+                break
+        if pick is None and infos and (code or len(infos) == 1):
+            pick = infos[0]
+        if not pick or not pick.get("stockId"):
+            _HKEX_STOCKID_CACHE[query] = None
+            return None
+        res = (str(pick["stockId"]), str(pick.get("code") or code).zfill(5),
+               str(pick.get("name") or "").strip())
+        _HKEX_STOCKID_CACHE[query] = res
+        return res
+    except Exception as exc:
+        print(f"  [warn] HKEX stock lookup '{query}' failed: {exc}", file=sys.stderr)
+        return None
+
+
+def fetch_hkex_filings(ticker, since_dt=None, hk_code="", name_zh="", limit=20):
+    """
+    Official HKEXnews filings for a dual-listed ADR (e.g. QFIN 03660, LU 06623)
+    or HK stock. Returns a list of items, [] when not HK-listed, or None on
+    network/API failure.
+    """
+    resolved = resolve_hkex_stock(hk_code=hk_code, ticker=ticker, name_zh=name_zh)
+    if not resolved:
+        return []
+    stock_id, code, sname = resolved
+    now_hk = datetime.now(BEIJING)
+    from_dt = (since_dt.astimezone(BEIJING) - timedelta(days=1)
+               if since_dt else now_hk - timedelta(days=14))
+    try:
+        resp = requests.get(
+            HKEX_SEARCH_API,
+            params={
+                "sortDir": "0", "sortByOptions": "DateTime", "category": "0",
+                "market": "SEHK", "stockId": stock_id, "documentType": "-1",
+                "fromDate": from_dt.strftime("%Y%m%d"),
+                "toDate": (now_hk + timedelta(days=1)).strftime("%Y%m%d"),
+                "title": "", "searchType": "0",
+                "t1code": "-2", "t2Gcode": "-2", "t2code": "-2",
+                "rowRange": str(limit), "lang": "ZH",
+            },
+            headers={**WIRE_HEADERS,
+                     "Referer": "https://www1.hkexnews.hk/search/titlesearch.xhtml?lang=zh"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        payload = resp.json() or {}
+        rows = json.loads(payload.get("result") or "[]")
+    except Exception as exc:
+        print(f"  [error] HKEX {ticker} ({code}): {exc}", file=sys.stderr)
+        return None
+    items = []
+    for row in rows:
+        raw_title = strip_tags(str(row.get("TITLE") or "")).strip()
+        if not raw_title or HKEX_ROUTINE_RE.search(raw_title):
+            continue
+        link = str(row.get("FILE_LINK") or "").strip()
+        url = (f"https://www1.hkexnews.hk{link}"
+               if link.startswith("/") else link)
+        # DATE_TIME is "DD/MM/YYYY HH:MM" in Hong Kong (UTC+8, same as BEIJING).
+        dt_str = str(row.get("DATE_TIME") or "").strip()
+        date_et = ""
+        try:
+            dt_hk = datetime.strptime(dt_str, "%d/%m/%Y %H:%M").replace(tzinfo=BEIJING)
+            date_et = dt_hk.astimezone(EASTERN).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            date_et = _date_from_url(url)
+        pub_dt = _parse_pub(date_et)
+        if _pub_before_since(date_et, pub_dt, since_dt):
+            continue
+        short_cat = strip_tags(str(row.get("SHORT_TEXT") or "")).strip()
+        prefix = f"{sname} ({code}.HK)" if sname else f"{code}.HK"
+        title = f"{prefix}: {raw_title}"
+        items.append({
+            "source": "HKEX",
+            "ticker": ticker,
+            "id": str(row.get("NEWS_ID") or url or title),
+            "title": title,
+            "url": url,
+            "date": date_et,
+            "lang": "zh" if is_chinese(title) else "en",
+            "snippet": short_cat[:300],
+        })
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Ticker-scoped English primary RSS feeds (Yahoo Finance + Seeking Alpha)
+# ---------------------------------------------------------------------------
+def fetch_yahoo_rss(ticker, since_dt=None):
+    """Yahoo Finance per-ticker headline RSS (PR wires, earnings, Nasdaq notices)."""
+    sym = str(ticker or "").strip().upper()
+    if not sym:
+        return []
+    url = (f"https://feeds.finance.yahoo.com/rss/2.0/headline"
+           f"?s={urllib.parse.quote_plus(sym)}&region=US&lang=en-US")
+    return fetch_rss(url, sym, since_dt, source="YahooFinance", lang="en")
+
+
+def fetch_seeking_alpha_rss(ticker, since_dt=None):
+    """Seeking Alpha per-ticker combined RSS (breaking flashes, earnings, transcripts)."""
+    sym = str(ticker or "").strip().upper()
+    if not sym or not US_SYMBOL_RE.match(sym):
+        return []
+    url = f"https://seekingalpha.com/api/sa/combined/{urllib.parse.quote_plus(sym)}.xml"
+    return fetch_rss(url, sym, since_dt, source="SeekingAlpha", lang="en")
 
 
 SEC_VALIDATE_FILE = os.path.join(BASE_DIR, "sec_validate.json")
@@ -4819,6 +5252,14 @@ def fetch_guba(ticker, since_dt=None, terms=None, limit=80):
         return None
 
     floor = datetime.min.replace(tzinfo=EASTERN)
+    match_terms = list(terms or [])
+    if match_terms:
+        seen_t = {str(t).lower() for t in match_terms}
+        for p in posts[:10]:
+            sb = re.sub(r"[-－][A-Za-z]+$", "", str(p.get("stockbar_name") or "")).strip()
+            if sb and len(sb) >= 2 and is_chinese(sb) and sb.lower() not in seen_t:
+                match_terms.append(sb)
+                seen_t.add(sb.lower())
     out = []
     for p in posts[:limit]:
         title = strip_tags(str(p.get("post_title") or "")).strip()
@@ -4832,13 +5273,13 @@ def fetch_guba(ticker, since_dt=None, terms=None, limit=80):
         # of changes in beneficial ownership"), so the COMPANY NAME is required
         # for every post - news account or not. Measured 2026-11-01 that removes
         # ~60% of the board volume and every one of those was symbol noise.
-        if terms and not any(_term_in_text(t, title) for t in terms):
+        if match_terms and not any(_term_in_text(t, title) for t in match_terms):
             continue
         if not is_news and not _event_terms_hit(title, DEEPSEEK_CORP_TERMS):
             continue
         date = _zh_date_to_et(str(p.get("post_publish_time") or ""))
         pub_dt = _parse_pub(date)
-        if since_dt is not None and pub_dt is not None and pub_dt < since_dt:
+        if _pub_before_since(date, pub_dt, since_dt):
             continue
         pid = str(p.get("post_id") or "")
         if not pid:
@@ -5154,7 +5595,7 @@ def fetch_tavily(query, secrets, config, since_dt=None, limit=8, topic="news",
                     continue
             date = r.get("published_date", "") or ""
             pub_dt = _parse_pub(date)
-            if topic == "news" and since_dt is not None and pub_dt and pub_dt < since_dt:
+            if topic == "news" and _pub_before_since(date, pub_dt, since_dt):
                 continue
             items.append({
                 "source": "Tavily",
@@ -5218,8 +5659,9 @@ MACRO_TAGS = [
     ("出口管制|实体清单", "EXPORT CONTROL"),
 ]
 # One compact Google News query for longer-form macro coverage (the wires
-# carry the flash items; this catches the articles).
-MACRO_GNEWS_QUERY = "中国 央行 降息 降准 LPR 助贷 消费金融 中概股 刺激政策"
+# carry the flash items; this catches the articles). Uses OR + when:7d because
+# space-separated terms are AND-joined by Google News and returned 0 hits.
+MACRO_GNEWS_QUERY = "(央行降息 OR 央行降准 OR LPR OR 助贷监管 OR 消费金融监管 OR 中概股) when:7d"
 # Primary regulator sources, reached through the news index because the
 # regulators' own listing pages are JavaScript-driven and their item APIs are
 # not public (verified 2026-10-06: the NFRA/CSRC list pages return a JS shell,
@@ -5615,9 +6057,12 @@ def _date_from_page(url, timeout=8):
     return ""
 
 
-def deepseek_hk_code(meta):
-    """The HK listing code (e.g. 06623 for Lufax), when the profile has one."""
+def deepseek_hk_code(meta, ticker=""):
+    """The HK listing code (e.g. 06623 for Lufax), from profile or KNOWN_HK_CODES."""
     code = re.sub(r"\D", "", str((meta or {}).get("hk_code") or ""))
+    if not code:
+        tk = str(ticker or (meta or {}).get("ticker") or "").strip().upper()
+        code = KNOWN_HK_CODES.get(tk, "")
     return code[:5]
 
 
@@ -5797,7 +6242,7 @@ def fetch_deepseek_search(query, secrets, config, since_dt=None, limit=10,
             if require_date and pub_dt is None:
                 dropped += 1
                 continue
-            if pub_dt is not None and pub_dt < since_dt:
+            if _pub_before_since(date, pub_dt, since_dt):
                 dropped += 1
                 continue
         summary = str(r.get("summary") or "").strip()
@@ -6144,6 +6589,7 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
             it["importance"] = 1
             it["sentiment"] = "neutral"
             it["push"] = False
+            it["_ai_unavailable"] = True
             it["reason"] = "No AI API key - stored only"
             it["impact"] = ""
             it["is_dup"] = False
@@ -6271,20 +6717,33 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
             + json.dumps(lines, ensure_ascii=False)
             )
         else:
+            today_str = (str(run_start or "")[:10]
+                         or datetime.now(EASTERN).strftime("%Y-%m-%d"))
             prompt = (
             f"You are an investor's news analyst for the stock {ticker} "
             f"({name_zh}{(' / ' + name_en) if name_en else ''}"
             f"{(' | official site: ' + site) if site else ''}).\n"
+            f"TODAY'S DATE (ET): {today_str}.\n"
             f"Chinese-language news about this company or its subsidiaries "
             f"(e.g. {subs}) is especially valuable - weigh it heavily; it often "
             f"contains information English media misses.\n"
             + prompt_extra
             + "Below are NEW items found today. Each has a number, source, "
             "language, title, publish date, and a short snippet.\n"
-            "FRESHNESS RULE: if an item's 'published' date is days or more in "
-            "the past relative to today, it is a recycled OLD story, not "
-            "breaking news - set known_event=true and push=false for it "
-            "unless something genuinely new happened.\n"
+            "ENTITY RELEVANCE RULE: set relevant=true ONLY if the item is "
+            f"genuinely about {ticker} ({name_zh}"
+            f"{(' / ' + name_en) if name_en else ''}) or its own subsidiaries/brands. "
+            "Set relevant=false if the headline is about a DIFFERENT company or "
+            "person that happens to share a ticker/surname/substring (e.g. Korea's "
+            "LX Semicon / LX Pantos / LX Hausys / LX International is NOT LexinFintech; "
+            "a person surnamed Lu is NOT Lufax; generic market roundups where this "
+            "company is not a real subject). For relevant=false items set "
+            "importance=1, push=false, impact=''.\n"
+            "FRESHNESS RULE: only set known_event=true if this item describes "
+            "the SAME underlying event as one of the ALREADY SEEN headlines below, "
+            "or is an obviously recycled old story from months ago. Do NOT mark "
+            "an unseen recent filing, HKEX notice, or corporate action from the "
+            "last couple of weeks as known_event if it is NOT in ALREADY SEEN.\n"
             "SAME STORY RULE: the items below come from MANY outlets, so "
             "several of them are usually the SAME story reported by different "
             "sources (e.g. one earnings release covered by four outlets). "
@@ -6296,7 +6755,8 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
             "item that is merely about the same INDUSTRY or the same broad "
             "topic is NOT a duplicate; it is a separate story.\n"
             "For EACH item return one JSON object with keys:\n"
-            "  number (the item's number), title_en (concise English "
+            "  number (the item's number), relevant (true/false - see ENTITY "
+            "RELEVANCE RULE above), title_en (concise English "
             "translation; keep as-is if already English), summary (one English "
             "sentence), category (one of filing, earnings, press_release, "
             "analyst, regulatory, ownership, delisting, fraud, other), "
@@ -6361,9 +6821,9 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
             # store ONE row per event instead of one per outlet.
             it["_number"] = i
             it["_dup_of"] = dup_num
-            # The macro/global tiers ask the model a direct relevance question
-            # (see RELEVANCE_TEST_PROMPT). None means "the model was not asked or
-            # answered nothing" - which the caller must NOT read as "relevant".
+            # Both macro/global AND ticker modes now ask the model a direct
+            # relevance question. None means "the model was not asked or
+            # answered nothing".
             rel = obj.get("relevant")
             if isinstance(rel, bool):
                 it["relevant"] = rel
@@ -6371,7 +6831,7 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
                 it["relevant"] = rel.strip().lower() == "true"
             else:
                 it["relevant"] = None
-            if not it["is_dup"]:
+            if not it["is_dup"] and it["relevant"] is not False:
                 kept_nums.add(i)
             it["title_en"] = str(obj.get("title_en") or it.get("title") or "").strip()
             it["summary"] = str(obj.get("summary") or "").strip()
@@ -6385,18 +6845,24 @@ def ai_analyze(items, config, secrets, meta_map, conn=None, run_start=None,
                 # No usable AI response: unscored means UN-PUSHABLE (see above).
                 it["importance"] = 1
                 it["push"] = False
+                it["_ai_unavailable"] = True
                 it["reason"] = "AI analysis unavailable - stored only"
+            elif it["relevant"] is False:
+                it["importance"] = 1
+                it["push"] = False
+                it["reason"] = str(obj.get("reason") or "Not about this company").strip()
             else:
                 it["push"] = bool(obj.get("push", True))
                 it["reason"] = str(obj.get("reason") or "").strip()
-            it["impact"] = str(obj.get("impact") or "").strip()
+            it["impact"] = "" if it["relevant"] is False else str(obj.get("impact") or "").strip()
             it["is_known"] = bool(obj.get("known_event", False))
             enriched.append(it)
         n_dups = sum(1 for it in ticker_items if it.get("is_dup"))
         n_known = sum(1 for it in ticker_items if it.get("is_known"))
-        if n_dups or n_known:
-            print(f"  AI dedup {ticker}: {n_dups} same-batch duplicate(s) + "
-                  f"{n_known} known/recycled event(s) marked (stored, not pushed).")
+        n_irrel = sum(1 for it in ticker_items if it.get("relevant") is False)
+        if n_dups or n_known or n_irrel:
+            print(f"  AI dedup/relevance {ticker}: {n_dups} same-batch duplicate(s) + "
+                  f"{n_known} known/recycled + {n_irrel} irrelevant (not pushed).")
     return enriched
 
 
@@ -7267,13 +7733,42 @@ def adhoc_collect(ticker, meta, config, secrets, days=ADHOC_DEFAULT_DAYS):
         if res:
             collected.extend(res)
             cost["sources"].append(f"GoogleNewsZH:{len(res)}")
-    # --- Google News, English: ticker + English names/brands ---
-    q = " OR ".join([f"{ticker} stock"] + en_terms[:3])
+    # --- Google News, English: ticker + English names/brands (quoted) ---
+    en_parts = []
+    for raw_t in ([f"{ticker} stock"] + en_terms[:3]):
+        t = str(raw_t or "").strip().strip('"')
+        if not t:
+            continue
+        qpart = f'"{t}"' if " " in t else t
+        if qpart not in en_parts:
+            en_parts.append(qpart)
+    q = " OR ".join(en_parts)
     res = fetch_rss(google_news_url(q, "en"), ticker, since,
                     source="GoogleNews", lang="en")
     if res:
         collected.extend(res)
         cost["sources"].append(f"GoogleNews:{len(res)}")
+
+    # --- Ticker-scoped primary feeds: HKEX, Yahoo Finance, Seeking Alpha, Guba ---
+    hk_res = fetch_hkex_filings(ticker, since_dt=since,
+                                hk_code=deepseek_hk_code(meta, ticker),
+                                name_zh=meta.get("name_zh") or "")
+    if hk_res:
+        collected.extend(hk_res)
+        cost["sources"].append(f"HKEX:{len(hk_res)}")
+    yh_res = fetch_yahoo_rss(ticker, since_dt=since)
+    if yh_res:
+        collected.extend(yh_res)
+        cost["sources"].append(f"YahooFinance:{len(yh_res)}")
+    sa_res = fetch_seeking_alpha_rss(ticker, since_dt=since)
+    if sa_res:
+        collected.extend(sa_res)
+        cost["sources"].append(f"SeekingAlpha:{len(sa_res)}")
+    if zh_terms:
+        gb_res = fetch_guba(ticker, since, terms=zh_terms)
+        if gb_res:
+            collected.extend(gb_res)
+            cost["sources"].append(f"Guba:{len(gb_res)}")
 
     # --- Eastmoney search, one query per term (capped) ---
     if zh_terms:
@@ -7327,12 +7822,14 @@ def adhoc_collect(ticker, meta, config, secrets, days=ADHOC_DEFAULT_DAYS):
             continue
         # For an ad-hoc scan we keep sector-relevant items too (the user is
         # researching), but never anything unrelated to the company or sector.
-        verdict = passes_relevance({"ticker": ticker, "title": it.get("title", ""),
+        verdict = passes_relevance({"ticker": ticker, "source": it.get("source", ""),
+                                    "title": it.get("title", ""),
                                     "snippet": it.get("snippet", "")}, meta, resolved)
         if verdict == "unrelated":
             continue
-        pub = _parse_pub(it.get("date", ""))
-        if pub and pub < since:
+        raw_d = it.get("date", "")
+        pub = _parse_pub(raw_d)
+        if _pub_before_since(raw_d, pub, since):
             continue
         it["published_at"] = _normalize_pub(it.get("date", ""))
         key = story_key(it)
@@ -7578,7 +8075,8 @@ def analyze_macro(macro_items, config, secrets, conn, run_start, pseudo="MACRO")
                 print(f"      dropped: {(it.get('title') or '')[:66]}")
         # One row per EVENT: promote the canonical item of each event into
         # `news` before writing the AI fields back (the row must exist first).
-        promoted, copies, known = promote_run(conn, kept, run_id=run_start)
+        promoted, copies, known = promote_run(conn, kept, run_id=run_start,
+                                              tickers=["MACRO"])
         if copies or known:
             print(f"  [{pseudo.lower()}] {len(kept)} item(s) -> {promoted} "
                   f"event row(s); {copies} same-event copy(ies) + {known} "
@@ -8004,7 +8502,8 @@ def select_push_items(enriched, config, conn=None, now=None):
 
     unique = [it for it in enriched
               if not it.get("is_dup") and not it.get("is_known")
-              and not it.get("_superseded")]
+              and not it.get("_superseded") and it.get("relevant") is not False
+              and not it.get("_ai_unavailable")]
 
     # Regulatory force-push: subsidiary penalties / regulatory action is the
     # core alpha - a code-level override so it is never buried by 1-10 scoring.
@@ -8030,7 +8529,10 @@ def select_push_items(enriched, config, conn=None, now=None):
 
     # (2) Age gate. An item with NO usable publish date cannot be checked for
     #     freshness at all - it may be years old (two such rows were pushed) - so
-    #     it is stored but never pushed. Regulatory items keep their exemption.
+    #     it is stored but never pushed. Regulatory items keep their exemption,
+    #     and rolling-window corporate-action/HK sources carry their own
+    #     `_max_push_age_hours` ceiling so newly discovered events inside their
+    #     window are not killed by the 72h default.
     if max_age > 0:
         fresh = []
         for it in unique:
@@ -8041,7 +8543,8 @@ def select_push_items(enriched, config, conn=None, now=None):
             if age is None:
                 it["_undated"] = True
                 continue
-            if age > max_age:
+            item_limit = max(max_age, int(it.get("_max_push_age_hours") or 0))
+            if age > item_limit:
                 it["_too_old"] = True
                 continue
             fresh.append(it)
@@ -8146,17 +8649,15 @@ def is_primary_event(item):
     Is this a primary-source corporate fact rather than a write-up about one?
 
     Ownership filings (SC 13G/13D, Form 4), periodic reports (6-K, 8-K, 20-F),
-    buybacks/dividends and regulatory actions are FACTS about the company. For a
-    microcap they are frequently the only hard news in a month, so the model's
-    "won't move the stock" veto must not apply to them (see the push selection:
-    measured 2026-11-09, a Goldman 5.2% stake, three Form 4s and a 6-K were all
-    stored and suppressed).
+    HKEX announcements, buybacks/dividends and regulatory actions are FACTS
+    about the company. For a microcap they are frequently the only hard news in
+    a month, so the model's "won't move the stock" veto must not apply to them.
 
     Monthly share-movement returns (月报表) are deliberately NOT included: they
     are routine paperwork with no information content for a holder.
     """
     title = str((item or {}).get("title") or "")
-    if str((item or {}).get("source") or "") == "SEC":
+    if str((item or {}).get("source") or "") in ("SEC", "HKEX"):
         return True
     return bool(PRIMARY_EVENT_RE.search(title))
 
@@ -8178,11 +8679,13 @@ VETO_MAX_IMPORTANCE = 4
 
 def push_decision_counts(enriched):
     """Per-reason counters for the 'why wasn't this pushed' run log."""
-    counts = {"undated": 0, "too_old": 0, "repeat": 0, "event_repeat": 0,
-              "same_story": 0, "dup": 0, "known": 0, "vetoed": 0,
-              "below_floor": 0, "no_seat": 0}
+    counts = {"irrelevant": 0, "undated": 0, "too_old": 0, "repeat": 0,
+              "event_repeat": 0, "same_story": 0, "dup": 0, "known": 0,
+              "vetoed": 0, "below_floor": 0, "no_seat": 0}
     for it in enriched:
-        if it.get("_undated"):
+        if it.get("relevant") is False:
+            counts["irrelevant"] += 1
+        elif it.get("_undated"):
             counts["undated"] += 1
         elif it.get("_too_old"):
             counts["too_old"] += 1
@@ -8933,14 +9436,18 @@ def main():
             """
             return {"status": "strict" if strict else "warn", "note": note}
 
-        def fetch_source(source, fetch_fn, status, since_override=None):
+        def fetch_source(source, fetch_fn, status, since_override=None,
+                         max_age_hours_override=None, max_push_age_hours=None):
             """
             Fetch one source and fold it through the shared ingest gate.
 
             `since_override` is for the rolling-window sources (corporate
-            actions, HK filings): they deliberately look back three weeks on
+            actions, HK filings): they deliberately look back 2-3 weeks on
             every run instead of at the last-fetch delta, because an
             announcement is made ONCE and is not re-published.
+            `max_age_hours_override` and `max_push_age_hours` lift the 96h/72h
+            defaults for those rolling sources so paid/primary finds inside
+            their window are not discarded downstream.
             """
             last = get_last_fetched(conn, ticker, source)
             if BACKFILL_HOURS:
@@ -8971,11 +9478,20 @@ def main():
                                                         "failed": 0})
                 stat["failed"] += 1
                 return None
+            eff_max_age = (max(max_news_age_hours, max_age_hours_override)
+                           if (max_age_hours_override and max_news_age_hours > 0)
+                           else max_news_age_hours)
+            if BACKFILL_HOURS and max_news_age_hours > 0:
+                eff_max_age = max(eff_max_age, BACKFILL_HOURS + 24)
             for item in items:
                 item["_source_status"] = status
+                if max_age_hours_override:
+                    item["_max_age_hours"] = eff_max_age
+                if max_push_age_hours:
+                    item["_max_push_age_hours"] = max_push_age_hours
             keeps = [it for it in items if status.get("status") != "drop"]
             accept = ingest_items(conn, all_new, source, keeps, ticker, since_dt,
-                                  max_news_age_hours,
+                                  eff_max_age,
                                   relevance_resolved=relevance_resolved,
                                   sector_watch=sector_watch,
                                   sector_items=_sector_items,
@@ -9006,6 +9522,21 @@ def main():
                 print(f"  {ticker}: not a US-listed symbol - skipping SEC "
                       f"(nothing in EDGAR).")
 
+        # 1.5) HKEX official filings (dual-listed ADRs like QFIN 03660, LU 06623,
+        #      and HK stocks). Free, exact stockId-scoped, breaks hours before US
+        #      market open (earnings dates, inside info, buyback disclosures).
+        hk_code = deepseek_hk_code(meta, ticker)
+        if src_on("hkex") and (hk_code or ticker.endswith(".HK")):
+            fetch_source(
+                "HKEX",
+                lambda sd, hc=hk_code: fetch_hkex_filings(
+                    ticker, since_dt=sd, hk_code=hc,
+                    name_zh=meta.get("name_zh") or ""),
+                src_status("hkex", strict=False),
+                since_override=datetime.now(EASTERN) - timedelta(days=14),
+                max_age_hours_override=15 * 24,
+                max_push_age_hours=14 * 24)
+
         # 2) Chinese sources (the alpha) - require Chinese search terms.
         if zh_terms:
             # Google News, Chinese editions (CN + HK merged, newest first).
@@ -9031,18 +9562,18 @@ def main():
                 fetch_source("GoogleNewsZH", _gnzh, src_status("google_news_zh"))
 
             # Eastmoney search - one query per term (capped), already
-            # title-filtered by the fetcher.
+            # title-filtered by the fetcher. Only treat as a total failure when
+            # EVERY term fails (don't throw away 7 successful terms if 1 times out).
             if src_on("eastmoney"):
                 def _em(sd, terms=zh_terms[:EASTMONEY_MAX_QUERIES]):
-                    out = []
-                    failed = False
+                    out, failed = [], 0
                     for term in terms:
                         res = fetch_eastmoney_search(term, sd, terms=zh_terms)
                         if res is None:
-                            failed = True
+                            failed += 1
                             continue
                         out.extend(res)
-                    return None if failed else out
+                    return None if (terms and failed == len(terms)) else out
                 fetch_source("Eastmoney", _em, src_status("eastmoney", strict=False))
 
             # Eastmoney 股吧 - Chinese retail discussion + the Chinese write-up
@@ -9119,10 +9650,10 @@ def main():
                     src_status("deepseek_search", strict=False))
 
         # 2.46) Corporate actions - a rolling 3-week window, because an
-        #       announcement is made ONCE. The 1-for-10 reverse split at LU was
-        #       announced on 30 Sep and the daily delta never saw it; the
-        #       `合股 并股 拆股 ADS比例变更` query finds it immediately. Repeat
-        #       coverage is stopped downstream by the seen/story ledger.
+        #       announcement is made ONCE. Lift the ingest/push age ceilings to
+        #       match DEEPSEEK_CORP_DAYS so paid results >4 days old are NOT
+        #       immediately discarded as stale. Repeat coverage is stopped
+        #       downstream by the seen/story ledger.
         if src_on("deepseek_corp") and ds_ok and zh_terms:
             display = deepseek_name(meta, zh_terms, en_terms, ticker)
             fetch_source(
@@ -9135,13 +9666,14 @@ def main():
                                  f"split, ADS ratio, buyback, delisting?"),
                 src_status("deepseek_corp", strict=False),
                 since_override=datetime.now(EASTERN)
-                - timedelta(days=DEEPSEEK_CORP_DAYS))
+                - timedelta(days=DEEPSEEK_CORP_DAYS),
+                max_age_hours_override=(DEEPSEEK_CORP_DAYS + 1) * 24,
+                max_push_age_hours=DEEPSEEK_CORP_DAYS * 24)
 
         # 2.47) HK listing code / filings - same rolling window. A Chinese ADR
         #       that is also HK-listed (LU 06623, QFIN 03660) publishes
         #       announcements there first, and Chinese portals summarise them
-        #       within hours. `hk_code` lives in ticker_meta.
-        hk_code = deepseek_hk_code(meta)
+        #       within hours.
         if src_on("deepseek_hk") and ds_ok and hk_code and zh_terms:
             display = deepseek_name(meta, zh_terms, en_terms, ticker)
             fetch_source(
@@ -9152,7 +9684,9 @@ def main():
                     event_terms=DEEPSEEK_CORP_TERMS),
                 src_status("deepseek_hk", strict=False),
                 since_override=datetime.now(EASTERN)
-                - timedelta(days=DEEPSEEK_CORP_DAYS))
+                - timedelta(days=DEEPSEEK_CORP_DAYS),
+                max_age_hours_override=(DEEPSEEK_CORP_DAYS + 1) * 24,
+                max_push_age_hours=DEEPSEEK_CORP_DAYS * 24)
 
         # 2.48) One financial-paper site per day (rotation). A single site:
         #       clause plus after: works; a multi-site OR group with before:
@@ -9168,7 +9702,9 @@ def main():
                     event_terms=DEEPSEEK_PRESS_TERMS),
                 src_status("deepseek_press", strict=False),
                 since_override=datetime.now(EASTERN)
-                - timedelta(days=DEEPSEEK_PRESS_DAYS))
+                - timedelta(days=DEEPSEEK_PRESS_DAYS),
+                max_age_hours_override=(DEEPSEEK_PRESS_DAYS + 1) * 24,
+                max_push_age_hours=DEEPSEEK_PRESS_DAYS * 24)
 
         # 2.5) Google News restricted to the company's OWN websites (site:)
         #      - catches official announcements / press releases that no news
@@ -9182,33 +9718,35 @@ def main():
                                      source="GoogleNewsSite", lang="zh"),
                 src_status("google_news_site", strict=False))
 
-        # 2.6) HKEX is deliberately NOT a source. Two approaches were tested
-        #      (2026-10-06) and neither is usable:
-        #        - HKEX's own titleSearchServlet needs internal session state: it
-        #          answers HTTP 200 with recordCnt 0 even for Tencent (700), with
-        #          or without a primed cookie session;
-        #        - reaching the filings through the news index returns documents
-        #          Google titled "Untitled - HKEXnews" (0 of 30 named the company
-        #          for 陆金所) or other issuers' filings entirely (site:hkexnews.hk
-        #          3660 returned 專業旅運 and 普源精電), so the relevance gate
-        #          correctly drops them.
-        #      A real HKEX source needs a per-document fetch (PDF text) plus a
-        #      working session handshake; that is a project of its own, and
-        #      shipping the index version would only add noise.
+        # 2.6) Ticker-scoped English primary feeds (Yahoo Finance + Seeking Alpha):
+        #      free, exact-ticker RSS carrying PR Newswire/GlobeNewswire releases,
+        #      Nasdaq compliance notices, earnings transcripts and executive moves.
+        if src_on("yahoo_finance"):
+            fetch_source(
+                "YahooFinance",
+                lambda sd: fetch_yahoo_rss(ticker, since_dt=sd),
+                src_status("yahoo_finance"))
+        if src_on("seeking_alpha") and US_SYMBOL_RE.match(ticker or ""):
+            fetch_source(
+                "SeekingAlpha",
+                lambda sd: fetch_seeking_alpha_rss(ticker, since_dt=sd),
+                src_status("seeking_alpha"))
 
         # 3) Google News English - includes the company's EN names/brands so
         #    subsidiary news is found even when the ticker symbol isn't in it.
         if src_on("google_news_en"):
-            # The date horizon is not decoration. Without `when:`, Google News
-            # orders by relevance, so the feed is dominated by old coverage and
-            # the delta filter then discards almost all of it. Measured
-            # 2026-11-01, items inside 14 days with the old query vs this one:
-            #   LU 8 -> 30, QFIN 1 -> 13, TIGR 5 -> 12, CAAS 2 -> 10
-            # (QFIN's whole fresh English feed was one item before the fix.)
+            # Quote every multi-word phrase so Google News OR precedence holds
+            # ("Qifu Technology" OR "QFIN stock" OR "Qfin Holdings"), and keep
+            # `when:14d` so fresh coverage beats old relevance-ordered pages.
             en_name = str((meta or {}).get("name_en") or "").strip().strip('"')
-            parts = [f'"{en_name}"'] if en_name else []
-            parts.append(f"{ticker} stock")
-            parts.extend(en_terms[:3])
+            raw_parts = ([en_name] if en_name else []) + [f"{ticker} stock"] + list(en_terms[:3])
+            parts, seen_p = [], set()
+            for p in raw_parts:
+                p = str(p or "").strip().strip('"')
+                if not p or p.lower() in seen_p:
+                    continue
+                seen_p.add(p.lower())
+                parts.append(f'"{p}"' if " " in p else p)
             en_query = " OR ".join(parts) + " when:14d"
             fetch_source(
                 "GoogleNews",
@@ -9232,18 +9770,15 @@ def main():
             def _wire(sd, raw=raw, src=wire_src, terms=zh_terms):
                 """Filter a global wire by this ticker's Chinese terms.
 
-                Macro-matched items belong to the 📢 CHINA MACRO section, and
-                an item must really name the company (or a subsidiary) - the
-                wire is a firehose of everything, so this filter is what makes
-                it per-ticker."""
+                An item that EXPLICITLY names the company (or a subsidiary) is
+                ALWAYS kept for this ticker, even when it also contains a macro
+                keyword like 助贷 / 中概股 / 金融监管总局 - previously skipping
+                is_macro() first dropped company-specific regulatory flashes
+                into the gap between per-ticker and macro tiers."""
                 out = []
                 subjects = set()
                 for r in raw:
                     hay = f"{r.get('title', '')} {r.get('snippet', '')}"
-                    # Macro / global-markets items have their own sections -
-                    # keep them out of the per-ticker digest.
-                    if is_macro(hay, macro_extra) or is_global_markets(hay):
-                        continue
                     if not any(_term_in_text(t, hay) for t in terms):
                         continue
                     # Same speaker filing several wire entries ("乐信CEO：...")
@@ -9441,23 +9976,24 @@ def main():
         return datetime.min.replace(tzinfo=EASTERN)
     all_new.sort(key=_sort_key, reverse=True)
 
-    # Trim AFTER dedup so far fewer items are lost to the cap, and release the
-    # seen-mark of anything still trimmed: the old code left those rows in the
-    # DB and in the `seen` ledger with importance NULL forever, so no later run
-    # could ever analyze them (they were "already seen"). Released items are
-    # re-fetched by a following run and are re-queued by rescue_orphans.
+    # Trim AFTER dedup so far fewer items are lost to the cap. Anything trimmed
+    # is inserted UNSCORED (importance IS NULL) into `news` so rescue_orphans()
+    # analyzes it on the next run: merely deleting from `seen` could NOT recover
+    # trimmed items because `last_fetched` had already advanced past their dates.
     max_to_filter = _cfg_int(config, "max_items_per_run", 40)
     if len(all_new) > max_to_filter:
         trimmed = all_new[max_to_filter:]
         all_new = all_new[:max_to_filter]
-        released = 0
+        deferred = 0
         for it in trimmed:
             if NO_WRITE:
                 continue
             try:
-                conn.execute("DELETE FROM seen WHERE ticker=? AND source=? AND item_hash=?",
-                             (it.get("ticker"), it.get("source"), _hash_of(it)))
-                released += 1
+                insert_news(conn, it)
+                if it.get("_staging_id"):
+                    conn.execute("UPDATE staging SET promoted=1 WHERE id=?",
+                                 (it["_staging_id"],))
+                deferred += 1
             except Exception:
                 pass
         try:
@@ -9465,7 +10001,7 @@ def main():
         except Exception:
             pass
         print(f"  Trimming to the {max_to_filter} most recent for AI analysis "
-              f"({len(trimmed)} deferred, {released} re-queued for the next run).")
+              f"({len(trimmed)} deferred, {deferred} saved unscored for rescue_orphans).")
 
     # Any stored row that never reached the AI has no English title, which makes
     # the panel unreadable for a Chinese-only reader (this is exactly what left
@@ -9537,12 +10073,13 @@ def main():
         # separate semantic-dedup AI call is needed - half the AI calls). ----
         enriched = ai_analyze(all_new, config, secrets, effective_meta,
                               conn=conn, run_start=run_start)
-        # One row per EVENT (same-event copies are recorded on the canonical row
-        # and dropped, not stored separately).
+        # One row per EVENT (same-event copies and AI-irrelevant rows are not
+        # stored separately).
         promoted, copies, known = promote_run(conn, enriched, run_id=run_start)
-        if copies or known:
-            print(f"  {ticker}: {len(enriched)} item(s) -> {promoted} event row(s); "
-                  f"{copies} copy(ies) + {known} repeat(s) not stored again.")
+        irrel = sum(1 for it in enriched if it.get("relevant") is False)
+        if copies or known or irrel:
+            print(f"  [events] {len(enriched)} item(s) -> {promoted} event row(s); "
+                  f"{copies} copy(ies) + {known} repeat(s) + {irrel} irrelevant not stored.")
         # Push selection FIRST: the regulatory force-push mutates importance /
         # category in place, so it must run before update_news_ai persists the
         # boosted values (otherwise the DB would show the pre-boost score).
